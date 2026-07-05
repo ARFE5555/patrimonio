@@ -1,0 +1,1486 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover" />
+<title>Patrimonio</title>
+<meta name="theme-color" content="#0B0E14" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="apple-mobile-web-app-title" content="Patrimonio" />
+<meta name="mobile-web-app-capable" content="yes" />
+<link rel="manifest" href="manifest.webmanifest" />
+<link rel="apple-touch-icon" href="icon-180.png" />
+<link rel="icon" type="image/png" href="icon-192.png" />
+<style>
+  html, body { margin: 0; padding: 0; background: #0B0E14; -webkit-text-size-adjust: 100%; }
+  #root { min-height: 100vh; }
+  .boot { min-height:100vh; display:flex; align-items:center; justify-content:center;
+          color:#8A93A7; font-family:-apple-system,system-ui,sans-serif; }
+</style>
+</head>
+<body>
+<div id="root"><div class="boot">Cargando Patrimonio…</div></div>
+
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useRef, useMemo } = React;
+
+
+/* ─────────────────────────────  Tokens de diseño  ───────────────────────────── */
+const T = {
+  bg: "#0B0E14",
+  bg2: "#0F131C",
+  card: "#161B27",
+  card2: "#1C2231",
+  line: "#262E3E",
+  lineSoft: "#1E2532",
+  text: "#EEF1F6",
+  mut: "#8A93A7",
+  mut2: "#5B6579",
+  gold: "#E3B24D",
+  goldSoft: "rgba(227,178,77,0.12)",
+  green: "#3FCB8B",
+  greenSoft: "rgba(63,203,139,0.14)",
+  red: "#F0645F",
+  redSoft: "rgba(240,100,95,0.14)",
+  blue: "#5B8DEF",
+  violet: "#9B7BEA",
+};
+const FONT =
+  '-apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, Segoe UI, Roboto, sans-serif';
+const MONO =
+  'ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace';
+
+/* ─────────────────────────────  Config  ───────────────────────────── */
+const TICKER = [
+  { id: "bitcoin", sym: "BTC" },
+  { id: "solana", sym: "SOL" },
+  { id: "ethereum", sym: "ETH" },
+];
+const CURRENCIES = [
+  { code: "usd", label: "USD $" },
+  { code: "eur", label: "EUR €" },
+  { code: "ars", label: "ARS $" },
+  { code: "mxn", label: "MXN $" },
+  { code: "cop", label: "COP $" },
+  { code: "clp", label: "CLP $" },
+  { code: "brl", label: "BRL R$" },
+  { code: "gbp", label: "GBP £" },
+];
+const ACCENT = { bank: T.blue, cash: T.green, crypto: T.gold };
+const TYPE_LABEL = { bank: "Banco", cash: "Efectivo", crypto: "Cripto" };
+
+// Respaldo: id de CoinGecko -> id de CoinPaprika (cubre las principales)
+const PAPRIKA = {
+  bitcoin: "btc-bitcoin",
+  ethereum: "eth-ethereum",
+  solana: "sol-solana",
+  ripple: "xrp-xrp",
+  cardano: "ada-cardano",
+  dogecoin: "doge-dogecoin",
+  binancecoin: "bnb-binance-coin",
+  tron: "trx-tron",
+  polkadot: "dot-polkadot",
+  "matic-network": "matic-polygon",
+  litecoin: "ltc-litecoin",
+  chainlink: "link-chainlink",
+  "avalanche-2": "avax-avalanche",
+  "shiba-inu": "shib-shiba-inu",
+  uniswap: "uni-uniswap",
+  stellar: "xlm-stellar",
+  "usd-coin": "usdc-usd-coin",
+  tether: "usdt-tether",
+};
+
+// Para carga manual: símbolo -> id de CoinGecko (así las monedas comunes
+// igual toman precio en vivo cuando hay conexión)
+const SYMBOL_ID = {
+  BTC: "bitcoin", ETH: "ethereum", SOL: "solana", XRP: "ripple",
+  ADA: "cardano", DOGE: "dogecoin", BNB: "binancecoin", TRX: "tron",
+  DOT: "polkadot", MATIC: "matic-network", LTC: "litecoin", LINK: "chainlink",
+  AVAX: "avalanche-2", SHIB: "shiba-inu", UNI: "uniswap", XLM: "stellar",
+  USDC: "usd-coin", USDT: "tether",
+};
+
+/* ─────────────────────────────  Almacenamiento persistente  ───────────────────────────── */
+const store = {
+  async get(k) {
+    try { return localStorage.getItem(k); } catch { return null; }
+  },
+  async set(k, v) {
+    try { localStorage.setItem(k, v); } catch (e) { console.error(e); }
+  },
+};
+async function loadKey(k, fb) {
+  const raw = await store.get(k);
+  if (!raw) return fb;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return fb;
+  }
+}
+const saveKey = (k, v) => store.set(k, JSON.stringify(v));
+
+/* ─────────────────────────────  Helpers  ───────────────────────────── */
+const uid = () =>
+  Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+
+function money(n, cur, opts = {}) {
+  const c = (cur || "usd").toUpperCase();
+  try {
+    return new Intl.NumberFormat("es-ES", {
+      style: "currency",
+      currency: c,
+      minimumFractionDigits: opts.min ?? 2,
+      maximumFractionDigits: opts.max ?? 2,
+    }).format(Number.isFinite(n) ? n : 0);
+  } catch {
+    return `${(Number.isFinite(n) ? n : 0).toFixed(2)} ${c}`;
+  }
+}
+function coinPrice(n, cur) {
+  const abs = Math.abs(n || 0);
+  const max = abs >= 100 ? 2 : abs >= 1 ? 2 : 6;
+  return money(n, cur, { min: 2, max });
+}
+const pct = (n) => `${n >= 0 ? "+" : ""}${(n || 0).toFixed(2)}%`;
+function relTime(ts) {
+  if (!ts) return "—";
+  const s = Math.round((Date.now() - ts) / 1000);
+  if (s < 5) return "recién";
+  if (s < 60) return `hace ${s}s`;
+  const m = Math.round(s / 60);
+  return `hace ${m}m`;
+}
+function todayISO() {
+  const d = new Date();
+  return new Date(d.getTime() - d.getTimezoneOffset() * 60000)
+    .toISOString()
+    .slice(0, 10);
+}
+function fmtDate(iso) {
+  try {
+    return new Date(iso + "T00:00:00").toLocaleDateString("es-ES", {
+      day: "2-digit",
+      month: "short",
+    });
+  } catch {
+    return iso;
+  }
+}
+
+/* ─────────────────────────────  Primitivos de UI  ───────────────────────────── */
+function Sheet({ open, onClose, title, children }) {
+  if (!open) return null;
+  return (
+    <div
+      onClick={onClose}
+      style={{
+        position: "fixed",
+        inset: 0,
+        background: "rgba(0,0,0,0.55)",
+        display: "flex",
+        alignItems: "flex-end",
+        justifyContent: "center",
+        zIndex: 50,
+        animation: "fade .18s ease",
+      }}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          width: "100%",
+          maxWidth: 430,
+          background: T.bg2,
+          borderTopLeftRadius: 22,
+          borderTopRightRadius: 22,
+          borderTop: `1px solid ${T.line}`,
+          padding: "10px 18px calc(22px + env(safe-area-inset-bottom))",
+          maxHeight: "88vh",
+          overflowY: "auto",
+          animation: "slideUp .24s cubic-bezier(.22,1,.36,1)",
+        }}
+      >
+        <div
+          style={{
+            width: 38,
+            height: 4,
+            borderRadius: 4,
+            background: T.line,
+            margin: "0 auto 14px",
+          }}
+        />
+        <div
+          style={{
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "center",
+            marginBottom: 16,
+          }}
+        >
+          <h3 style={{ margin: 0, fontSize: 18, fontWeight: 650, color: T.text }}>
+            {title}
+          </h3>
+          <button onClick={onClose} style={btnGhost}>
+            Cerrar
+          </button>
+        </div>
+        {children}
+      </div>
+    </div>
+  );
+}
+
+const inputStyle = {
+  width: "100%",
+  boxSizing: "border-box",
+  background: T.card,
+  border: `1px solid ${T.line}`,
+  borderRadius: 12,
+  padding: "13px 14px",
+  color: T.text,
+  fontSize: 16,
+  fontFamily: FONT,
+  outline: "none",
+};
+const labelStyle = {
+  display: "block",
+  fontSize: 12.5,
+  color: T.mut,
+  margin: "0 0 7px 2px",
+  fontWeight: 500,
+};
+const btnGhost = {
+  background: "transparent",
+  border: "none",
+  color: T.mut,
+  fontSize: 15,
+  fontFamily: FONT,
+  cursor: "pointer",
+  padding: 4,
+};
+function PrimaryBtn({ children, color = T.gold, onClick, disabled }) {
+  return (
+    <button
+      onClick={onClick}
+      disabled={disabled}
+      style={{
+        width: "100%",
+        background: disabled ? T.card2 : color,
+        color: disabled ? T.mut2 : "#0B0E14",
+        border: "none",
+        borderRadius: 13,
+        padding: "15px",
+        fontSize: 16,
+        fontWeight: 650,
+        fontFamily: FONT,
+        cursor: disabled ? "default" : "pointer",
+        marginTop: 6,
+      }}
+    >
+      {children}
+    </button>
+  );
+}
+function Field({ label, children }) {
+  return (
+    <div style={{ marginBottom: 15 }}>
+      <label style={labelStyle}>{label}</label>
+      {children}
+    </div>
+  );
+}
+
+/* ─────────────────────────────  App  ───────────────────────────── */
+function App() {
+  const [loaded, setLoaded] = useState(false);
+  const [tab, setTab] = useState("balance");
+  const [accounts, setAccounts] = useState([]);
+  const [txns, setTxns] = useState([]);
+  const [settings, setSettings] = useState({ currency: "usd" });
+
+  const [prices, setPrices] = useState({});
+  const [priceStatus, setPriceStatus] = useState("loading"); // loading | live | error
+  const [lastUpdate, setLastUpdate] = useState(null);
+  const [source, setSource] = useState(null); // "CoinGecko" | "CoinPaprika"
+
+  // sheets
+  const [acctSheet, setAcctSheet] = useState(null); // {mode,'bank'|'cash'} | account
+  const [txnSheet, setTxnSheet] = useState(false);
+  const [cryptoSheet, setCryptoSheet] = useState(false);
+
+  /* Carga inicial */
+  useEffect(() => {
+    (async () => {
+      setAccounts(await loadKey("fin:accounts", []));
+      setTxns(await loadKey("fin:txns", []));
+      setSettings(await loadKey("fin:settings", { currency: "usd" }));
+      setLoaded(true);
+    })();
+  }, []);
+  /* Guardado */
+  useEffect(() => {
+    if (loaded) saveKey("fin:accounts", accounts);
+  }, [accounts, loaded]);
+  useEffect(() => {
+    if (loaded) saveKey("fin:txns", txns);
+  }, [txns, loaded]);
+  useEffect(() => {
+    if (loaded) saveKey("fin:settings", settings);
+  }, [settings, loaded]);
+
+  /* Precios en vivo (24/7) */
+  const trackedIds = useMemo(() => {
+    const s = new Set(TICKER.map((t) => t.id));
+    accounts.forEach((a) => a.type === "crypto" && a.coinId && s.add(a.coinId));
+    return Array.from(s);
+  }, [accounts]);
+
+  useEffect(() => {
+    if (!loaded) return;
+    let alive = true;
+
+    // Fuente 1: CoinGecko (soporta cualquier moneda y cualquier cripto)
+    async function fromCoinGecko() {
+      const url = `https://api.coingecko.com/api/v3/simple/price?ids=${trackedIds.join(
+        ","
+      )}&vs_currencies=${settings.currency}&include_24hr_change=true`;
+      const r = await fetch(url);
+      if (!r.ok) throw new Error("cg " + r.status);
+      const d = await r.json();
+      const next = {};
+      trackedIds.forEach((id) => {
+        if (d[id])
+          next[id] = {
+            price: d[id][settings.currency],
+            change: d[id][settings.currency + "_24h_change"],
+          };
+      });
+      if (!Object.keys(next).length) throw new Error("cg vacío");
+      return next;
+    }
+
+    // Fuente 2: CoinPaprika (respaldo; solo USD en el plan gratuito)
+    async function fromPaprika() {
+      const next = {};
+      await Promise.all(
+        trackedIds.map(async (id) => {
+          const pid = PAPRIKA[id];
+          if (!pid) return;
+          try {
+            const r = await fetch(
+              `https://api.coinpaprika.com/v1/tickers/${pid}?quotes=USD`
+            );
+            if (!r.ok) return;
+            const d = await r.json();
+            const q = d.quotes && d.quotes.USD;
+            if (q) next[id] = { price: q.price, change: q.percent_change_24h };
+          } catch {
+            /* ignora la moneda que falle */
+          }
+        })
+      );
+      if (!Object.keys(next).length) throw new Error("paprika vacío");
+      return next;
+    }
+
+    async function poll() {
+      // Intento 1: CoinGecko
+      try {
+        const next = await fromCoinGecko();
+        if (!alive) return;
+        setPrices(next);
+        setSource("CoinGecko");
+        setPriceStatus("live");
+        setLastUpdate(Date.now());
+        return;
+      } catch {
+        /* pasa al respaldo */
+      }
+      // Intento 2: CoinPaprika (solo si la moneda base es USD, para no mostrar valores incorrectos)
+      if (settings.currency === "usd") {
+        try {
+          const next = await fromPaprika();
+          if (!alive) return;
+          setPrices(next);
+          setSource("CoinPaprika");
+          setPriceStatus("live");
+          setLastUpdate(Date.now());
+          return;
+        } catch {
+          /* ambas fallaron */
+        }
+      }
+      if (alive) setPriceStatus("error");
+    }
+
+    poll();
+    const iv = setInterval(poll, 60000);
+    return () => {
+      alive = false;
+      clearInterval(iv);
+    };
+  }, [loaded, trackedIds.join(","), settings.currency]);
+
+  /* Totales */
+  const totals = useMemo(() => {
+    let bank = 0,
+      cash = 0,
+      crypto = 0;
+    accounts.forEach((a) => {
+      if (a.type === "bank") bank += a.balance || 0;
+      else if (a.type === "cash") cash += a.balance || 0;
+      else if (a.type === "crypto") {
+        const p = prices[a.coinId]?.price ?? a.manualPrice;
+        if (p != null) crypto += (a.amount || 0) * (p || 0);
+      }
+    });
+    return { bank, cash, crypto, net: bank + cash + crypto };
+  }, [accounts, prices]);
+
+  const cur = settings.currency;
+
+  /* Acciones cuentas */
+  function saveAccount(data) {
+    setAccounts((prev) => {
+      if (data.id) return prev.map((a) => (a.id === data.id ? { ...a, ...data } : a));
+      return [...prev, { ...data, id: uid() }];
+    });
+    setAcctSheet(null);
+    setCryptoSheet(false);
+  }
+  function deleteAccount(id) {
+    setAccounts((prev) => prev.filter((a) => a.id !== id));
+    setTxns((prev) => prev.filter((t) => t.accountId !== id));
+    setAcctSheet(null);
+  }
+
+  /* Acciones movimientos */
+  function addTxn(data) {
+    const delta = data.kind === "income" ? data.amount : -data.amount;
+    setAccounts((prev) =>
+      prev.map((a) =>
+        a.id === data.accountId ? { ...a, balance: (a.balance || 0) + delta } : a
+      )
+    );
+    setTxns((prev) => [{ ...data, id: uid(), createdAt: Date.now() }, ...prev]);
+    setTxnSheet(false);
+  }
+  function deleteTxn(t) {
+    const delta = t.kind === "income" ? -t.amount : t.amount;
+    setAccounts((prev) =>
+      prev.map((a) =>
+        a.id === t.accountId ? { ...a, balance: (a.balance || 0) + delta } : a
+      )
+    );
+    setTxns((prev) => prev.filter((x) => x.id !== t.id));
+  }
+
+  if (!loaded)
+    return (
+      <div style={{ ...shell, alignItems: "center", justifyContent: "center" }}>
+        <div style={{ color: T.mut, fontFamily: FONT }}>Cargando…</div>
+      </div>
+    );
+
+  return (
+    <div style={shell}>
+      <style>{css}</style>
+
+      {/* Header */}
+      <header
+        style={{
+          padding: "18px 20px 12px",
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "center",
+        }}
+      >
+        <div>
+          <div
+            style={{
+              fontSize: 20,
+              fontWeight: 700,
+              letterSpacing: -0.3,
+              color: T.text,
+            }}
+          >
+            Patrimonio
+          </div>
+          <StatusDot status={priceStatus} lastUpdate={lastUpdate} source={source} />
+        </div>
+        <select
+          value={cur}
+          onChange={(e) => setSettings((s) => ({ ...s, currency: e.target.value }))}
+          style={{
+            background: T.card,
+            color: T.text,
+            border: `1px solid ${T.line}`,
+            borderRadius: 10,
+            padding: "8px 10px",
+            fontSize: 13,
+            fontFamily: FONT,
+            appearance: "none",
+          }}
+        >
+          {CURRENCIES.map((c) => (
+            <option key={c.code} value={c.code}>
+              {c.label}
+            </option>
+          ))}
+        </select>
+      </header>
+
+      <main style={{ flex: 1, overflowY: "auto", padding: "0 20px 90px" }}>
+        {tab === "balance" && (
+          <BalanceTab totals={totals} cur={cur} prices={prices} />
+        )}
+        {tab === "accounts" && (
+          <AccountsTab
+            accounts={accounts}
+            prices={prices}
+            cur={cur}
+            onAdd={(type) =>
+              type === "crypto"
+                ? setCryptoSheet(true)
+                : setAcctSheet({ type, mode: "new" })
+            }
+            onEdit={(a) => (a.type === "crypto" ? setCryptoSheet(a) : setAcctSheet(a))}
+          />
+        )}
+        {tab === "txns" && (
+          <TxnsTab
+            txns={txns}
+            accounts={accounts}
+            cur={cur}
+            onAdd={() => setTxnSheet(true)}
+            onDelete={deleteTxn}
+          />
+        )}
+        {tab === "crypto" && (
+          <CryptoTab
+            accounts={accounts}
+            prices={prices}
+            cur={cur}
+            onAdd={() => setCryptoSheet(true)}
+            onEdit={(a) => setCryptoSheet(a)}
+          />
+        )}
+      </main>
+
+      {/* Tab bar iOS */}
+      <nav style={tabbar}>
+        {[
+          ["balance", "Balance", IconChart],
+          ["accounts", "Cuentas", IconWallet],
+          ["txns", "Movimientos", IconSwap],
+          ["crypto", "Cripto", IconCoin],
+        ].map(([id, label, Icon]) => (
+          <button
+            key={id}
+            onClick={() => setTab(id)}
+            style={{
+              background: "none",
+              border: "none",
+              display: "flex",
+              flexDirection: "column",
+              alignItems: "center",
+              gap: 3,
+              cursor: "pointer",
+              flex: 1,
+              padding: "6px 0",
+              color: tab === id ? T.gold : T.mut2,
+            }}
+          >
+            <Icon color={tab === id ? T.gold : T.mut2} />
+            <span style={{ fontSize: 10.5, fontFamily: FONT, fontWeight: 500 }}>
+              {label}
+            </span>
+          </button>
+        ))}
+      </nav>
+
+      {/* Sheets */}
+      <AccountSheet
+        state={acctSheet}
+        cur={cur}
+        onClose={() => setAcctSheet(null)}
+        onSave={saveAccount}
+        onDelete={deleteAccount}
+      />
+      <TxnSheet
+        open={txnSheet}
+        accounts={accounts}
+        cur={cur}
+        onClose={() => setTxnSheet(false)}
+        onSave={addTxn}
+      />
+      <CryptoSheet
+        state={cryptoSheet}
+        cur={cur}
+        onClose={() => setCryptoSheet(false)}
+        onSave={saveAccount}
+        onDelete={deleteAccount}
+        prices={prices}
+      />
+    </div>
+  );
+}
+
+/* ─────────────────────────────  Tab: Balance  ───────────────────────────── */
+function BalanceTab({ totals, cur, prices }) {
+  const parts = [
+    { key: "bank", label: "Bancos", val: totals.bank, color: ACCENT.bank },
+    { key: "cash", label: "Efectivo", val: totals.cash, color: ACCENT.cash },
+    { key: "crypto", label: "Cripto", val: totals.crypto, color: ACCENT.crypto },
+  ];
+  const total = totals.net || 0;
+  return (
+    <div>
+      {/* Hero */}
+      <div
+        style={{
+          background: `linear-gradient(160deg, ${T.card2}, ${T.card})`,
+          border: `1px solid ${T.line}`,
+          borderRadius: 20,
+          padding: "22px 20px",
+          marginTop: 4,
+        }}
+      >
+        <div style={{ fontSize: 13, color: T.mut, fontWeight: 500 }}>
+          Balance general
+        </div>
+        <div
+          style={{
+            fontFamily: MONO,
+            fontVariantNumeric: "tabular-nums",
+            fontSize: 38,
+            fontWeight: 600,
+            letterSpacing: -1,
+            color: T.text,
+            margin: "6px 0 16px",
+          }}
+        >
+          {money(total, cur)}
+        </div>
+        {/* Barra de reparto */}
+        <div
+          style={{
+            display: "flex",
+            height: 8,
+            borderRadius: 6,
+            overflow: "hidden",
+            background: T.bg,
+          }}
+        >
+          {total > 0 ? (
+            parts.map(
+              (p) =>
+                p.val > 0 && (
+                  <div
+                    key={p.key}
+                    style={{
+                      width: `${(p.val / total) * 100}%`,
+                      background: p.color,
+                    }}
+                  />
+                )
+            )
+          ) : (
+            <div style={{ width: "100%", background: T.line }} />
+          )}
+        </div>
+        <div style={{ display: "flex", gap: 16, marginTop: 14 }}>
+          {parts.map((p) => (
+            <div key={p.key} style={{ flex: 1 }}>
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 6,
+                  marginBottom: 3,
+                }}
+              >
+                <span
+                  style={{
+                    width: 8,
+                    height: 8,
+                    borderRadius: 3,
+                    background: p.color,
+                  }}
+                />
+                <span style={{ fontSize: 12, color: T.mut }}>{p.label}</span>
+              </div>
+              <div
+                style={{
+                  fontFamily: MONO,
+                  fontVariantNumeric: "tabular-nums",
+                  fontSize: 14,
+                  color: T.text,
+                  fontWeight: 500,
+                }}
+              >
+                {money(p.val, cur, { max: 0 })}
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* Ticker en vivo */}
+      <div style={{ marginTop: 22, marginBottom: 8, ...sectionTitle }}>
+        Mercado en vivo
+      </div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+        {TICKER.map((t) => {
+          const p = prices[t.id];
+          const up = (p?.change ?? 0) >= 0;
+          return (
+            <div key={t.id} style={rowCard}>
+              <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+                <CoinBadge sym={t.sym} />
+                <div>
+                  <div style={{ fontSize: 15, fontWeight: 600, color: T.text }}>
+                    {t.sym}
+                  </div>
+                  <div style={{ fontSize: 12, color: T.mut }}>{t.id}</div>
+                </div>
+              </div>
+              <div style={{ textAlign: "right" }}>
+                <div
+                  style={{
+                    fontFamily: MONO,
+                    fontVariantNumeric: "tabular-nums",
+                    fontSize: 15,
+                    color: T.text,
+                    fontWeight: 500,
+                  }}
+                >
+                  {p ? coinPrice(p.price, cur) : "—"}
+                </div>
+                {p && (
+                  <div
+                    style={{
+                      fontSize: 12,
+                      fontWeight: 600,
+                      color: up ? T.green : T.red,
+                    }}
+                  >
+                    {pct(p.change)}
+                  </div>
+                )}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+/* ─────────────────────────────  Tab: Cuentas  ───────────────────────────── */
+function AccountsTab({ accounts, prices, cur, onAdd, onEdit }) {
+  const groups = ["bank", "cash", "crypto"];
+  return (
+    <div style={{ paddingTop: 8 }}>
+      {groups.map((g) => {
+        const list = accounts.filter((a) => a.type === g);
+        return (
+          <div key={g} style={{ marginBottom: 22 }}>
+            <div
+              style={{
+                display: "flex",
+                justifyContent: "space-between",
+                alignItems: "center",
+                marginBottom: 10,
+              }}
+            >
+              <span style={sectionTitle}>{TYPE_LABEL[g]}</span>
+              <button onClick={() => onAdd(g)} style={{ ...btnGhost, color: ACCENT[g] }}>
+                + Agregar
+              </button>
+            </div>
+            {list.length === 0 ? (
+              <div style={emptyRow}>Sin cuentas de {TYPE_LABEL[g].toLowerCase()}</div>
+            ) : (
+              <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                {list.map((a) => {
+                  const value =
+                    a.type === "crypto"
+                      ? (a.amount || 0) *
+                        (prices[a.coinId]?.price ?? a.manualPrice ?? 0)
+                      : a.balance || 0;
+                  return (
+                    <button
+                      key={a.id}
+                      onClick={() => onEdit(a)}
+                      style={{ ...rowCard, cursor: "pointer", textAlign: "left" }}
+                    >
+                      <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+                        {a.type === "crypto" ? (
+                          <CoinBadge sym={a.symbol} />
+                        ) : (
+                          <span
+                            style={{
+                              width: 36,
+                              height: 36,
+                              borderRadius: 10,
+                              background: T.card2,
+                              display: "flex",
+                              alignItems: "center",
+                              justifyContent: "center",
+                            }}
+                          >
+                            {a.type === "bank" ? (
+                              <IconWallet color={ACCENT.bank} />
+                            ) : (
+                              <IconCash color={ACCENT.cash} />
+                            )}
+                          </span>
+                        )}
+                        <div>
+                          <div style={{ fontSize: 15, fontWeight: 600, color: T.text }}>
+                            {a.name || a.symbol}
+                          </div>
+                          {a.type === "crypto" && (
+                            <div style={{ fontSize: 12, color: T.mut }}>
+                              {a.amount} {a.symbol}
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                      <div
+                        style={{
+                          fontFamily: MONO,
+                          fontVariantNumeric: "tabular-nums",
+                          fontSize: 15,
+                          color: T.text,
+                          fontWeight: 500,
+                        }}
+                      >
+                        {money(value, cur)}
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+/* ─────────────────────────────  Tab: Movimientos  ───────────────────────────── */
+function TxnsTab({ txns, accounts, cur, onAdd, onDelete }) {
+  const acctName = (id) => accounts.find((a) => a.id === id)?.name || "—";
+  const grouped = useMemo(() => {
+    const m = {};
+    txns.forEach((t) => {
+      (m[t.date] = m[t.date] || []).push(t);
+    });
+    return Object.entries(m).sort((a, b) => (a[0] < b[0] ? 1 : -1));
+  }, [txns]);
+
+  return (
+    <div style={{ paddingTop: 8 }}>
+      <button onClick={onAdd} style={{ ...rowCard, cursor: "pointer", justifyContent: "center", gap: 8, color: T.gold, fontWeight: 600, fontSize: 15, marginBottom: 20 }}>
+        <IconPlus color={T.gold} /> Nuevo movimiento
+      </button>
+
+      {txns.length === 0 ? (
+        <div style={emptyRow}>Todavía no cargaste ingresos ni egresos</div>
+      ) : (
+        grouped.map(([date, items]) => (
+          <div key={date} style={{ marginBottom: 18 }}>
+            <div style={{ ...sectionTitle, marginBottom: 8 }}>{fmtDate(date)}</div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              {items.map((t) => {
+                const inc = t.kind === "income";
+                return (
+                  <div key={t.id} style={rowCard}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 12, minWidth: 0 }}>
+                      <span
+                        style={{
+                          width: 34,
+                          height: 34,
+                          borderRadius: 10,
+                          background: inc ? T.greenSoft : T.redSoft,
+                          display: "flex",
+                          alignItems: "center",
+                          justifyContent: "center",
+                          flexShrink: 0,
+                          color: inc ? T.green : T.red,
+                          fontSize: 18,
+                          fontWeight: 700,
+                        }}
+                      >
+                        {inc ? "↓" : "↑"}
+                      </span>
+                      <div style={{ minWidth: 0 }}>
+                        <div
+                          style={{
+                            fontSize: 14.5,
+                            fontWeight: 600,
+                            color: T.text,
+                            whiteSpace: "nowrap",
+                            overflow: "hidden",
+                            textOverflow: "ellipsis",
+                          }}
+                        >
+                          {t.motivo || (inc ? "Ingreso" : "Egreso")}
+                        </div>
+                        <div style={{ fontSize: 12, color: T.mut }}>{acctName(t.accountId)}</div>
+                      </div>
+                    </div>
+                    <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                      <span
+                        style={{
+                          fontFamily: MONO,
+                          fontVariantNumeric: "tabular-nums",
+                          fontSize: 14.5,
+                          fontWeight: 600,
+                          color: inc ? T.green : T.red,
+                        }}
+                      >
+                        {inc ? "+" : "−"}
+                        {money(t.amount, cur)}
+                      </span>
+                      <button
+                        onClick={() => onDelete(t)}
+                        style={{ ...btnGhost, color: T.mut2, fontSize: 18, lineHeight: 1 }}
+                        aria-label="Eliminar"
+                      >
+                        ×
+                      </button>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        ))
+      )}
+    </div>
+  );
+}
+
+/* ─────────────────────────────  Tab: Cripto  ───────────────────────────── */
+function CryptoTab({ accounts, prices, cur, onAdd, onEdit }) {
+  const list = accounts.filter((a) => a.type === "crypto");
+  return (
+    <div style={{ paddingTop: 8 }}>
+      <button onClick={onAdd} style={{ ...rowCard, cursor: "pointer", justifyContent: "center", gap: 8, color: T.gold, fontWeight: 600, fontSize: 15, marginBottom: 20 }}>
+        <IconPlus color={T.gold} /> Agregar cripto
+      </button>
+      {list.length === 0 ? (
+        <div style={emptyRow}>Agregá tus tenencias (BTC, SOL, ETH o cualquier otra)</div>
+      ) : (
+        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+          {list.map((a) => {
+            const p = prices[a.coinId];
+            const livePrice = p?.price;
+            const usedPrice = livePrice ?? a.manualPrice;
+            const val = (a.amount || 0) * (usedPrice || 0);
+            const up = (p?.change ?? 0) >= 0;
+            return (
+              <button key={a.id} onClick={() => onEdit(a)} style={{ ...rowCard, cursor: "pointer", textAlign: "left" }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+                  <CoinBadge sym={a.symbol} />
+                  <div>
+                    <div style={{ fontSize: 15, fontWeight: 600, color: T.text }}>{a.name}</div>
+                    <div style={{ fontSize: 12, color: T.mut, fontFamily: MONO }}>
+                      {a.amount} {a.symbol} ·{" "}
+                      {usedPrice != null ? coinPrice(usedPrice, cur) : "—"}
+                      {livePrice == null && a.manualPrice != null ? " (manual)" : ""}
+                    </div>
+                  </div>
+                </div>
+                <div style={{ textAlign: "right" }}>
+                  <div style={{ fontFamily: MONO, fontVariantNumeric: "tabular-nums", fontSize: 15, color: T.text, fontWeight: 500 }}>
+                    {money(val, cur)}
+                  </div>
+                  {p && (
+                    <div style={{ fontSize: 12, fontWeight: 600, color: up ? T.green : T.red }}>
+                      {pct(p.change)}
+                    </div>
+                  )}
+                </div>
+              </button>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ─────────────────────────────  Sheet: Cuenta banco/efectivo  ───────────────────────────── */
+function AccountSheet({ state, cur, onClose, onSave, onDelete }) {
+  const editing = state && state.id;
+  const type = state?.type || "bank";
+  const [name, setName] = useState("");
+  const [balance, setBalance] = useState("");
+  useEffect(() => {
+    if (state) {
+      setName(state.name || "");
+      setBalance(state.id != null && state.balance != null ? String(state.balance) : "");
+    }
+  }, [state]);
+  if (!state || type === "crypto") return null;
+  const valid = name.trim() && balance !== "" && !isNaN(parseFloat(balance));
+  return (
+    <Sheet open={!!state} onClose={onClose} title={editing ? "Editar cuenta" : `Nueva cuenta · ${TYPE_LABEL[type]}`}>
+      <Field label="Nombre">
+        <input style={inputStyle} value={name} onChange={(e) => setName(e.target.value)} placeholder={type === "bank" ? "Ej. Banco Galicia" : "Ej. Efectivo billetera"} />
+      </Field>
+      <Field label={`Saldo actual (${cur.toUpperCase()})`}>
+        <input style={{ ...inputStyle, fontFamily: MONO }} value={balance} onChange={(e) => setBalance(e.target.value)} inputMode="decimal" placeholder="0.00" />
+      </Field>
+      <PrimaryBtn color={ACCENT[type]} disabled={!valid} onClick={() => onSave({ id: state.id, type, name: name.trim(), balance: parseFloat(balance) })}>
+        {editing ? "Guardar cambios" : "Crear cuenta"}
+      </PrimaryBtn>
+      {editing && (
+        <button onClick={() => onDelete(state.id)} style={{ ...btnGhost, color: T.red, width: "100%", marginTop: 14, padding: 10 }}>
+          Eliminar cuenta
+        </button>
+      )}
+    </Sheet>
+  );
+}
+
+/* ─────────────────────────────  Sheet: Movimiento  ───────────────────────────── */
+function TxnSheet({ open, accounts, cur, onClose, onSave }) {
+  const usable = accounts.filter((a) => a.type === "bank" || a.type === "cash");
+  const [kind, setKind] = useState("expense");
+  const [amount, setAmount] = useState("");
+  const [motivo, setMotivo] = useState("");
+  const [accountId, setAccountId] = useState("");
+  const [date, setDate] = useState(todayISO());
+  useEffect(() => {
+    if (open) {
+      setKind("expense");
+      setAmount("");
+      setMotivo("");
+      setAccountId(usable[0]?.id || "");
+      setDate(todayISO());
+    }
+  }, [open]);
+  const valid = amount && !isNaN(parseFloat(amount)) && parseFloat(amount) > 0 && accountId && motivo.trim();
+  return (
+    <Sheet open={open} onClose={onClose} title="Nuevo movimiento">
+      {usable.length === 0 ? (
+        <div style={{ ...emptyRow, marginBottom: 4 }}>
+          Primero creá una cuenta de banco o efectivo en la pestaña Cuentas.
+        </div>
+      ) : (
+        <>
+          {/* Segmento ingreso/egreso */}
+          <div style={{ display: "flex", background: T.card, borderRadius: 12, padding: 4, marginBottom: 16 }}>
+            {[
+              ["expense", "Egreso", T.red],
+              ["income", "Ingreso", T.green],
+            ].map(([k, label, color]) => (
+              <button
+                key={k}
+                onClick={() => setKind(k)}
+                style={{
+                  flex: 1,
+                  border: "none",
+                  borderRadius: 9,
+                  padding: "11px",
+                  fontSize: 15,
+                  fontWeight: 600,
+                  fontFamily: FONT,
+                  cursor: "pointer",
+                  background: kind === k ? color : "transparent",
+                  color: kind === k ? "#0B0E14" : T.mut,
+                }}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+          <Field label={`Monto (${cur.toUpperCase()})`}>
+            <input style={{ ...inputStyle, fontFamily: MONO, fontSize: 22 }} value={amount} onChange={(e) => setAmount(e.target.value)} inputMode="decimal" placeholder="0.00" />
+          </Field>
+          <Field label="Motivo">
+            <input style={inputStyle} value={motivo} onChange={(e) => setMotivo(e.target.value)} placeholder="Ej. Sueldo, Supermercado, Alquiler…" />
+          </Field>
+          <Field label="Cuenta / método de pago">
+            <select style={{ ...inputStyle, appearance: "none" }} value={accountId} onChange={(e) => setAccountId(e.target.value)}>
+              {usable.map((a) => (
+                <option key={a.id} value={a.id}>
+                  {a.name} · {TYPE_LABEL[a.type]}
+                </option>
+              ))}
+            </select>
+          </Field>
+          <Field label="Fecha">
+            <input type="date" style={{ ...inputStyle, fontFamily: MONO }} value={date} onChange={(e) => setDate(e.target.value)} />
+          </Field>
+          <PrimaryBtn color={kind === "income" ? T.green : T.red} disabled={!valid} onClick={() => onSave({ kind, amount: parseFloat(amount), motivo: motivo.trim(), accountId, date })}>
+            {kind === "income" ? "Registrar ingreso" : "Registrar egreso"}
+          </PrimaryBtn>
+        </>
+      )}
+    </Sheet>
+  );
+}
+
+/* ─────────────────────────────  Sheet: Cripto (buscar cualquier moneda)  ───────────────────────────── */
+function CryptoSheet({ state, cur, onClose, onSave, onDelete, prices }) {
+  const editing = state && state.id;
+  const [query, setQuery] = useState("");
+  const [results, setResults] = useState([]);
+  const [picked, setPicked] = useState(null); // {coinId,symbol,name}
+  const [amount, setAmount] = useState("");
+  const [manual, setManual] = useState("");
+  const [searching, setSearching] = useState(false);
+  const [err, setErr] = useState("");
+  const [manualEntry, setManualEntry] = useState(false);
+  const [mSym, setMSym] = useState("");
+  const [mName, setMName] = useState("");
+
+  useEffect(() => {
+    if (state && state.id) {
+      setPicked({ coinId: state.coinId, symbol: state.symbol, name: state.name });
+      setAmount(String(state.amount ?? ""));
+      setManual(state.manualPrice != null ? String(state.manualPrice) : "");
+    } else if (state) {
+      setPicked(null);
+      setAmount("");
+      setManual("");
+      setQuery("");
+      setResults([]);
+      setErr("");
+      setManualEntry(false);
+      setMSym("");
+      setMName("");
+    }
+  }, [state]);
+
+  // búsqueda con debounce
+  useEffect(() => {
+    if (!query.trim() || picked) {
+      setResults([]);
+      return;
+    }
+    setSearching(true);
+    setErr("");
+    const t = setTimeout(async () => {
+      try {
+        const r = await fetch(`https://api.coingecko.com/api/v3/search?query=${encodeURIComponent(query.trim())}`);
+        const d = await r.json();
+        setResults((d.coins || []).slice(0, 8));
+      } catch {
+        setErr("No hay acceso a internet en la vista previa. Cargala a mano abajo 👇");
+      } finally {
+        setSearching(false);
+      }
+    }, 400);
+    return () => clearTimeout(t);
+  }, [query, picked]);
+
+  if (!state) return null;
+  const valid = picked && amount !== "" && !isNaN(parseFloat(amount));
+  const livePrice = picked && prices[picked.coinId]?.price;
+
+  return (
+    <Sheet open={!!state} onClose={onClose} title={editing ? `Editar ${state.symbol}` : "Agregar cripto"}>
+      {!picked ? (
+        <>
+          <Field label="Buscar moneda">
+            <input style={inputStyle} value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Bitcoin, SOL, Ethereum, Cardano…" autoFocus />
+          </Field>
+          {searching && <div style={{ color: T.mut, fontSize: 13, padding: "4px 2px" }}>Buscando…</div>}
+          {err && <div style={{ color: T.red, fontSize: 13, padding: "4px 2px" }}>{err}</div>}
+          <div style={{ display: "flex", flexDirection: "column", gap: 8, marginTop: 4 }}>
+            {results.map((c) => (
+              <button
+                key={c.id}
+                onClick={() => setPicked({ coinId: c.id, symbol: (c.symbol || "").toUpperCase(), name: c.name })}
+                style={{ ...rowCard, cursor: "pointer", textAlign: "left" }}
+              >
+                <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+                  {c.thumb ? (
+                    <img src={c.thumb} alt="" style={{ width: 30, height: 30, borderRadius: 8 }} />
+                  ) : (
+                    <CoinBadge sym={(c.symbol || "").toUpperCase()} />
+                  )}
+                  <div>
+                    <div style={{ fontSize: 15, fontWeight: 600, color: T.text }}>{c.name}</div>
+                    <div style={{ fontSize: 12, color: T.mut }}>{(c.symbol || "").toUpperCase()}</div>
+                  </div>
+                </div>
+                <span style={{ color: T.gold, fontSize: 20 }}>+</span>
+              </button>
+            ))}
+          </div>
+
+          {/* Carga manual (funciona sin internet) */}
+          <div style={{ borderTop: `1px solid ${T.lineSoft}`, marginTop: 16, paddingTop: 14 }}>
+            {!manualEntry ? (
+              <button
+                onClick={() => setManualEntry(true)}
+                style={{ ...btnGhost, color: T.gold, padding: 4 }}
+              >
+                + Cargar una moneda a mano
+              </button>
+            ) : (
+              <>
+                <div style={{ fontSize: 12.5, color: T.mut, marginBottom: 12 }}>
+                  Ingresá la moneda manualmente. Si es una de las principales (BTC,
+                  ETH, SOL…), tomará el precio en vivo cuando haya conexión.
+                </div>
+                <Field label="Símbolo">
+                  <input
+                    style={{ ...inputStyle, textTransform: "uppercase" }}
+                    value={mSym}
+                    onChange={(e) => setMSym(e.target.value.toUpperCase())}
+                    placeholder="BTC"
+                  />
+                </Field>
+                <Field label="Nombre">
+                  <input
+                    style={inputStyle}
+                    value={mName}
+                    onChange={(e) => setMName(e.target.value)}
+                    placeholder="Bitcoin"
+                  />
+                </Field>
+                <PrimaryBtn
+                  color={T.gold}
+                  disabled={!mSym.trim()}
+                  onClick={() => {
+                    const sym = mSym.trim().toUpperCase();
+                    setPicked({
+                      coinId: SYMBOL_ID[sym] || sym.toLowerCase(),
+                      symbol: sym,
+                      name: mName.trim() || sym,
+                    });
+                  }}
+                >
+                  Continuar
+                </PrimaryBtn>
+              </>
+            )}
+          </div>
+        </>
+      ) : (
+        <>
+          <div style={{ ...rowCard, marginBottom: 16 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+              <CoinBadge sym={picked.symbol} />
+              <div>
+                <div style={{ fontSize: 15, fontWeight: 600, color: T.text }}>{picked.name}</div>
+                <div style={{ fontSize: 12, color: T.mut, fontFamily: MONO }}>
+                  {livePrice ? coinPrice(livePrice, cur) : "precio al actualizar"}
+                </div>
+              </div>
+            </div>
+            {!editing && (
+              <button onClick={() => setPicked(null)} style={btnGhost}>
+                Cambiar
+              </button>
+            )}
+          </div>
+          <Field label={`Cantidad de ${picked.symbol}`}>
+            <input style={{ ...inputStyle, fontFamily: MONO, fontSize: 22 }} value={amount} onChange={(e) => setAmount(e.target.value)} inputMode="decimal" placeholder="0.00" autoFocus />
+          </Field>
+          <Field label={`Precio manual en ${cur.toUpperCase()} (opcional)`}>
+            <input style={{ ...inputStyle, fontFamily: MONO }} value={manual} onChange={(e) => setManual(e.target.value)} inputMode="decimal" placeholder="Se usa solo si no hay precio en vivo" />
+          </Field>
+          {(() => {
+            const shown = livePrice ?? (manual !== "" && !isNaN(parseFloat(manual)) ? parseFloat(manual) : null);
+            if (shown == null || !amount || isNaN(parseFloat(amount))) return null;
+            return (
+              <div style={{ fontSize: 13, color: T.mut, marginBottom: 14, marginLeft: 2 }}>
+                Valor:{" "}
+                <span style={{ color: T.text, fontFamily: MONO, fontWeight: 600 }}>
+                  {money(parseFloat(amount) * shown, cur)}
+                </span>
+                {livePrice == null ? " (precio manual)" : ""}
+              </div>
+            );
+          })()}
+          <PrimaryBtn
+            color={T.gold}
+            disabled={!valid}
+            onClick={() =>
+              onSave({
+                id: state.id,
+                type: "crypto",
+                coinId: picked.coinId,
+                symbol: picked.symbol,
+                name: picked.name,
+                amount: parseFloat(amount),
+                manualPrice:
+                  manual !== "" && !isNaN(parseFloat(manual))
+                    ? parseFloat(manual)
+                    : undefined,
+              })
+            }
+          >
+            {editing ? "Guardar cambios" : "Agregar a mi cartera"}
+          </PrimaryBtn>
+          {editing && (
+            <button onClick={() => onDelete(state.id)} style={{ ...btnGhost, color: T.red, width: "100%", marginTop: 14, padding: 10 }}>
+              Eliminar
+            </button>
+          )}
+        </>
+      )}
+    </Sheet>
+  );
+}
+
+/* ─────────────────────────────  Piezas pequeñas  ───────────────────────────── */
+function StatusDot({ status, lastUpdate, source }) {
+  const map = {
+    live: [T.green, `En vivo · ${source || ""} · ${relTime(lastUpdate)}`],
+    loading: [T.gold, "Conectando…"],
+    error: [T.red, "Sin conexión al mercado"],
+  };
+  const [color, label] = map[status] || map.loading;
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 4 }}>
+      <span
+        style={{
+          width: 7,
+          height: 7,
+          borderRadius: 4,
+          background: color,
+          boxShadow: status === "live" ? `0 0 0 0 ${color}` : "none",
+          animation: status === "live" ? "pulse 1.8s infinite" : "none",
+        }}
+      />
+      <span style={{ fontSize: 12, color: T.mut }}>{label}</span>
+    </div>
+  );
+}
+function CoinBadge({ sym }) {
+  return (
+    <span
+      style={{
+        width: 36,
+        height: 36,
+        borderRadius: 18,
+        background: T.goldSoft,
+        color: T.gold,
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        fontSize: 12,
+        fontWeight: 700,
+        fontFamily: MONO,
+        flexShrink: 0,
+      }}
+    >
+      {(sym || "?").slice(0, 4)}
+    </span>
+  );
+}
+
+/* Íconos (SVG inline) */
+const IconChart = ({ color }) => (
+  <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke={color} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 3v18h18" /><path d="M7 15l4-5 3 3 5-7" /></svg>
+);
+const IconWallet = ({ color }) => (
+  <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke={color} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="6" width="18" height="14" rx="2.5" /><path d="M3 10h18" /><circle cx="17" cy="14" r="1" /></svg>
+);
+const IconSwap = ({ color }) => (
+  <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke={color} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M7 4v13" /><path d="M4 14l3 3 3-3" /><path d="M17 20V7" /><path d="M20 10l-3-3-3 3" /></svg>
+);
+const IconCoin = ({ color }) => (
+  <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke={color} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="9" /><path d="M12 7v10M9.5 9.5h4a1.8 1.8 0 010 3.6H9.5" /></svg>
+);
+const IconCash = ({ color }) => (
+  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke={color} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="2" y="6" width="20" height="12" rx="2" /><circle cx="12" cy="12" r="2.5" /></svg>
+);
+const IconPlus = ({ color }) => (
+  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke={color} strokeWidth="2.4" strokeLinecap="round"><path d="M12 5v14M5 12h14" /></svg>
+);
+
+/* ─────────────────────────────  Estilos base  ───────────────────────────── */
+const shell = {
+  maxWidth: 430,
+  margin: "0 auto",
+  minHeight: "100vh",
+  height: "100vh",
+  display: "flex",
+  flexDirection: "column",
+  background: T.bg,
+  color: T.text,
+  fontFamily: FONT,
+  position: "relative",
+  overflow: "hidden",
+};
+const rowCard = {
+  display: "flex",
+  justifyContent: "space-between",
+  alignItems: "center",
+  background: T.card,
+  border: `1px solid ${T.lineSoft}`,
+  borderRadius: 14,
+  padding: "13px 15px",
+  width: "100%",
+  boxSizing: "border-box",
+};
+const sectionTitle = {
+  fontSize: 12,
+  fontWeight: 600,
+  letterSpacing: 0.6,
+  textTransform: "uppercase",
+  color: T.mut2,
+};
+const emptyRow = {
+  background: T.bg2,
+  border: `1px dashed ${T.line}`,
+  borderRadius: 14,
+  padding: "18px 15px",
+  color: T.mut,
+  fontSize: 13.5,
+  textAlign: "center",
+};
+const tabbar = {
+  display: "flex",
+  borderTop: `1px solid ${T.line}`,
+  background: "rgba(11,14,20,0.9)",
+  backdropFilter: "blur(12px)",
+  padding: "8px 6px calc(8px + env(safe-area-inset-bottom))",
+  position: "absolute",
+  bottom: 0,
+  left: 0,
+  right: 0,
+};
+const css = `
+  * { -webkit-tap-highlight-color: transparent; }
+  ::placeholder { color: ${T.mut2}; }
+  input, select { color-scheme: dark; }
+  ::-webkit-scrollbar { width: 0; height: 0; }
+  button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px solid ${T.gold}; outline-offset: 1px; }
+  @keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(63,203,139,0.5);} 70% { box-shadow: 0 0 0 6px rgba(63,203,139,0);} 100% { box-shadow: 0 0 0 0 rgba(63,203,139,0);} }
+  @keyframes slideUp { from { transform: translateY(100%);} to { transform: translateY(0);} }
+  @keyframes fade { from { opacity: 0;} to { opacity: 1;} }
+`;
+
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+
+<script>
+  if ("serviceWorker" in navigator) {
+    window.addEventListener("load", function () {
+      navigator.serviceWorker.register("sw.js").catch(function () {});
+    });
+  }
+</script>
+</body>
+</html>
