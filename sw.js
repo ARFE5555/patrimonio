@@ -1,41 +1,51 @@
-const CACHE = "patrimonio-v1";
-const ASSETS = [
-  "./",
-  "./index.html",
-  "./manifest.webmanifest",
-  "./icon-180.png",
-  "./icon-192.png",
-  "./icon-512.png",
-  "https://unpkg.com/react@18/umd/react.production.min.js",
-  "https://unpkg.com/react-dom@18/umd/react-dom.production.min.js",
-  "https://unpkg.com/@babel/standalone/babel.min.js"
-];
+const CACHE = "patrimonio-v2";
 
-self.addEventListener("install", (e) => {
-  e.waitUntil(
-    caches.open(CACHE).then((c) =>
-      Promise.all(ASSETS.map((u) => c.add(u).catch(() => {})))
-    )
-  );
-  self.skipWaiting();
-});
+self.addEventListener("install", () => self.skipWaiting());
 
 self.addEventListener("activate", (e) => {
   e.waitUntil(
     caches.keys().then((ks) =>
-      Promise.all(ks.filter((k) => k !== CACHE).map((k) => caches.delete(k)))
+      Promise.all(ks.map((k) => (k !== CACHE ? caches.delete(k) : null)))
     )
   );
   self.clients.claim();
 });
 
 self.addEventListener("fetch", (e) => {
-  const url = new URL(e.request.url);
-  // Precios: siempre desde la red (con respaldo a caché si no hay conexión)
-  if (url.hostname.includes("coingecko") || url.hostname.includes("coinpaprika")) {
-    e.respondWith(fetch(e.request).catch(() => caches.match(e.request)));
+  const req = e.request;
+  const url = new URL(req.url);
+
+  // HTML / navegación: red primero (así siempre baja la última versión)
+  if (req.mode === "navigate") {
+    e.respondWith(
+      fetch(req)
+        .then((r) => {
+          const copy = r.clone();
+          caches.open(CACHE).then((c) => c.put(req, copy));
+          return r;
+        })
+        .catch(() => caches.match(req).then((r) => r || caches.match("./index.html")))
+    );
     return;
   }
-  // Resto: caché primero, luego red
-  e.respondWith(caches.match(e.request).then((r) => r || fetch(e.request)));
+
+  // Precios: siempre desde la red, con respaldo a caché sin conexión
+  if (url.hostname.includes("coingecko") || url.hostname.includes("coinpaprika")) {
+    e.respondWith(fetch(req).catch(() => caches.match(req)));
+    return;
+  }
+
+  // Librerías e íconos: usa caché y actualiza en segundo plano
+  e.respondWith(
+    caches.match(req).then((cached) => {
+      const net = fetch(req)
+        .then((r) => {
+          const copy = r.clone();
+          caches.open(CACHE).then((c) => c.put(req, copy));
+          return r;
+        })
+        .catch(() => cached);
+      return cached || net;
+    })
+  );
 });
