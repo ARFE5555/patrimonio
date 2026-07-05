@@ -18,7 +18,7 @@ self.addEventListener("fetch", (e) => {
   // HTML / navegación: red primero (así siempre baja la última versión)
   if (req.mode === "navigate") {
     e.respondWith(
-      fetch(req)
+      fetch(req, { cache: "no-store" })
         .then((r) => {
           const copy = r.clone();
           caches.open(CACHE).then((c) => c.put(req, copy));
