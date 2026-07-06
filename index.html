@@ -159,6 +159,43 @@ const comOp = (d) =>
     ? d.comisionBs
     : (d.usd || 0) * (d.tasa || 0) * (COMISION[d.comisionTipo] || 0);
 
+// Asignación automática FIFO: cada compra consume los VES de las ventas abiertas
+// por orden de llegada; si agota una, se fracciona hacia la siguiente.
+function allocateFIFO(ventas, compras) {
+  const arriv = (a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : (a.createdAt || 0) - (b.createdAt || 0));
+  const buckets = ventas.slice().sort(arriv).map((v) => ({ v, cap: (v.usd || 0) * (v.tasa || 0), used: 0 }));
+  const cs = compras.slice().sort(arriv);
+  const ventaStats = {};
+  buckets.forEach((b) => { ventaStats[b.v.id] = { usdRecomprado: 0, vesUsados: 0, allocs: [] }; });
+  const unalloc = [];
+  const EPS = 1e-6;
+  let bi = 0;
+  for (const c of cs) {
+    const usd = c.usd || 0;
+    const W = usd * (c.tasa || 0) + comOp(c); // VES totales que consume la compra (con comisión)
+    if (W <= EPS) continue;
+    let remaining = W;
+    while (remaining > EPS) {
+      while (bi < buckets.length && buckets[bi].used >= buckets[bi].cap - EPS) bi++;
+      if (bi >= buckets.length) {
+        unalloc.push({ compraId: c.id, compra: c, usd: usd * (remaining / W), ves: remaining });
+        remaining = 0;
+        break;
+      }
+      const b = buckets[bi];
+      const take = Math.min(b.cap - b.used, remaining);
+      const usdShare = usd * (take / W);
+      b.used += take;
+      const st = ventaStats[b.v.id];
+      st.usdRecomprado += usdShare;
+      st.vesUsados += take;
+      st.allocs.push({ compraId: c.id, compra: c, usd: usdShare, ves: take });
+      remaining -= take;
+    }
+  }
+  return { ventaStats, unalloc };
+}
+
 /* ── Lectura de Google Sheets (CSV publicado) ── */
 function parseCSV(text) {
   const rows = [];
@@ -238,9 +275,84 @@ function mergeSheetOps(prev, rows) {
   const manual = prev.filter((d) => d.source !== "sheet");
   const sheetOps = rows.map((r) => {
     const ex = prevByRef[r.refKey];
-    return { ...r, id: (ex && ex.id) || uid(), createdAt: (ex && ex.createdAt) || Date.now(), ventaId: ex ? ex.ventaId : undefined };
+    return {
+      ...r,
+      id: (ex && ex.id) || uid(),
+      createdAt: (ex && ex.createdAt) || Date.now(),
+      ventaId: ex ? ex.ventaId : undefined,
+      pagado: ex ? ex.pagado : undefined,
+      hasReceipt: ex ? ex.hasReceipt : undefined,
+    };
   });
   return [...sheetOps, ...manual];
+}
+
+/* ── Comprobantes: guardados en IndexedDB (soporta archivos grandes) ── */
+function idbOpen() {
+  return new Promise((res, rej) => {
+    if (!window.indexedDB) { rej(new Error("Este navegador no soporta guardar comprobantes.")); return; }
+    const r = window.indexedDB.open("patrimonio", 1);
+    r.onupgradeneeded = () => r.result.createObjectStore("receipts");
+    r.onsuccess = () => res(r.result);
+    r.onerror = () => rej(r.error);
+  });
+}
+async function idbPut(id, val) {
+  const db = await idbOpen();
+  return new Promise((res, rej) => {
+    const t = db.transaction("receipts", "readwrite");
+    t.objectStore("receipts").put(val, id);
+    t.oncomplete = () => res();
+    t.onerror = () => rej(t.error);
+  });
+}
+async function idbGet(id) {
+  const db = await idbOpen();
+  return new Promise((res, rej) => {
+    const t = db.transaction("receipts", "readonly");
+    const rq = t.objectStore("receipts").get(id);
+    rq.onsuccess = () => res(rq.result || null);
+    rq.onerror = () => rej(rq.error);
+  });
+}
+async function idbDel(id) {
+  try {
+    const db = await idbOpen();
+    return new Promise((res) => {
+      const t = db.transaction("receipts", "readwrite");
+      t.objectStore("receipts").delete(id);
+      t.oncomplete = () => res();
+      t.onerror = () => res();
+    });
+  } catch { /* ignora */ }
+}
+// Comprime imágenes; los PDF u otros se leen tal cual (con límite de tamaño)
+function fileToStored(file) {
+  return new Promise((res, rej) => {
+    if (file.type && file.type.indexOf("image/") === 0) {
+      const img = new Image();
+      const url = URL.createObjectURL(file);
+      img.onload = () => {
+        const maxDim = 1400;
+        let { width, height } = img;
+        if (width > height && width > maxDim) { height = (height * maxDim) / width; width = maxDim; }
+        else if (height > maxDim) { width = (width * maxDim) / height; height = maxDim; }
+        const c = document.createElement("canvas");
+        c.width = width; c.height = height;
+        c.getContext("2d").drawImage(img, 0, 0, width, height);
+        URL.revokeObjectURL(url);
+        res({ dataUrl: c.toDataURL("image/jpeg", 0.7), type: "image" });
+      };
+      img.onerror = () => { URL.revokeObjectURL(url); rej(new Error("No se pudo leer la imagen.")); };
+      img.src = url;
+    } else {
+      if (file.size > 6 * 1024 * 1024) { rej(new Error("El archivo es muy grande (máx. 6 MB).")); return; }
+      const fr = new FileReader();
+      fr.onload = () => res({ dataUrl: fr.result, type: "file", name: file.name });
+      fr.onerror = () => rej(new Error("No se pudo leer el archivo."));
+      fr.readAsDataURL(file);
+    }
+  });
 }
 function relTime(ts) {
   if (!ts) return "—";
@@ -597,7 +709,11 @@ function App() {
   }
   function deleteDivisa(id) {
     setDivisas((prev) => prev.filter((d) => d.id !== id));
+    idbDel(id);
     setDivisaSheet(null);
+  }
+  function patchDivisa(id, patch) {
+    setDivisas((prev) => prev.map((d) => (d.id === id ? { ...d, ...patch } : d)));
   }
   async function syncSheet(url) {
     const u = (url || settings.sheetUrl || "").trim();
@@ -706,6 +822,7 @@ function App() {
             onAdd={(kind) => setDivisaSheet({ kind, mode: "new" })}
             onEdit={(d) => setDivisaSheet(d)}
             onDelete={deleteDivisa}
+            onPatch={patchDivisa}
           />
         )}
         {tab === "ajustes" && (
@@ -1635,23 +1752,21 @@ function AjustesTab({ settings, setSettings, accounts, txns, prices, cur, divisa
         return [a.name, TYPE_LABEL[a.type], round2(ini), round2(fin), round2(ing), round2(egr), round2(fin - ini)];
       });
 
-      // Rentabilidad de divisas (ventas del período con sus compras vinculadas)
+      // Rentabilidad de divisas (asignación automática FIFO)
       const _divs = divisas || [];
-      const _ves = (d) => (d.usd || 0) * (d.tasa || 0);
-      const _com = (d) => comOp(d);
-      const _comprasAll = _divs.filter((d) => d.kind === "compra");
-      const _ventasR = _divs.filter((d) => d.kind === "venta" && d.date >= from && d.date <= to);
+      const _allV = _divs.filter((d) => d.kind === "venta");
+      const _allC = _divs.filter((d) => d.kind === "compra");
+      const _allo = allocateFIFO(_allV, _allC);
+      const _ventasR = _allV.filter((v) => v.date >= from && v.date <= to);
       let dUsdVend = 0, dUsdRe = 0, dBsRec = 0, dBsUs = 0, dGan = 0, dCap = 0;
       _ventasR.forEach((v) => {
-        const linked = _comprasAll.filter((c) => c.ventaId === v.id);
-        const usdRe = linked.reduce((s, c) => s + (c.usd || 0), 0);
-        const vesUs = linked.reduce((s, c) => s + _ves(c) + _com(c), 0);
-        const usdEq = v.tasa > 0 ? vesUs / v.tasa : 0;
+        const s = _allo.ventaStats[v.id] || { usdRecomprado: 0, vesUsados: 0 };
+        const usdEq = v.tasa > 0 ? s.vesUsados / v.tasa : 0;
         dUsdVend += v.usd || 0;
-        dUsdRe += usdRe;
-        dBsRec += _ves(v);
-        dBsUs += vesUs;
-        dGan += usdRe - usdEq;
+        dUsdRe += s.usdRecomprado;
+        dBsRec += (v.usd || 0) * (v.tasa || 0);
+        dBsUs += s.vesUsados;
+        dGan += s.usdRecomprado - usdEq;
         dCap += usdEq;
       });
       const dRent = dCap > 0 ? (dGan / dCap) * 100 : 0;
@@ -1704,31 +1819,31 @@ function AjustesTab({ settings, setSettings, accounts, txns, prices, cur, divisa
       const wsC = XLSX.utils.aoa_to_sheet(criptoAoa);
       wsC["!cols"] = [{ wch: 18 }, { wch: 10 }, { wch: 16 }, { wch: 16 }, { wch: 16 }];
 
-      // Divisas por bloques: cada venta con sus compras vinculadas y su total de rentabilidad
-      const divs = divisas || [];
+      // Divisas por bloques (asignación automática FIFO, con fraccionamiento)
+      const divs2 = divisas || [];
       const vesTot = (d) => (d.usd || 0) * (d.tasa || 0);
-      const comisionVes = (d) => comOp(d);
       const byDate = (a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : (a.createdAt || 0) - (b.createdAt || 0));
-      const comprasAll = divs.filter((d) => d.kind === "compra");
-      const ventasRango = divs.filter((d) => d.kind === "venta" && d.date >= from && d.date <= to).slice().sort(byDate);
+      const allV2 = divs2.filter((d) => d.kind === "venta");
+      const allC2 = divs2.filter((d) => d.kind === "compra");
+      const allo2 = allocateFIFO(allV2, allC2);
+      const ventasRango = allV2.filter((v) => v.date >= from && v.date <= to).slice().sort(byDate);
       const header = ["Tipo", "Fecha", "Cliente", "USD", "Tasa (VES)", "VES", "Comisión (VES)", "Total VES", "Ganancia (USD)", "Rentab. %", "Referencia"];
-
       const aoa = [[`Divisas por venta · ${from} a ${to}  (USD y Bs)`], []];
       let gTotal = 0;
       ventasRango.forEach((v) => {
         const gen = vesTot(v);
+        const s = allo2.ventaStats[v.id] || { usdRecomprado: 0, vesUsados: 0, allocs: [] };
         aoa.push(header);
         aoa.push(["VENTA", v.date, v.persona || "", round2(v.usd || 0), v.tasa || 0, round2(gen), 0, round2(gen), "", "", v.referencia || ""]);
-        const linked = comprasAll.filter((c) => c.ventaId === v.id).slice().sort(byDate);
-        let usdRe = 0, vesUs = 0;
-        linked.forEach((c) => {
-          const cCom = comisionVes(c);
-          const cTot = vesTot(c) + cCom;
-          usdRe += c.usd || 0;
-          vesUs += cTot;
-          aoa.push(["Compra", c.date, c.persona || "", round2(c.usd || 0), c.tasa || 0, round2(vesTot(c)), round2(cCom), round2(cTot), "", "", c.referencia || ""]);
+        s.allocs.forEach((a) => {
+          const c = a.compra;
+          const frac = (c.usd || 0) > 0 ? a.usd / (c.usd || 1) : 0;
+          const cCom = comOp(c) * frac;
+          const cVes = a.usd * (c.tasa || 0);
+          aoa.push(["Compra", c.date, c.persona || "", round2(a.usd), c.tasa || 0, round2(cVes), round2(cCom), round2(a.ves), "", "", c.referencia || ""]);
         });
-        if (linked.length === 0) aoa.push(["(sin compras vinculadas)", "", "", "", "", "", "", "", "", "", ""]);
+        if (s.allocs.length === 0) aoa.push(["(sin compras asignadas)", "", "", "", "", "", "", "", "", "", ""]);
+        const usdRe = s.usdRecomprado, vesUs = s.vesUsados;
         const usdEq = v.tasa > 0 ? vesUs / v.tasa : 0;
         const gan = usdRe - usdEq;
         const rent = usdEq > 0 ? (gan / usdEq) * 100 : 0;
@@ -1736,19 +1851,18 @@ function AjustesTab({ settings, setSettings, accounts, txns, prices, cur, divisa
         aoa.push(["TOTAL RENTABILIDAD", "", "", round2(usdRe), "", round2(vesUs), "", "", round2(gan), round2(rent), ""]);
         aoa.push([]);
       });
-
-      // Compras del período sin venta asignada
-      const sueltas = comprasAll.filter((c) => !c.ventaId && c.date >= from && c.date <= to).slice().sort(byDate);
-      if (sueltas.length) {
-        aoa.push(["COMPRAS SIN VINCULAR"], header);
-        sueltas.forEach((c) => {
-          const cCom = comisionVes(c);
-          aoa.push(["Compra", c.date, c.persona || "", round2(c.usd || 0), c.tasa || 0, round2(vesTot(c)), round2(cCom), round2(vesTot(c) + cCom), "", "", c.referencia || ""]);
+      // Porciones sin asignar (compras sin venta con VES disponibles), del período
+      const sinAsig = allo2.unalloc.filter((a) => a.compra.date >= from && a.compra.date <= to);
+      if (sinAsig.length) {
+        aoa.push(["SIN ASIGNAR"], header);
+        sinAsig.forEach((a) => {
+          const c = a.compra;
+          const frac = (c.usd || 0) > 0 ? a.usd / (c.usd || 1) : 0;
+          aoa.push(["Compra", c.date, c.persona || "", round2(a.usd), c.tasa || 0, round2(a.usd * (c.tasa || 0)), round2(comOp(c) * frac), round2(a.ves), "", "", c.referencia || ""]);
         });
         aoa.push([]);
       }
       aoa.push(["GANANCIA TOTAL (USD)", "", "", "", "", "", "", "", round2(gTotal), "", ""]);
-
       const wsDiv = XLSX.utils.aoa_to_sheet(aoa);
       wsDiv["!cols"] = [{ wch: 20 }, { wch: 12 }, { wch: 18 }, { wch: 12 }, { wch: 12 }, { wch: 16 }, { wch: 15 }, { wch: 16 }, { wch: 15 }, { wch: 10 }, { wch: 16 }];
 
@@ -1850,7 +1964,11 @@ function AjustesTab({ settings, setSettings, accounts, txns, prices, cur, divisa
 }
 
 /* ─────────────────────────────  Tab: Divisas (USD / VES)  ───────────────────────────── */
-function DivisasTab({ divisas, onAdd, onEdit, onDelete }) {
+function DivisasTab({ divisas, onAdd, onEdit, onDelete, onPatch }) {
+  const [openId, setOpenId] = useState(null);
+  const [busyId, setBusyId] = useState(null);
+  const [receiptErr, setReceiptErr] = useState("");
+  const [viewer, setViewer] = useState(null);
   const ventas = divisas.filter((d) => d.kind === "venta");
   const compras = divisas.filter((d) => d.kind === "compra");
   const vesDe = (d) => (d.usd || 0) * (d.tasa || 0);
@@ -1864,18 +1982,16 @@ function DivisasTab({ divisas, onAdd, onEdit, onDelete }) {
   const bsPagados = compras.reduce((s, d) => s + vesDe(d) + comisionDe(d), 0);
   const bsDisponibles = bsRecibidos - bsPagados;
 
-  // Rentabilidad por venta: compras vinculadas (por ventaId) y profit por diferencial cambiario
-  const vesConComision = (c) => vesDe(c) + comisionDe(c);
+  // Rentabilidad por venta con asignación automática FIFO (con fraccionamiento)
+  const alloc = allocateFIFO(ventas, compras);
   const statsDeVenta = (v) => {
-    const linked = compras.filter((c) => c.ventaId === v.id);
-    const usdRecomprado = linked.reduce((s, c) => s + (c.usd || 0), 0);
-    const vesUsados = linked.reduce((s, c) => s + vesConComision(c), 0);
+    const s = alloc.ventaStats[v.id] || { usdRecomprado: 0, vesUsados: 0, allocs: [] };
     const vesGenerados = vesDe(v);
-    const vesRestantes = vesGenerados - vesUsados;
-    const usdEquiv = v.tasa > 0 ? vesUsados / v.tasa : 0; // USD "vendidos" que financiaron esas compras
-    const gananciaUsd = usdRecomprado - usdEquiv;
+    const vesRestantes = vesGenerados - s.vesUsados;
+    const usdEquiv = v.tasa > 0 ? s.vesUsados / v.tasa : 0;
+    const gananciaUsd = s.usdRecomprado - usdEquiv;
     const rentab = usdEquiv > 0 ? (gananciaUsd / usdEquiv) * 100 : 0;
-    return { linked, usdRecomprado, vesUsados, vesGenerados, vesRestantes, gananciaUsd, rentab };
+    return { allocs: s.allocs, usdRecomprado: s.usdRecomprado, vesUsados: s.vesUsados, vesGenerados, vesRestantes, gananciaUsd, rentab };
   };
   const gananciaTotal = ventas.reduce((s, v) => s + statsDeVenta(v).gananciaUsd, 0);
 
@@ -1888,6 +2004,66 @@ function DivisasTab({ divisas, onAdd, onEdit, onDelete }) {
         {val}
       </div>
     </div>
+  );
+
+  const seg = (active, color) => ({
+    flex: 1, border: "none", borderRadius: 9, padding: "10px", fontSize: 14,
+    fontWeight: 600, fontFamily: FONT, cursor: "pointer",
+    background: active ? color : "transparent", color: active ? "#0A0F1E" : T.mut,
+  });
+  const miniBtn = { flex: 1, borderRadius: 11, padding: "11px", fontSize: 13.5, fontWeight: 600, fontFamily: FONT, cursor: "pointer", textAlign: "center", boxSizing: "border-box" };
+  const sortDesc = (a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : (b.createdAt || 0) - (a.createdAt || 0));
+  const sortAsc = (a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : (a.createdAt || 0) - (b.createdAt || 0));
+  const ventasOrden = ventas.slice().sort(sortDesc);
+  const sueltas = compras.filter((c) => !c.ventaId).slice().sort(sortDesc);
+
+  async function onReceiptFile(op, e) {
+    const f = e.target.files && e.target.files[0];
+    e.target.value = "";
+    if (!f) return;
+    setBusyId(op.id); setReceiptErr("");
+    try { const stored = await fileToStored(f); await idbPut(op.id, stored); onPatch(op.id, { hasReceipt: true }); }
+    catch (ex) { setReceiptErr((ex && ex.message) || "No se pudo guardar el comprobante."); }
+    finally { setBusyId(null); }
+  }
+  async function openReceipt(op) {
+    setReceiptErr("");
+    try { const stored = await idbGet(op.id); if (stored) setViewer({ op, stored }); else setReceiptErr("No se encontró el comprobante."); }
+    catch { setReceiptErr("No se pudo abrir el comprobante."); }
+  }
+  async function removeReceipt(op) { await idbDel(op.id); onPatch(op.id, { hasReceipt: false }); }
+
+  const allocRow = (a, i) => {
+    const c = a.compra;
+    const parcial = a.usd < (c.usd || 0) - 1e-6;
+    return (
+      <button key={c.id + "-" + i} onClick={() => onEdit(c)} style={{ ...rowCard, cursor: "pointer", textAlign: "left" }}>
+        <div style={{ minWidth: 0 }}>
+          <div style={{ fontSize: 13.5, fontWeight: 600, color: T.text }}>
+            {fmtUsd(a.usd)} <span style={{ color: T.mut, fontWeight: 400 }}>× {(c.tasa || 0).toLocaleString("es-VE")}</span>
+            {parcial && <span style={{ color: T.gold, fontWeight: 400 }}> · parcial de {fmtUsd(c.usd)}</span>}
+          </div>
+          <div style={{ fontSize: 11.5, color: T.mut, fontFamily: MONO, marginTop: 2 }}>
+            {fmtDate(c.date)} · {fmtBs(a.ves)}{c.persona ? ` · ${c.persona}` : ""}{c.referencia ? ` · ref ${c.referencia}` : ""}
+          </div>
+        </div>
+        <button onClick={(e) => { e.stopPropagation(); onDelete(c.id); }} style={{ ...btnGhost, color: T.mut2, fontSize: 18, lineHeight: 1, paddingLeft: 8 }} aria-label="Eliminar">×</button>
+      </button>
+    );
+  };
+
+  const compraRow = (c) => (
+    <button key={c.id} onClick={() => onEdit(c)} style={{ ...rowCard, cursor: "pointer", textAlign: "left" }}>
+      <div style={{ minWidth: 0 }}>
+        <div style={{ fontSize: 13.5, fontWeight: 600, color: T.text }}>
+          {fmtUsd(c.usd)} <span style={{ color: T.mut, fontWeight: 400 }}>× {(c.tasa || 0).toLocaleString("es-VE")}</span>
+        </div>
+        <div style={{ fontSize: 11.5, color: T.mut, fontFamily: MONO, marginTop: 2 }}>
+          {fmtDate(c.date)} · {fmtBs(vesDe(c))} · com. {fmtBs(comisionDe(c))}{c.persona ? ` · ${c.persona}` : ""}{c.referencia ? ` · ref ${c.referencia}` : ""}
+        </div>
+      </div>
+      <button onClick={(e) => { e.stopPropagation(); onDelete(c.id); }} style={{ ...btnGhost, color: T.mut2, fontSize: 18, lineHeight: 1, paddingLeft: 8 }} aria-label="Eliminar">×</button>
+    </button>
   );
 
   return (
@@ -1950,75 +2126,111 @@ function DivisasTab({ divisas, onAdd, onEdit, onDelete }) {
         </button>
       </div>
 
-      {/* Historial */}
-      <div style={{ ...sectionTitle, marginBottom: 10 }}>Operaciones</div>
-      {ordenadas.length === 0 ? (
-        <div style={emptyRow}>Registrá tu primera venta o compra de divisas</div>
+      {/* Ventas (desplegables) */}
+      <div style={{ ...sectionTitle, marginBottom: 10 }}>Ventas</div>
+      {ventasOrden.length === 0 ? (
+        <div style={emptyRow}>Registrá tu primera venta de divisas</div>
       ) : (
         <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-          {ordenadas.map((d) => {
-            const venta = d.kind === "venta";
-            const ves = vesDe(d);
-            const com = comisionDe(d);
+          {ventasOrden.map((v) => {
+            const st = statsDeVenta(v);
+            const open = openId === v.id;
+            const pagado = !!v.pagado;
             return (
-              <button key={d.id} onClick={() => onEdit(d)} style={{ ...rowCard, cursor: "pointer", textAlign: "left", alignItems: "flex-start" }}>
-                <div style={{ minWidth: 0, flex: 1 }}>
-                  <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 3 }}>
-                    <span style={{ fontSize: 11, fontWeight: 700, color: venta ? T.green : T.blue, background: venta ? T.greenSoft : "rgba(91,141,239,0.14)", padding: "2px 8px", borderRadius: 6 }}>
-                      {venta ? "VENTA" : "COMPRA"}
-                    </span>
-                    <span style={{ fontSize: 12, color: T.mut }}>{fmtDate(d.date)}</span>
+              <div key={v.id} style={{ ...rowCard, flexDirection: "column", alignItems: "stretch", padding: 0, overflow: "hidden" }}>
+                <div onClick={() => setOpenId(open ? null : v.id)} style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 10, padding: "13px 15px", cursor: "pointer" }}>
+                  <div style={{ minWidth: 0, flex: 1 }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 4, flexWrap: "wrap" }}>
+                      <span style={{ fontSize: 11, fontWeight: 700, color: T.green, background: T.greenSoft, padding: "2px 8px", borderRadius: 6 }}>VENTA</span>
+                      <span style={{ fontSize: 12, color: T.mut }}>{fmtDate(v.date)}</span>
+                      <span style={{ fontSize: 10.5, fontWeight: 700, padding: "2px 8px", borderRadius: 6, color: pagado ? T.green : T.mut2, background: pagado ? T.greenSoft : T.bg2, border: `1px solid ${pagado ? T.green : T.line}` }}>
+                        {pagado ? "PAGADO" : "NO PAGADO"}
+                      </span>
+                      {v.hasReceipt && <span style={{ fontSize: 10, fontWeight: 700, padding: "2px 7px", borderRadius: 6, color: T.blue, background: "rgba(91,141,239,0.14)" }}>ADJUNTO</span>}
+                    </div>
+                    <div style={{ fontSize: 14.5, fontWeight: 600, color: T.text }}>
+                      {fmtUsd(v.usd)} <span style={{ color: T.mut, fontWeight: 400 }}>× {(v.tasa || 0).toLocaleString("es-VE")}</span>
+                    </div>
+                    <div style={{ fontSize: 12, color: T.mut, fontFamily: MONO, marginTop: 2 }}>
+                      {fmtBs(vesDe(v))}{v.persona ? ` · ${v.persona}` : ""}
+                    </div>
+                    <div style={{ fontSize: 12, marginTop: 4, color: st.gananciaUsd >= 0 ? T.green : T.red, fontWeight: 600 }}>
+                      {st.allocs.length} compra(s) · {st.gananciaUsd >= 0 ? "+" : ""}{fmtUsd(st.gananciaUsd)} ({st.rentab.toFixed(2)}%)
+                    </div>
                   </div>
-                  <div style={{ fontSize: 14.5, fontWeight: 600, color: T.text }}>
-                    {fmtUsd(d.usd)} <span style={{ color: T.mut, fontWeight: 400 }}>× {(d.tasa || 0).toLocaleString("es-VE")}</span>
-                  </div>
-                  <div style={{ fontSize: 12, color: T.mut, fontFamily: MONO, marginTop: 2 }}>
-                    {fmtBs(ves)}
-                    {d.persona ? ` · ${d.persona}` : ""}
-                    {!venta ? ` · com. ${fmtBs(com)}` : ""}
-                    {d.referencia ? ` · ref ${d.referencia}` : ""}
-                  </div>
-                  {venta && (() => {
-                    const st = statsDeVenta(d);
-                    return (
-                      <div style={{ marginTop: 8, padding: "9px 11px", background: T.bg2, border: `1px solid ${T.lineSoft}`, borderRadius: 10 }}>
-                        <div style={{ fontSize: 10.5, fontWeight: 600, letterSpacing: 0.5, textTransform: "uppercase", color: T.mut2, marginBottom: 6 }}>
-                          Rentabilidad
-                        </div>
-                        {st.linked.length === 0 ? (
-                          <div style={{ fontSize: 12, color: T.mut }}>Aún sin compras vinculadas a esta venta.</div>
-                        ) : (
-                          <>
-                            <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, color: T.mut, marginBottom: 4 }}>
-                              <span>Recompras: {st.linked.length} · {fmtUsd(st.usdRecomprado)}</span>
-                              <span style={{ fontFamily: MONO }}>{st.rentab >= 0 ? "+" : ""}{st.rentab.toFixed(2)}%</span>
-                            </div>
-                            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
-                              <span style={{ fontSize: 11.5, color: T.mut }}>
-                                VES usados {fmtBs(st.vesUsados)} / {fmtBs(st.vesGenerados)}
-                              </span>
-                              <span style={{ fontFamily: MONO, fontVariantNumeric: "tabular-nums", fontSize: 14, fontWeight: 700, color: st.gananciaUsd >= 0 ? T.green : T.red }}>
-                                {st.gananciaUsd >= 0 ? "+" : ""}{fmtUsd(st.gananciaUsd)}
-                              </span>
-                            </div>
-                          </>
-                        )}
-                      </div>
-                    );
-                  })()}
+                  <span style={{ color: T.mut2, fontSize: 12, paddingTop: 2 }}>{open ? "▲" : "▼"}</span>
                 </div>
-                <button
-                  onClick={(e) => { e.stopPropagation(); onDelete(d.id); }}
-                  style={{ ...btnGhost, color: T.mut2, fontSize: 18, lineHeight: 1, paddingLeft: 8 }}
-                  aria-label="Eliminar"
-                >
-                  ×
-                </button>
-              </button>
+
+                {open && (
+                  <div style={{ padding: "4px 15px 16px", borderTop: `1px solid ${T.lineSoft}` }}>
+                    <div style={{ ...sectionTitle, margin: "14px 0 8px" }}>Estado de pago</div>
+                    <div style={{ display: "flex", background: T.card2, borderRadius: 11, padding: 4, border: `1px solid ${T.lineSoft}` }}>
+                      <button onClick={() => onPatch(v.id, { pagado: false })} style={seg(!pagado, T.mut2)}>No pagado</button>
+                      <button onClick={() => onPatch(v.id, { pagado: true })} style={seg(pagado, T.green)}>Pagado</button>
+                    </div>
+
+                    <div style={{ ...sectionTitle, margin: "16px 0 8px" }}>Comprobante de pago</div>
+                    {v.hasReceipt ? (
+                      <div style={{ display: "flex", gap: 8 }}>
+                        <button onClick={() => openReceipt(v)} style={{ ...miniBtn, background: T.blue, color: "#0A0F1E" }}>Ver comprobante</button>
+                        <button onClick={() => removeReceipt(v)} style={{ ...miniBtn, background: "transparent", color: T.red, border: `1px solid ${T.red}` }}>Quitar</button>
+                      </div>
+                    ) : (
+                      <label style={{ ...miniBtn, display: "block", background: T.goldSoft, color: T.gold, border: `1px solid ${T.gold}` }}>
+                        {busyId === v.id ? "Guardando…" : "Cargar comprobante"}
+                        <input type="file" accept="image/*,application/pdf" style={{ display: "none" }} onChange={(e) => onReceiptFile(v, e)} />
+                      </label>
+                    )}
+                    {receiptErr && <div style={{ fontSize: 12.5, color: T.red, marginTop: 8 }}>{receiptErr}</div>}
+
+                    <div style={{ ...sectionTitle, margin: "16px 0 8px" }}>Compras asignadas (FIFO) ({st.allocs.length})</div>
+                    {st.allocs.length === 0 ? (
+                      <div style={{ fontSize: 12.5, color: T.mut, marginBottom: 6 }}>Aún sin compras asignadas a esta venta.</div>
+                    ) : (
+                      <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                        {st.allocs.map((a, i) => allocRow(a, i))}
+                      </div>
+                    )}
+
+                    <div style={{ marginTop: 12, padding: "10px 12px", background: T.bg2, border: `1px solid ${T.lineSoft}`, borderRadius: 10, fontSize: 12, color: T.mut }}>
+                      VES generados {fmtBs(st.vesGenerados)} · usados {fmtBs(st.vesUsados)} · restante {fmtBs(st.vesRestantes)}
+                    </div>
+
+                    <div style={{ display: "flex", gap: 8, marginTop: 14 }}>
+                      <button onClick={() => onEdit(v)} style={{ ...miniBtn, background: "transparent", color: T.text, border: `1px solid ${T.line}` }}>Editar venta</button>
+                      <button onClick={() => onDelete(v.id)} style={{ ...miniBtn, background: "transparent", color: T.red, border: `1px solid ${T.red}` }}>Eliminar</button>
+                    </div>
+                  </div>
+                )}
+              </div>
             );
           })}
         </div>
       )}
+
+      {alloc.unalloc.length > 0 && (
+        <>
+          <div style={{ ...sectionTitle, margin: "22px 0 10px" }}>Sin asignar (sin venta con VES disponibles)</div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            {alloc.unalloc.map((a, i) => allocRow(a, i))}
+          </div>
+        </>
+      )}
+
+      <Sheet open={!!viewer} onClose={() => setViewer(null)} title="Comprobante de pago">
+        {viewer && (viewer.stored && viewer.stored.type === "image" ? (
+          <img src={viewer.stored.dataUrl} alt="comprobante" style={{ width: "100%", borderRadius: 12, display: "block" }} />
+        ) : (
+          viewer && (
+            <div>
+              <div style={{ color: T.mut, fontSize: 13, marginBottom: 12 }}>{(viewer.stored && viewer.stored.name) || "Archivo adjunto"}</div>
+              <a href={viewer.stored.dataUrl} download={(viewer.stored && viewer.stored.name) || "comprobante"} style={{ display: "block", textAlign: "center", background: T.gold, color: "#0A0F1E", borderRadius: 12, padding: "13px", fontWeight: 600, textDecoration: "none" }}>
+                Abrir / descargar
+              </a>
+            </div>
+          )
+        ))}
+      </Sheet>
     </div>
   );
 }
@@ -2119,18 +2331,8 @@ function DivisaSheet({ state, divisas, onClose, onSave, onDelete }) {
             <span>Comisión: <span style={{ color: T.text, fontFamily: MONO }}>{fmtBs(comision)}</span></span>
             <span>Total: <span style={{ color: T.text, fontFamily: MONO, fontWeight: 600 }}>{fmtBs(ves + comision)}</span></span>
           </div>
-          <Field label="Venta de origen (de dónde salen los VES)">
-            <select style={{ ...inputStyle, appearance: "none" }} value={ventaId} onChange={(e) => setVentaId(e.target.value)}>
-              <option value="">— Sin vincular —</option>
-              {ventasList.map(({ v, restante }) => (
-                <option key={v.id} value={v.id}>
-                  {fmtDate(v.date)} · {v.persona || "—"} · {fmtUsd(v.usd)} @ {v.tasa} · queda {fmtBs(restante)}
-                </option>
-              ))}
-            </select>
-          </Field>
-          <div style={{ fontSize: 12, color: T.mut, margin: "-8px 2px 4px" }}>
-            Se asigna sola la venta abierta más antigua con Bs disponibles. Podés cambiarla.
+          <div style={{ fontSize: 12, color: T.mut, margin: "4px 2px 8px", lineHeight: 1.5 }}>
+            Esta compra se asigna automáticamente a las ventas abiertas por orden de llegada. Si agota una venta, se fracciona hacia la siguiente.
           </div>
         </>
       )}
@@ -2150,7 +2352,7 @@ function DivisaSheet({ state, divisas, onClose, onSave, onDelete }) {
             tasa: nTasa,
             date,
             persona: persona.trim(),
-            ...(venta ? {} : { comisionTipo, ventaId: ventaId || undefined }),
+            ...(venta ? {} : { comisionTipo }),
           })
         }
       >
