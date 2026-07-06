@@ -885,14 +885,7 @@ function App() {
       {/* Tab bar (solo móvil) */}
       {!desktop && (
       <nav style={tabbar}>
-        {[
-          ["balance", "Balance", IconChart],
-          ["accounts", "Cuentas", IconWallet],
-          ["txns", "Movim.", IconSwap],
-          ["crypto", "Cripto", IconCoin],
-          ["divisas", "Divisas", IconExchange],
-          ["ajustes", "Ajustes", IconGear],
-        ].map(([id, label, Icon]) => (
+        {NAV.map(([id, label, short, Icon]) => (
           <button
             key={id}
             onClick={() => setTab(id)}
@@ -911,7 +904,7 @@ function App() {
           >
             <Icon color={tab === id ? T.gold : T.mut2} />
             <span style={{ fontSize: 10.5, fontFamily: FONT, fontWeight: 500 }}>
-              {label}
+              {short}
             </span>
           </button>
         ))}
