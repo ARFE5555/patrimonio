@@ -171,7 +171,7 @@ function comUsdOf(d) {
 // por orden de llegada; si agota una, se fracciona hacia la siguiente.
 function allocateFIFO(ventas, compras) {
   const arriv = (a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : (a.createdAt || 0) - (b.createdAt || 0));
-  const buckets = ventas.slice().sort(arriv).map((v) => ({ v, cap: (v.usd || 0) * (v.tasa || 0), used: 0 }));
+  const buckets = ventas.slice().sort(arriv).map((v) => ({ v, cap: Math.max(0, (v.usd || 0) * (v.tasa || 0) - comOp(v)), used: 0 }));
   const cs = compras.slice().sort(arriv);
   const ventaStats = {};
   buckets.forEach((b) => { ventaStats[b.v.id] = { usdRecomprado: 0, usdBruto: 0, vesUsados: 0, allocs: [] }; });
@@ -1822,7 +1822,7 @@ function AjustesTab({ settings, setSettings, accounts, txns, prices, cur, divisa
         dUsdRe += s.usdRecomprado;
         dBsRec += (v.usd || 0) * (v.tasa || 0);
         dBsUs += s.vesUsados;
-        dGan += s.usdRecomprado - usdEq;
+        dGan += s.usdRecomprado - usdEq - comUsdOf(v);
         dCap += usdEq;
       });
       const dRent = dCap > 0 ? (dGan / dCap) * 100 : 0;
@@ -1889,8 +1889,9 @@ function AjustesTab({ settings, setSettings, accounts, txns, prices, cur, divisa
       ventasRango.forEach((v) => {
         const gen = vesTot(v);
         const s = allo2.ventaStats[v.id] || { usdRecomprado: 0, vesUsados: 0, allocs: [] };
+        const comV = comOp(v), comU = comUsdOf(v);
         aoa.push(header);
-        aoa.push(["VENTA", v.date, v.persona || "", round2(v.usd || 0), v.tasa || 0, round2(gen), 0, round2(gen), "", "", v.referencia || ""]);
+        aoa.push(["VENTA", v.date, v.persona || "", round2(v.usd || 0), v.tasa || 0, round2(gen), round2(comV), round2(gen - comV), "", "", v.referencia || ""]);
         s.allocs.forEach((a) => {
           const c = a.compra;
           const frac = (c.usd || 0) > 0 ? a.usd / (c.usd || 1) : 0;
@@ -1901,7 +1902,7 @@ function AjustesTab({ settings, setSettings, accounts, txns, prices, cur, divisa
         if (s.allocs.length === 0) aoa.push(["(sin compras asignadas)", "", "", "", "", "", "", "", "", "", ""]);
         const usdRe = s.usdRecomprado, vesUs = s.vesUsados;
         const usdEq = v.tasa > 0 ? vesUs / v.tasa : 0;
-        const gan = usdRe - usdEq;
+        const gan = usdRe - usdEq - comU;
         const rent = usdEq > 0 ? (gan / usdEq) * 100 : 0;
         gTotal += gan;
         aoa.push(["TOTAL RENTABILIDAD", "", "", round2(usdRe), "", round2(vesUs), "", "", round2(gan), round2(rent), ""]);
@@ -2056,11 +2057,14 @@ function DivisasTab({ divisas, onAdd, onEdit, onDelete, onPatch }) {
   const statsDeVenta = (v) => {
     const s = alloc.ventaStats[v.id] || { usdRecomprado: 0, vesUsados: 0, allocs: [] };
     const vesGenerados = vesDe(v);
-    const vesRestantes = vesGenerados - s.vesUsados;
+    const comVesV = comOp(v);
+    const comUsdV = comUsdOf(v);
+    const vesNeto = vesGenerados - comVesV;
+    const vesRestantes = vesNeto - s.vesUsados;
     const usdEquiv = v.tasa > 0 ? s.vesUsados / v.tasa : 0;
-    const gananciaUsd = s.usdRecomprado - usdEquiv;
+    const gananciaUsd = s.usdRecomprado - usdEquiv - comUsdV;
     const rentab = usdEquiv > 0 ? (gananciaUsd / usdEquiv) * 100 : 0;
-    return { allocs: s.allocs, usdRecomprado: s.usdRecomprado, vesUsados: s.vesUsados, vesGenerados, vesRestantes, gananciaUsd, rentab };
+    return { allocs: s.allocs, usdRecomprado: s.usdRecomprado, vesUsados: s.vesUsados, vesGenerados, vesNeto, vesRestantes, comVesV, comUsdV, gananciaUsd, rentab };
   };
   const gananciaTotal = ventas.reduce((s, v) => s + statsDeVenta(v).gananciaUsd, 0);
 
@@ -2263,6 +2267,8 @@ function DivisasTab({ divisas, onAdd, onEdit, onDelete, onPatch }) {
 
                     <div style={{ marginTop: 12, padding: "10px 12px", background: T.bg2, border: `1px solid ${T.lineSoft}`, borderRadius: 10, fontSize: 12, color: T.mut }}>
                       VES generados {fmtBs(st.vesGenerados)} · usados {fmtBs(st.vesUsados)} · restante {fmtBs(st.vesRestantes)}
+                      {st.comVesV > 0 ? ` · comisión ${fmtBs(st.comVesV)}` : ""}
+                      {st.comUsdV > 0 ? ` · comisión ${fmtUsd(st.comUsdV)}` : ""}
                     </div>
 
                     <div style={{ display: "flex", gap: 8, marginTop: 14 }}>
@@ -2325,13 +2331,13 @@ function DivisaSheet({ state, divisas, onClose, onSave, onDelete }) {
       setTasa(String(state.tasa ?? ""));
       setPersona(state.persona || "");
       setComisionTipo(state.comisionTipo || "mismo");
-      setComMode(state.comMode || "pct");
+      setComMode(state.comMode || (state.kind === "venta" ? "none" : "pct"));
       setComVes(state.comisionVesInput != null ? String(state.comisionVesInput) : "");
       setComUsd(state.comisionUsdInput != null ? String(state.comisionUsdInput) : "");
       setVentaId(state.ventaId || "");
       setDate(state.date || todayISO());
     } else if (state) {
-      setUsd(""); setTasa(""); setPersona(""); setComisionTipo("mismo"); setComMode("pct"); setComVes(""); setComUsd(""); setDate(todayISO());
+      setUsd(""); setTasa(""); setPersona(""); setComisionTipo("mismo"); setComMode(state.kind === "venta" ? "none" : "pct"); setComVes(""); setComUsd(""); setDate(todayISO());
       // Asignación automática: si es compra y hay una venta "abierta" (con Bs restantes),
       // elegir la más antigua para cerrarlas en orden.
       let auto = "";
@@ -2356,14 +2362,15 @@ function DivisaSheet({ state, divisas, onClose, onSave, onDelete }) {
   }, [state]);
 
   if (!state) return null;
-  const nUsd = parseFloat(usd);
-  const nTasa = parseFloat(tasa);
+  const nUsd = numVE(usd);
+  const nTasa = numVE(tasa);
   const ves = (isNaN(nUsd) ? 0 : nUsd) * (isNaN(nTasa) ? 0 : nTasa);
   const comVesAmt =
-    comMode === "ves" ? (parseFloat(comVes) || 0)
+    comMode === "ves" ? (numVE(comVes) || 0)
     : comMode === "usd" ? 0
+    : comMode === "none" ? 0
     : ves * (COMISION[comisionTipo] || 0);
-  const comUsdAmt = comMode === "usd" ? (parseFloat(comUsd) || 0) : 0;
+  const comUsdAmt = comMode === "usd" ? (numVE(comUsd) || 0) : 0;
   const valid = !isNaN(nUsd) && nUsd > 0 && !isNaN(nTasa) && nTasa > 0 && persona.trim();
 
   const readonly = { ...inputStyle, background: T.bg2, color: T.text, fontFamily: MONO };
@@ -2392,9 +2399,35 @@ function DivisaSheet({ state, divisas, onClose, onSave, onDelete }) {
       </Field>
 
       {venta ? (
-        <Field label="Persona a quien le vendimos">
-          <input style={inputStyle} value={persona} onChange={(e) => setPersona(e.target.value)} placeholder="Nombre" />
-        </Field>
+        <>
+          <Field label="Persona a quien le vendimos">
+            <input style={inputStyle} value={persona} onChange={(e) => setPersona(e.target.value)} placeholder="Nombre" />
+          </Field>
+          <Field label="Comisión (opcional)">
+            <select style={{ ...inputStyle, appearance: "none" }} value={comMode} onChange={(e) => setComMode(e.target.value)}>
+              <option value="none">Sin comisión</option>
+              <option value="ves">Monto en VES</option>
+              <option value="usd">Monto en USD</option>
+            </select>
+          </Field>
+          {comMode === "ves" && (
+            <Field label="Comisión en VES">
+              <input style={{ ...inputStyle, fontFamily: MONO }} value={comVes} onChange={(e) => setComVes(e.target.value)} inputMode="decimal" placeholder="0,00" />
+            </Field>
+          )}
+          {comMode === "usd" && (
+            <Field label="Comisión en USD">
+              <input style={{ ...inputStyle, fontFamily: MONO }} value={comUsd} onChange={(e) => setComUsd(e.target.value)} inputMode="decimal" placeholder="0.00" />
+            </Field>
+          )}
+          {comMode !== "none" && (
+            <div style={{ fontSize: 12.5, color: T.mut, margin: "-4px 2px 12px" }}>
+              {comMode === "usd"
+                ? <>Comisión: <span style={{ color: T.text, fontFamily: MONO }}>{fmtUsd(comUsdAmt)}</span> (se descuenta de la ganancia)</>
+                : <>Comisión: <span style={{ color: T.text, fontFamily: MONO }}>{fmtBs(comVesAmt)}</span> (reduce los VES disponibles)</>}
+            </div>
+          )}
+        </>
       ) : (
         <>
           <Field label="Cliente a quien le compramos">
@@ -2459,14 +2492,10 @@ function DivisaSheet({ state, divisas, onClose, onSave, onDelete }) {
             tasa: nTasa,
             date,
             persona: persona.trim(),
-            ...(venta
-              ? {}
-              : {
-                  comMode,
-                  comisionTipo,
-                  comisionVesInput: comMode === "ves" ? (parseFloat(comVes) || 0) : undefined,
-                  comisionUsdInput: comMode === "usd" ? (parseFloat(comUsd) || 0) : undefined,
-                }),
+            comMode,
+            comisionTipo,
+            comisionVesInput: comMode === "ves" ? (numVE(comVes) || 0) : undefined,
+            comisionUsdInput: comMode === "usd" ? (numVE(comUsd) || 0) : undefined,
           })
         }
       >
