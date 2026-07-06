@@ -193,6 +193,13 @@ function allocateFIFO(ventas, compras) {
         break;
       }
       const b = buckets[bi];
+      if (b.v.date > c.date) {
+        // La venta es posterior a la compra: no puede recibirla (ni ninguna venta más nueva).
+        const f = remaining / W;
+        unalloc.push({ compraId: c.id, compra: c, usd: gross * f, net: net * f, ves: remaining });
+        remaining = 0;
+        break;
+      }
       const take = Math.min(b.cap - b.used, remaining);
       const f = take / W;
       b.used += take;
@@ -254,8 +261,11 @@ function parseDivisasCSV(text) {
   if (rows.length < 2) return [];
   const header = rows[0].map((h) => (h || "").toLowerCase().trim());
   const find = (...keys) => header.findIndex((h) => keys.some((k) => h === k || h.includes(k)));
-  const iF = find("fecha"), iP = find("persona"), iU = find("usd"), iT = find("tasa"),
-    iC = find("comi"), iR = find("referencia", "ref"), iTipo = find("tipo");
+  const iF = find("fecha"), iP = find("persona"), iT = find("tasa"),
+    iR = find("referencia", "ref"), iTipo = find("tipo");
+  const iU = header.findIndex((h) => (h === "usd" || h.includes("usd")) && !h.includes("comi") && !h.includes("fee"));
+  const iComUsd = header.findIndex((h) => (h.includes("comi") || h.includes("fee")) && h.includes("usd"));
+  const iCom = header.findIndex((h, idx) => h.includes("comi") && idx !== iComUsd);
   const out = [];
   for (let r = 1; r < rows.length; r++) {
     const row = rows[r];
@@ -268,15 +278,21 @@ function parseDivisasCSV(text) {
     const kind = tipoRaw.includes("venta") ? "venta" : "compra";
     const persona = iP >= 0 ? String(row[iP] || "").trim() : "";
     const referencia = iR >= 0 ? String(row[iR] || "").trim() : "";
-    let comisionBs = 0;
-    if (iC >= 0) {
-      const raw = String(row[iC] || "");
-      if (raw.indexOf("%") >= 0) { const p = numVE(raw); comisionBs = isNaN(p) ? 0 : ves * (p / 100); }
-      else { const v = numVE(raw); comisionBs = isNaN(v) ? 0 : v; }
-    }
     const date = fechaISO(row[iF]);
     const refKey = referencia || `${kind}|${date}|${usd}|${tasa}|${persona}`;
-    out.push({ kind, date, persona, usd, tasa, comisionBs, referencia, refKey, source: "sheet" });
+    const op = { kind, date, persona, usd, tasa, referencia, refKey, source: "sheet" };
+    const comUsd = iComUsd >= 0 ? numVE(row[iComUsd]) : NaN;
+    if (!isNaN(comUsd) && comUsd > 0) {
+      op.comMode = "usd";
+      op.comisionUsdInput = comUsd;
+    } else if (iCom >= 0) {
+      const raw = String(row[iCom] || "");
+      if (raw.indexOf("%") >= 0) { const p = numVE(raw); op.comisionBs = isNaN(p) ? 0 : ves * (p / 100); }
+      else { const v = numVE(raw); op.comisionBs = isNaN(v) ? 0 : v; }
+    } else {
+      op.comisionBs = 0;
+    }
+    out.push(op);
   }
   return out;
 }
@@ -2484,7 +2500,7 @@ function DivisaSheet({ state, divisas, onClose, onSave, onDelete }) {
             )}
           </div>
           <div style={{ fontSize: 12, color: T.mut, margin: "4px 2px 8px", lineHeight: 1.5 }}>
-            Esta compra se asigna automáticamente a las ventas abiertas por orden de llegada. Si agota una venta, se fracciona hacia la siguiente.
+            Esta compra se asigna automáticamente a las ventas abiertas por orden de llegada (solo ventas con fecha igual o anterior a la compra). Si agota una venta, se fracciona hacia la siguiente.
           </div>
         </>
       )}
