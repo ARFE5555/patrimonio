@@ -1751,6 +1751,7 @@ function AjustesTab({ settings, setSettings, accounts, txns, prices, cur, divisa
   const [to, setTo] = useState(todayISO());
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState("");
+  const [dl, setDl] = useState(null);
 
   function thisMonth() {
     setFrom(monthStart());
@@ -1931,8 +1932,9 @@ function AjustesTab({ settings, setSettings, accounts, txns, prices, cur, divisa
       XLSX.utils.book_append_sheet(wb, wsM, "Movimientos");
       XLSX.utils.book_append_sheet(wb, wsC, "Cripto");
       XLSX.utils.book_append_sheet(wb, wsDiv, "Divisas");
-      XLSX.writeFile(wb, `patrimonio_${from}_a_${to}.xlsx`);
-      setMsg("¡Listo! Revisá tus Descargas o el visor que se abrió.");
+      if (dl && dl.url) URL.revokeObjectURL(dl.url);
+      setDl(wbToBlobUrl(XLSX, wb, `patrimonio_${from}_a_${to}.xlsx`));
+      setMsg("Archivo generado. Tocá el botón verde para abrirlo o guardarlo.");
     } catch (e) {
       setMsg((e && e.message) || "No se pudo generar el Excel. Probá con conexión a internet.");
     } finally {
@@ -2004,8 +2006,13 @@ function AjustesTab({ settings, setSettings, accounts, txns, prices, cur, divisa
       </div>
 
       <PrimaryBtn color={T.gold} disabled={busy} onClick={exportExcel}>
-        {busy ? "Generando…" : "Exportar a Excel"}
+        {busy ? "Generando…" : "Generar Excel"}
       </PrimaryBtn>
+      {dl && (
+        <a href={dl.url} download={dl.name} style={{ display: "block", textAlign: "center", background: T.green, color: "#0A0F1E", borderRadius: 12, padding: "13px", fontWeight: 600, textDecoration: "none", marginTop: 10 }}>
+          Abrir / guardar el Excel
+        </a>
+      )}
       {msg && (
         <div style={{ fontSize: 13, color: T.mut, marginTop: 12, marginLeft: 2, lineHeight: 1.5 }}>{msg}</div>
       )}
@@ -2539,6 +2546,11 @@ function ensureXLSXStyle() {
     })();
   });
 }
+function wbToBlobUrl(XLSX, wb, name) {
+  const out = XLSX.write(wb, { bookType: "xlsx", type: "array" });
+  const blob = new Blob([out], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
+  return { url: URL.createObjectURL(blob), name };
+}
 function normRef(s) {
   return String(s || "").replace(/\s+/g, "").replace(/[^0-9a-zA-Z]/g, "").replace(/^0+/, "").toLowerCase();
 }
@@ -2582,8 +2594,10 @@ function ConciliacionTab({ divisas }) {
   const [from, setFrom] = useState(monthStart());
   const [to, setTo] = useState(todayISO());
   const [bankRows, setBankRows] = useState(null);
+  const [files, setFiles] = useState([]);
   const [bankMsg, setBankMsg] = useState("");
   const [busy, setBusy] = useState(false);
+  const [dl, setDl] = useState(null);
 
   const ops = (divisas || []).filter((d) => d.date >= from && d.date <= to);
   const result = useMemo(() => {
@@ -2606,24 +2620,36 @@ function ConciliacionTab({ divisas }) {
 
   const okCount = result ? result.filter((r) => r.estado.indexOf("Validado") === 0).length : 0;
   const noCount = result ? result.length - okCount : 0;
+  const total = result ? result.length : 0;
+  const completo = !!result && total > 0 && noCount === 0;
 
-  async function onBankFile(e) {
-    const f = e.target.files && e.target.files[0];
+  async function onBankFiles(e) {
+    const fs = Array.from(e.target.files || []);
     e.target.value = "";
-    if (!f) return;
-    setBusy(true); setBankMsg("Leyendo estado de cuenta…");
+    if (!fs.length) return;
+    setBusy(true); setBankMsg("Leyendo estado(s) de cuenta…");
     try {
       const XLSX = await ensureXLSXStyle();
-      const buf = await f.arrayBuffer();
-      const wb = XLSX.read(buf, { type: "array" });
-      const ws = wb.Sheets[wb.SheetNames[0]];
-      const rows = XLSX.utils.sheet_to_json(ws, { header: 1, raw: false, defval: "" });
-      const parsed = parseBankRows(rows);
-      if (!parsed.length) { setBankRows(null); setBankMsg("No pude identificar columnas de fecha/monto/referencia. Revisá que el archivo tenga encabezados."); }
-      else { setBankRows(parsed); setBankMsg(`${parsed.length} movimientos leídos del estado de cuenta.`); }
-    } catch (ex) { setBankRows(null); setBankMsg((ex && ex.message) || "No se pudo leer el archivo."); }
+      let added = [];
+      const newFiles = [];
+      for (const f of fs) {
+        try {
+          const buf = await f.arrayBuffer();
+          const wb = XLSX.read(buf, { type: "array" });
+          const ws = wb.Sheets[wb.SheetNames[0]];
+          const rows = XLSX.utils.sheet_to_json(ws, { header: 1, raw: false, defval: "" });
+          const parsed = parseBankRows(rows);
+          added = added.concat(parsed);
+          newFiles.push({ name: f.name, count: parsed.length });
+        } catch { newFiles.push({ name: f.name, count: 0 }); }
+      }
+      setBankRows((prev) => [...(prev || []), ...added]);
+      setFiles((prev) => [...prev, ...newFiles]);
+      setBankMsg(added.length ? `${added.length} movimientos agregados.` : "No se identificaron columnas en el/los archivo(s). Revisá los encabezados.");
+    } catch (ex) { setBankMsg((ex && ex.message) || "No se pudo leer el archivo."); }
     finally { setBusy(false); }
   }
+  function clearAll() { setBankRows(null); setFiles([]); setBankMsg(""); setDl(null); }
 
   async function download() {
     if (!result) return;
@@ -2651,7 +2677,8 @@ function ConciliacionTab({ divisas }) {
       });
       const wb = XLSX.utils.book_new();
       XLSX.utils.book_append_sheet(wb, ws, "Conciliación");
-      XLSX.writeFile(wb, `conciliacion_${from}_a_${to}.xlsx`);
+      if (dl && dl.url) URL.revokeObjectURL(dl.url);
+      setDl(wbToBlobUrl(XLSX, wb, `conciliacion_${from}_a_${to}.xlsx`));
     } catch (ex) { setBankMsg((ex && ex.message) || "No se pudo generar el Excel."); }
     finally { setBusy(false); }
   }
@@ -2675,47 +2702,55 @@ function ConciliacionTab({ divisas }) {
         </div>
       </div>
 
+      {files.length > 0 && (
+        <div style={{ marginBottom: 12 }}>
+          {files.map((f, i) => (
+            <div key={i} style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5, color: T.mut, padding: "4px 2px" }}>
+              <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{f.name}</span>
+              <span style={{ color: f.count ? T.mut : T.red, flexShrink: 0, marginLeft: 8 }}>{f.count ? `${f.count} mov.` : "sin datos"}</span>
+            </div>
+          ))}
+          <button onClick={clearAll} style={{ ...btnGhost, color: T.red, padding: "6px 2px" }}>Quitar todos</button>
+        </div>
+      )}
+
       <label style={{ display: "block", textAlign: "center", background: T.goldSoft, color: T.gold, border: `1px solid ${T.gold}`, borderRadius: 12, padding: "13px", fontSize: 15, fontWeight: 600, cursor: "pointer", marginBottom: 10 }}>
-        {busy ? "Procesando…" : "Subir estado de cuenta (Excel)"}
-        <input type="file" accept=".xlsx,.xls,.csv" style={{ display: "none" }} onChange={onBankFile} />
+        {busy ? "Procesando…" : files.length ? "Agregar otro estado de cuenta" : "Subir estado(s) de cuenta (Excel)"}
+        <input type="file" accept=".xlsx,.xls,.csv" multiple style={{ display: "none" }} onChange={onBankFiles} />
       </label>
       {bankMsg && <div style={{ fontSize: 13, color: T.mut, marginBottom: 14, marginLeft: 2, lineHeight: 1.5 }}>{bankMsg}</div>}
 
-      {result && (
-        <>
-          <div style={{ display: "flex", gap: 10, margin: "6px 0 16px" }}>
-            <div style={{ flex: 1, background: T.greenSoft, borderRadius: 12, padding: "12px 14px" }}>
-              <div style={{ fontSize: 12, color: T.mut }}>Validadas</div>
-              <div style={{ fontFamily: MONO, fontSize: 22, fontWeight: 700, color: T.green }}>{okCount}</div>
+      {bankRows && (
+        ops.length === 0 ? (
+          <div style={{ ...emptyRow, marginTop: 6 }}>No hay operaciones de divisas en el rango elegido.</div>
+        ) : (
+          <>
+            <div
+              style={{
+                marginTop: 6, marginBottom: 16, borderRadius: 16, padding: "24px 18px", textAlign: "center",
+                background: completo ? T.greenSoft : "rgba(227,178,77,0.14)",
+                border: `1px solid ${completo ? T.green : T.gold}`,
+              }}
+            >
+              <div style={{ fontSize: 23, fontWeight: 700, color: completo ? T.green : T.gold, letterSpacing: -0.3 }}>
+                {completo ? "Conciliado completo" : "Revisar"}
+              </div>
+              <div style={{ fontSize: 13, color: T.mut, marginTop: 6 }}>
+                {completo
+                  ? `Las ${total} operaciones coinciden con el estado de cuenta.`
+                  : `${noCount} de ${total} operaciones sin confirmar.`}
+              </div>
             </div>
-            <div style={{ flex: 1, background: "rgba(227,178,77,0.14)", borderRadius: 12, padding: "12px 14px" }}>
-              <div style={{ fontSize: 12, color: T.mut }}>No encontradas</div>
-              <div style={{ fontFamily: MONO, fontSize: 22, fontWeight: 700, color: T.gold }}>{noCount}</div>
-            </div>
-          </div>
-          <PrimaryBtn color={T.blue} disabled={busy} onClick={download}>
-            {busy ? "Generando…" : "Descargar Excel de conciliación"}
-          </PrimaryBtn>
-          <div style={{ ...sectionTitle, margin: "24px 0 10px" }}>Detalle ({result.length})</div>
-          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-            {result.map((r, i) => {
-              const ok = r.estado.indexOf("Validado") === 0;
-              return (
-                <div key={i} style={{ ...rowCard, borderLeft: `3px solid ${ok ? T.green : T.gold}` }}>
-                  <div style={{ minWidth: 0 }}>
-                    <div style={{ fontSize: 14, fontWeight: 600, color: T.text }}>{r.tipo} · {fmtBs(r.monto)}</div>
-                    <div style={{ fontSize: 11.5, color: T.mut, fontFamily: MONO, marginTop: 2 }}>
-                      {fmtDate(r.fecha)}{r.referencia ? ` · ref ${r.referencia}` : " · sin referencia"}
-                    </div>
-                  </div>
-                  <span style={{ fontSize: 11, fontWeight: 700, color: ok ? T.green : T.gold, background: ok ? T.greenSoft : "rgba(227,178,77,0.14)", padding: "3px 9px", borderRadius: 6, whiteSpace: "nowrap" }}>
-                    {ok ? "OK" : "FALTA"}
-                  </span>
-                </div>
-              );
-            })}
-          </div>
-        </>
+            <PrimaryBtn color={T.blue} disabled={busy} onClick={download}>
+              {busy ? "Generando…" : "Generar Excel de conciliación"}
+            </PrimaryBtn>
+            {dl && (
+              <a href={dl.url} download={dl.name} style={{ display: "block", textAlign: "center", background: T.green, color: "#0A0F1E", borderRadius: 12, padding: "13px", fontWeight: 600, textDecoration: "none", marginTop: 10 }}>
+                Abrir / guardar el archivo
+              </a>
+            )}
+          </>
+        )
       )}
     </div>
   );
