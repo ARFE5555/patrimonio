@@ -72,6 +72,7 @@ const CURRENCIES = [
   { code: "brl", label: "BRL R$" },
   { code: "gbp", label: "GBP £" },
 ];
+const ACCOUNT_CURRENCIES = [...CURRENCIES, { code: "ves", label: "VES Bs" }];
 const ACCENT = { bank: T.blue, cash: T.green, crypto: T.gold };
 const TYPE_LABEL = { bank: "Banco", cash: "Efectivo", crypto: "Cripto" };
 
@@ -167,51 +168,84 @@ function comUsdOf(d) {
   return d.comMode === "usd" ? (d.comisionUsdInput || 0) : 0;
 }
 
-// Asignación automática FIFO: cada compra consume los VES de las ventas abiertas
-// por orden de llegada; si agota una, se fracciona hacia la siguiente.
+// Capacidad de VES de una venta (generados menos comisión en VES)
+const capOf = (v) => Math.max(0, (v.usd || 0) * (v.tasa || 0) - comOp(v));
+
+// Asignación de compras a ventas:
+//  - respeta las asignaciones manuales (compra.ventaId)
+//  - el resto se asigna automáticamente por orden de llegada (FIFO), fraccionando
+// Regla: una venta solo puede recibir compras con fecha igual o posterior a la venta.
 function allocateFIFO(ventas, compras) {
   const arriv = (a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : (a.createdAt || 0) - (b.createdAt || 0));
-  const buckets = ventas.slice().sort(arriv).map((v) => ({ v, cap: Math.max(0, (v.usd || 0) * (v.tasa || 0) - comOp(v)), used: 0 }));
-  const cs = compras.slice().sort(arriv);
+  const buckets = ventas.slice().sort(arriv).map((v) => ({ v, cap: capOf(v), used: 0 }));
+  const byId = {};
+  buckets.forEach((b) => { byId[b.v.id] = b; });
   const ventaStats = {};
   buckets.forEach((b) => { ventaStats[b.v.id] = { usdRecomprado: 0, usdBruto: 0, vesUsados: 0, allocs: [] }; });
   const unalloc = [];
   const EPS = 1e-6;
-  let bi = 0;
-  for (const c of cs) {
+
+  const state = compras.slice().sort(arriv).map((c) => {
     const gross = c.usd || 0;
-    const net = gross - comUsdOf(c); // USDT que queda tras la comisión en USD
-    const W = gross * (c.tasa || 0) + comOp(c); // VES totales que consume (con comisión en VES)
-    if (W <= EPS) continue;
-    let remaining = W;
-    while (remaining > EPS) {
-      while (bi < buckets.length && buckets[bi].used >= buckets[bi].cap - EPS) bi++;
-      if (bi >= buckets.length) {
-        const f = remaining / W;
-        unalloc.push({ compraId: c.id, compra: c, usd: gross * f, net: net * f, ves: remaining });
-        remaining = 0;
-        break;
-      }
-      const b = buckets[bi];
-      if (b.v.date > c.date) {
-        // La venta es posterior a la compra: no puede recibirla (ni ninguna venta más nueva).
-        const f = remaining / W;
-        unalloc.push({ compraId: c.id, compra: c, usd: gross * f, net: net * f, ves: remaining });
-        remaining = 0;
-        break;
-      }
-      const take = Math.min(b.cap - b.used, remaining);
-      const f = take / W;
-      b.used += take;
-      const st = ventaStats[b.v.id];
-      st.usdRecomprado += net * f;
-      st.usdBruto += gross * f;
-      st.vesUsados += take;
-      st.allocs.push({ compraId: c.id, compra: c, usd: gross * f, net: net * f, ves: take });
-      remaining -= take;
+    const net = gross - comUsdOf(c); // USDT neto tras comisión en USD
+    const W = gross * (c.tasa || 0) + comOp(c); // VES que consume (con comisión en VES)
+    return { c, gross, net, W, remaining: W };
+  });
+
+  const put = (b, st, take, manual) => {
+    const f = take / st.W;
+    b.used += take;
+    const s = ventaStats[b.v.id];
+    s.usdRecomprado += st.net * f;
+    s.usdBruto += st.gross * f;
+    s.vesUsados += take;
+    s.allocs.push({ compraId: st.c.id, compra: st.c, usd: st.gross * f, net: st.net * f, ves: take, manual: !!manual });
+    st.remaining -= take;
+  };
+
+  // Paso A: asignaciones manuales
+  for (const st of state) {
+    if (st.W <= EPS || !st.c.ventaId) continue;
+    const b = byId[st.c.ventaId];
+    if (!b || b.v.date > st.c.date) continue; // pin inválido: la venta es posterior
+    const take = Math.min(b.cap - b.used, st.remaining);
+    if (take > EPS) put(b, st, take, true);
+  }
+
+  // Paso B: FIFO automático para lo que quede
+  for (const st of state) {
+    if (st.W <= EPS || st.remaining <= EPS) continue;
+    for (const b of buckets) {
+      if (st.remaining <= EPS) break;
+      if (b.v.date > st.c.date) break; // ordenadas por fecha: las siguientes también son posteriores
+      if (b.used >= b.cap - EPS) continue;
+      const take = Math.min(b.cap - b.used, st.remaining);
+      if (take > EPS) put(b, st, take, false);
+    }
+    if (st.remaining > EPS) {
+      const f = st.remaining / st.W;
+      unalloc.push({ compraId: st.c.id, compra: st.c, usd: st.gross * f, net: st.net * f, ves: st.remaining });
     }
   }
+
+  Object.keys(ventaStats).forEach((k) => {
+    ventaStats[k].allocs.sort((a, b) => arriv(a.compra, b.compra));
+  });
   return { ventaStats, unalloc };
+}
+
+/* ── Multimoneda: conversión USD ↔ VES ── */
+function vesRateOf(settings, divisas) {
+  const manual = settings && Number(settings.vesRate);
+  if (manual && manual > 0) return manual;
+  const ops = (divisas || []).filter((d) => d.tasa > 0).slice().sort((a, b) => (a.date < b.date ? 1 : -1));
+  return ops.length ? ops[0].tasa : null;
+}
+function convertAmt(amount, from, to, rate) {
+  if (!from || from === to) return amount;
+  if (from === "usd" && to === "ves") return rate ? amount * rate : null;
+  if (from === "ves" && to === "usd") return rate ? amount / rate : null;
+  return null; // par no soportado
 }
 
 /* ── Lectura de Google Sheets (CSV publicado) ── */
@@ -673,22 +707,26 @@ function App() {
   }, [loaded, trackedIds.join(","), settings.currency]);
 
   /* Totales */
+  const cur = settings.currency;
+
+  const vesRate = useMemo(() => vesRateOf(settings, divisas), [settings.vesRate, divisas]);
+
   const totals = useMemo(() => {
-    let bank = 0,
-      cash = 0,
-      crypto = 0;
+    let bank = 0, cash = 0, crypto = 0, sinConvertir = 0;
     accounts.forEach((a) => {
-      if (a.type === "bank") bank += a.balance || 0;
-      else if (a.type === "cash") cash += a.balance || 0;
-      else if (a.type === "crypto") {
+      if (a.type === "crypto") {
         const p = prices[a.coinId]?.price ?? a.manualPrice;
         if (p != null) crypto += (a.amount || 0) * (p || 0);
+        return;
       }
+      const conv = convertAmt(a.balance || 0, a.currency || cur, cur, vesRate);
+      if (conv == null) { sinConvertir++; return; }
+      if (a.type === "bank") bank += conv;
+      else if (a.type === "cash") cash += conv;
     });
-    return { bank, cash, crypto, net: bank + cash + crypto };
-  }, [accounts, prices]);
+    return { bank, cash, crypto, sinConvertir, net: bank + cash + crypto };
+  }, [accounts, prices, cur, vesRate]);
 
-  const cur = settings.currency;
 
   const [winW, setWinW] = useState(typeof window !== "undefined" ? window.innerWidth : 1024);
   useEffect(() => {
@@ -1082,6 +1120,13 @@ function BalanceTab({ totals, cur, prices }) {
         </div>
       </div>
 
+      {totals.sinConvertir > 0 && (
+        <div style={{ ...emptyRow, marginTop: 12, textAlign: "left", borderStyle: "solid", borderColor: T.gold, color: T.mut }}>
+          {totals.sinConvertir} cuenta(s) no se pudieron convertir a {cur.toUpperCase()} y quedan fuera del total.
+          Para cuentas en VES, cargá la tasa en Ajustes o registrá una operación de divisas.
+        </div>
+      )}
+
       {/* Ticker en vivo */}
       <div style={{ marginTop: 22, marginBottom: 8, ...sectionTitle }}>
         Mercado en vivo
@@ -1202,6 +1247,11 @@ function AccountsTab({ accounts, prices, cur, onAdd, onEdit }) {
                               {a.amount} {a.symbol}
                             </div>
                           )}
+                          {a.type !== "crypto" && (
+                            <div style={{ fontSize: 12, color: T.mut }}>
+                              {(a.currency || cur).toUpperCase()}
+                            </div>
+                          )}
                         </div>
                       </div>
                       <div
@@ -1213,7 +1263,7 @@ function AccountsTab({ accounts, prices, cur, onAdd, onEdit }) {
                           fontWeight: 500,
                         }}
                       >
-                        {money(value, cur)}
+                        {money(value, a.type === "crypto" ? cur : a.currency || cur)}
                       </div>
                     </button>
                   );
@@ -1229,23 +1279,128 @@ function AccountsTab({ accounts, prices, cur, onAdd, onEdit }) {
 
 /* ─────────────────────────────  Tab: Movimientos  ───────────────────────────── */
 function TxnsTab({ txns, accounts, cur, onAdd, onDelete }) {
-  const acctName = (id) => accounts.find((a) => a.id === id)?.name || "—";
+  const acct = (id) => accounts.find((a) => a.id === id);
+  const acctName = (id) => (acct(id) || {}).name || "—";
+  const acctCur = (t) => t.currency || (acct(t.accountId) || {}).currency || cur;
+
+  const [fAcct, setFAcct] = useState("all");
+  const [fKind, setFKind] = useState("all");
+  const [fFrom, setFFrom] = useState("");
+  const [fTo, setFTo] = useState("");
+  const [showF, setShowF] = useState(false);
+
+  const usable = accounts.filter((a) => a.type === "bank" || a.type === "cash");
+  const activos = (fAcct !== "all" ? 1 : 0) + (fKind !== "all" ? 1 : 0) + (fFrom ? 1 : 0) + (fTo ? 1 : 0);
+
+  const filtrados = useMemo(
+    () =>
+      txns.filter(
+        (t) =>
+          (fAcct === "all" || t.accountId === fAcct) &&
+          (fKind === "all" || t.kind === fKind) &&
+          (!fFrom || t.date >= fFrom) &&
+          (!fTo || t.date <= fTo)
+      ),
+    [txns, fAcct, fKind, fFrom, fTo]
+  );
+
+  // Totales del filtro, agrupados por moneda
+  const totalesPorMoneda = useMemo(() => {
+    const m = {};
+    filtrados.forEach((t) => {
+      const c = acctCur(t);
+      if (!m[c]) m[c] = { inc: 0, exp: 0 };
+      if (t.kind === "income") m[c].inc += t.amount || 0;
+      else m[c].exp += t.amount || 0;
+    });
+    return Object.entries(m);
+  }, [filtrados, accounts, cur]);
+
   const grouped = useMemo(() => {
     const m = {};
-    txns.forEach((t) => {
+    filtrados.forEach((t) => {
       (m[t.date] = m[t.date] || []).push(t);
     });
     return Object.entries(m).sort((a, b) => (a[0] < b[0] ? 1 : -1));
-  }, [txns]);
+  }, [filtrados]);
+
+  const selStyle = { ...inputStyle, appearance: "none", fontSize: 14, padding: "11px 12px" };
 
   return (
     <div style={{ paddingTop: 8 }}>
-      <button onClick={onAdd} style={{ ...rowCard, cursor: "pointer", justifyContent: "center", gap: 8, color: T.gold, fontWeight: 600, fontSize: 15, marginBottom: 20 }}>
+      <button onClick={onAdd} style={{ ...rowCard, cursor: "pointer", justifyContent: "center", gap: 8, color: T.gold, fontWeight: 600, fontSize: 15, marginBottom: 12 }}>
         <IconPlus color={T.gold} /> Nuevo movimiento
       </button>
 
+      {/* Filtros */}
+      <button
+        onClick={() => setShowF(!showF)}
+        style={{ ...rowCard, cursor: "pointer", marginBottom: 12, color: T.text, fontSize: 14, fontWeight: 600 }}
+      >
+        <span>Filtros{activos ? ` · ${activos} activo(s)` : ""}</span>
+        <span style={{ color: T.mut2, fontSize: 12 }}>{showF ? "▲" : "▼"}</span>
+      </button>
+
+      {showF && (
+        <div style={{ background: T.bg2, border: `1px solid ${T.lineSoft}`, borderRadius: 14, padding: "14px 15px", marginBottom: 16 }}>
+          <Field label="Cuenta">
+            <select style={selStyle} value={fAcct} onChange={(e) => setFAcct(e.target.value)}>
+              <option value="all">Todas las cuentas</option>
+              {usable.map((a) => (
+                <option key={a.id} value={a.id}>
+                  {a.name} · {(a.currency || cur).toUpperCase()}
+                </option>
+              ))}
+            </select>
+          </Field>
+          <Field label="Tipo">
+            <select style={selStyle} value={fKind} onChange={(e) => setFKind(e.target.value)}>
+              <option value="all">Ingresos y egresos</option>
+              <option value="income">Solo ingresos</option>
+              <option value="expense">Solo egresos</option>
+            </select>
+          </Field>
+          <div style={{ display: "flex", gap: 10 }}>
+            <div style={{ flex: 1 }}>
+              <label style={labelStyle}>Desde</label>
+              <input type="date" style={{ ...selStyle, fontFamily: MONO }} value={fFrom} onChange={(e) => setFFrom(e.target.value)} />
+            </div>
+            <div style={{ flex: 1 }}>
+              <label style={labelStyle}>Hasta</label>
+              <input type="date" style={{ ...selStyle, fontFamily: MONO }} value={fTo} onChange={(e) => setFTo(e.target.value)} />
+            </div>
+          </div>
+          {activos > 0 && (
+            <button
+              onClick={() => { setFAcct("all"); setFKind("all"); setFFrom(""); setFTo(""); }}
+              style={{ ...btnGhost, color: T.red, marginTop: 12, padding: 4 }}
+            >
+              Limpiar filtros
+            </button>
+          )}
+        </div>
+      )}
+
+      {/* Totales del filtro */}
+      {filtrados.length > 0 && totalesPorMoneda.length > 0 && (
+        <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 18 }}>
+          {totalesPorMoneda.map(([c, v]) => (
+            <div key={c} style={{ ...rowCard, background: T.bg2 }}>
+              <span style={{ fontSize: 12, color: T.mut, fontWeight: 600 }}>{c.toUpperCase()}</span>
+              <span style={{ fontFamily: MONO, fontSize: 13, fontVariantNumeric: "tabular-nums" }}>
+                <span style={{ color: T.green }}>+{money(v.inc, c)}</span>
+                <span style={{ color: T.mut2 }}>{"  /  "}</span>
+                <span style={{ color: T.red }}>−{money(v.exp, c)}</span>
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+
       {txns.length === 0 ? (
         <div style={emptyRow}>Todavía no cargaste ingresos ni egresos</div>
+      ) : filtrados.length === 0 ? (
+        <div style={emptyRow}>Ningún movimiento coincide con los filtros</div>
       ) : (
         grouped.map(([date, items]) => (
           <div key={date} style={{ marginBottom: 18 }}>
@@ -1253,60 +1408,35 @@ function TxnsTab({ txns, accounts, cur, onAdd, onDelete }) {
             <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
               {items.map((t) => {
                 const inc = t.kind === "income";
+                const c = acctCur(t);
                 return (
                   <div key={t.id} style={rowCard}>
                     <div style={{ display: "flex", alignItems: "center", gap: 12, minWidth: 0 }}>
                       <span
                         style={{
-                          width: 34,
-                          height: 34,
-                          borderRadius: 10,
+                          width: 34, height: 34, borderRadius: 10,
                           background: inc ? T.greenSoft : T.redSoft,
-                          display: "flex",
-                          alignItems: "center",
-                          justifyContent: "center",
-                          flexShrink: 0,
-                          color: inc ? T.green : T.red,
-                          fontSize: 18,
-                          fontWeight: 700,
+                          display: "flex", alignItems: "center", justifyContent: "center",
+                          flexShrink: 0, color: inc ? T.green : T.red, fontSize: 18, fontWeight: 700,
                         }}
                       >
                         {inc ? "↓" : "↑"}
                       </span>
                       <div style={{ minWidth: 0 }}>
-                        <div
-                          style={{
-                            fontSize: 14.5,
-                            fontWeight: 600,
-                            color: T.text,
-                            whiteSpace: "nowrap",
-                            overflow: "hidden",
-                            textOverflow: "ellipsis",
-                          }}
-                        >
+                        <div style={{ fontSize: 14.5, fontWeight: 600, color: T.text, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
                           {t.motivo || (inc ? "Ingreso" : "Egreso")}
                         </div>
-                        <div style={{ fontSize: 12, color: T.mut }}>{acctName(t.accountId)}</div>
+                        <div style={{ fontSize: 12, color: T.mut }}>
+                          {acctName(t.accountId)} · {c.toUpperCase()}
+                        </div>
                       </div>
                     </div>
                     <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-                      <span
-                        style={{
-                          fontFamily: MONO,
-                          fontVariantNumeric: "tabular-nums",
-                          fontSize: 14.5,
-                          fontWeight: 600,
-                          color: inc ? T.green : T.red,
-                        }}
-                      >
+                      <span style={{ fontFamily: MONO, fontVariantNumeric: "tabular-nums", fontSize: 14.5, fontWeight: 600, color: inc ? T.green : T.red }}>
                         {inc ? "+" : "−"}
-                        {money(t.amount, cur)}
+                        {money(t.amount, c)}
                       </span>
-                      <button
-                        onClick={() => onDelete(t)}
-                        style={{ ...btnGhost, color: T.mut2, fontSize: 18, lineHeight: 1 }}
-                        aria-label="Eliminar"
-                      >
+                      <button onClick={() => onDelete(t)} style={{ ...btnGhost, color: T.mut2, fontSize: 18, lineHeight: 1 }} aria-label="Eliminar">
                         ×
                       </button>
                     </div>
@@ -1377,23 +1507,32 @@ function AccountSheet({ state, cur, onClose, onSave, onDelete }) {
   const type = state?.type || "bank";
   const [name, setName] = useState("");
   const [balance, setBalance] = useState("");
+  const [currency, setCurrency] = useState(cur);
   useEffect(() => {
     if (state) {
       setName(state.name || "");
       setBalance(state.id != null && state.balance != null ? String(state.balance) : "");
+      setCurrency(state.currency || cur);
     }
   }, [state]);
   if (!state || type === "crypto") return null;
-  const valid = name.trim() && balance !== "" && !isNaN(parseFloat(balance));
+  const valid = name.trim() && balance !== "" && !isNaN(numVE(balance));
   return (
     <Sheet open={!!state} onClose={onClose} title={editing ? "Editar cuenta" : `Nueva cuenta · ${TYPE_LABEL[type]}`}>
       <Field label="Nombre">
         <input style={inputStyle} value={name} onChange={(e) => setName(e.target.value)} placeholder={type === "bank" ? "Ej. Banco Galicia" : "Ej. Efectivo billetera"} />
       </Field>
-      <Field label={`Saldo actual (${cur.toUpperCase()})`}>
+      <Field label="Moneda de la cuenta">
+        <select style={{ ...inputStyle, appearance: "none" }} value={currency} onChange={(e) => setCurrency(e.target.value)}>
+          {ACCOUNT_CURRENCIES.map((c) => (
+            <option key={c.code} value={c.code}>{c.label}</option>
+          ))}
+        </select>
+      </Field>
+      <Field label={`Saldo actual (${currency.toUpperCase()})`}>
         <input style={{ ...inputStyle, fontFamily: MONO }} value={balance} onChange={(e) => setBalance(e.target.value)} inputMode="decimal" placeholder="0.00" />
       </Field>
-      <PrimaryBtn color={ACCENT[type]} disabled={!valid} onClick={() => onSave({ id: state.id, type, name: name.trim(), balance: parseFloat(balance) })}>
+      <PrimaryBtn color={ACCENT[type]} disabled={!valid} onClick={() => onSave({ id: state.id, type, name: name.trim(), currency, balance: numVE(balance) })}>
         {editing ? "Guardar cambios" : "Crear cuenta"}
       </PrimaryBtn>
       {editing && (
@@ -1422,7 +1561,10 @@ function TxnSheet({ open, accounts, cur, onClose, onSave }) {
       setDate(todayISO());
     }
   }, [open]);
-  const valid = amount && !isNaN(parseFloat(amount)) && parseFloat(amount) > 0 && accountId && motivo.trim();
+  const acct = usable.find((a) => a.id === accountId);
+  const acctCur = (acct && acct.currency) || cur;
+  const nAmount = numVE(amount);
+  const valid = amount && !isNaN(nAmount) && nAmount > 0 && accountId && motivo.trim();
   return (
     <Sheet open={open} onClose={onClose} title="Nuevo movimiento">
       {usable.length === 0 ? (
@@ -1457,7 +1599,7 @@ function TxnSheet({ open, accounts, cur, onClose, onSave }) {
               </button>
             ))}
           </div>
-          <Field label={`Monto (${cur.toUpperCase()})`}>
+          <Field label={`Monto (${acctCur.toUpperCase()})`}>
             <input style={{ ...inputStyle, fontFamily: MONO, fontSize: 22 }} value={amount} onChange={(e) => setAmount(e.target.value)} inputMode="decimal" placeholder="0.00" />
           </Field>
           <Field label="Motivo">
@@ -1467,7 +1609,7 @@ function TxnSheet({ open, accounts, cur, onClose, onSave }) {
             <select style={{ ...inputStyle, appearance: "none" }} value={accountId} onChange={(e) => setAccountId(e.target.value)}>
               {usable.map((a) => (
                 <option key={a.id} value={a.id}>
-                  {a.name} · {TYPE_LABEL[a.type]}
+                  {a.name} · {TYPE_LABEL[a.type]} · {(a.currency || cur).toUpperCase()}
                 </option>
               ))}
             </select>
@@ -1475,7 +1617,7 @@ function TxnSheet({ open, accounts, cur, onClose, onSave }) {
           <Field label="Fecha">
             <input type="date" style={{ ...inputStyle, fontFamily: MONO }} value={date} onChange={(e) => setDate(e.target.value)} />
           </Field>
-          <PrimaryBtn color={kind === "income" ? T.green : T.red} disabled={!valid} onClick={() => onSave({ kind, amount: parseFloat(amount), motivo: motivo.trim(), accountId, date })}>
+          <PrimaryBtn color={kind === "income" ? T.green : T.red} disabled={!valid} onClick={() => onSave({ kind, amount: nAmount, motivo: motivo.trim(), accountId, date, currency: acctCur })}>
             {kind === "income" ? "Registrar ingreso" : "Registrar egreso"}
           </PrimaryBtn>
         </>
@@ -1741,6 +1883,7 @@ function CoinBadge({ sym }) {
 /* ─────────────────────────────  Tab: Ajustes  ───────────────────────────── */
 function AjustesTab({ settings, setSettings, accounts, txns, prices, cur, divisas, onSync }) {
   const theme = settings.theme || "dark";
+  const autoRate = vesRateOf(settings, divisas);
   const [syncing, setSyncing] = useState(false);
   const [syncMsg, setSyncMsg] = useState("");
   async function doSync() {
@@ -1815,8 +1958,11 @@ function AjustesTab({ settings, setSettings, accounts, txns, prices, cur, divisa
       const nameOf = (id) => (accounts.find((a) => a.id === id) || {}).name || "—";
 
       // Resumen por cuenta (saldo inicial/final reconstruido desde los movimientos)
-      let tIni = 0, tFin = 0, tIng = 0, tEgr = 0;
+      // Cada cuenta va en su moneda; los TOTALES se convierten a la moneda base.
+      const rate = vesRateOf(settings, divisas);
+      let tIni = 0, tFin = 0, tIng = 0, tEgr = 0, sinConv = 0;
       const resumen = fiat.map((a) => {
+        const aCur = a.currency || cur;
         const bal = a.balance || 0;
         const after = txns.filter((t) => t.accountId === a.id && t.date > to).reduce((s, t) => s + delta(t), 0);
         const fromOn = txns.filter((t) => t.accountId === a.id && t.date >= from).reduce((s, t) => s + delta(t), 0);
@@ -1824,8 +1970,11 @@ function AjustesTab({ settings, setSettings, accounts, txns, prices, cur, divisa
         const ini = bal - fromOn;
         const ing = txns.filter((t) => t.accountId === a.id && inRange(t) && t.kind === "income").reduce((s, t) => s + t.amount, 0);
         const egr = txns.filter((t) => t.accountId === a.id && inRange(t) && t.kind === "expense").reduce((s, t) => s + t.amount, 0);
-        tIni += ini; tFin += fin; tIng += ing; tEgr += egr;
-        return [a.name, TYPE_LABEL[a.type], round2(ini), round2(fin), round2(ing), round2(egr), round2(fin - ini)];
+        const cIni = convertAmt(ini, aCur, cur, rate), cFin = convertAmt(fin, aCur, cur, rate);
+        const cIng = convertAmt(ing, aCur, cur, rate), cEgr = convertAmt(egr, aCur, cur, rate);
+        if (cIni == null || cFin == null) sinConv++;
+        else { tIni += cIni; tFin += cFin; tIng += cIng || 0; tEgr += cEgr || 0; }
+        return [a.name, TYPE_LABEL[a.type], aCur.toUpperCase(), round2(ini), round2(fin), round2(ing), round2(egr), round2(fin - ini)];
       });
 
       // Rentabilidad de divisas (asignación automática FIFO)
@@ -1852,9 +2001,10 @@ function AjustesTab({ settings, setSettings, accounts, txns, prices, cur, divisa
         ["Período", `${from}  a  ${to}`],
         ["Moneda", CUR],
         [],
-        ["Cuenta", "Tipo", `Saldo inicial (${CUR})`, `Saldo final (${CUR})`, `Ingresos (${CUR})`, `Egresos (${CUR})`, `Neto (${CUR})`],
+        ["Cuenta", "Tipo", "Moneda", "Saldo inicial", "Saldo final", "Ingresos", "Egresos", "Neto"],
         ...resumen,
-        ["TOTAL", "", round2(tIni), round2(tFin), round2(tIng), round2(tEgr), round2(tFin - tIni)],
+        [`TOTAL (convertido a ${CUR})`, "", CUR, round2(tIni), round2(tFin), round2(tIng), round2(tEgr), round2(tFin - tIni)],
+        ...(sinConv ? [[`${sinConv} cuenta(s) sin conversión disponible: excluidas del total`]] : []),
         [],
         ["Divisas (compra/venta USD)"],
         ["USD vendidos", round2(dUsdVend)],
@@ -1865,7 +2015,7 @@ function AjustesTab({ settings, setSettings, accounts, txns, prices, cur, divisa
         ["Rentabilidad (%)", round2(dRent)],
       ];
       const wsR = XLSX.utils.aoa_to_sheet(resumenAoa);
-      wsR["!cols"] = [{ wch: 30 }, { wch: 12 }, { wch: 16 }, { wch: 16 }, { wch: 14 }, { wch: 14 }, { wch: 14 }];
+      wsR["!cols"] = [{ wch: 30 }, { wch: 12 }, { wch: 9 }, { wch: 16 }, { wch: 16 }, { wch: 14 }, { wch: 14 }, { wch: 14 }];
 
       // Movimientos del período
       const movs = txns.filter(inRange).slice().sort((a, b) => (a.date < b.date ? -1 : 1));
@@ -1996,6 +2146,26 @@ function AjustesTab({ settings, setSettings, accounts, txns, prices, cur, divisa
       </div>
       <div style={{ fontSize: 12.5, color: T.mut, marginBottom: 26, marginLeft: 2, lineHeight: 1.5 }}>
         "Automática" usa escritorio en pantallas anchas y móvil en el teléfono. En escritorio, el menú pasa a la barra lateral.
+      </div>
+
+      {/* Tasa VES */}
+      <div style={{ ...sectionTitle, marginBottom: 10 }}>Tasa VES por USD</div>
+      <Field label="Tasa manual (dejala vacía para usar la última operación de divisas)">
+        <input
+          style={{ ...inputStyle, fontFamily: MONO }}
+          value={settings.vesRate != null ? String(settings.vesRate) : ""}
+          onChange={(e) => {
+            const v = e.target.value;
+            setSettings((s) => ({ ...s, vesRate: v === "" ? undefined : numVE(v) }));
+          }}
+          inputMode="decimal"
+          placeholder={autoRate ? `Automática: ${autoRate}` : "Ej. 38,50"}
+        />
+      </Field>
+      <div style={{ fontSize: 12.5, color: T.mut, marginBottom: 26, marginLeft: 2, lineHeight: 1.5 }}>
+        {autoRate
+          ? `Se usa para convertir cuentas en VES a ${cur.toUpperCase()} en el balance y el Excel. Tasa activa: ${autoRate}.`
+          : `Cargá una tasa (o registrá una operación de divisas) para poder convertir cuentas en VES a ${cur.toUpperCase()}.`}
       </div>
 
       {/* Exportar */}
@@ -2141,6 +2311,7 @@ function DivisasTab({ divisas, onAdd, onEdit, onDelete, onPatch }) {
           <div style={{ fontSize: 13.5, fontWeight: 600, color: T.text }}>
             {fmtUsd(a.usd)} <span style={{ color: T.mut, fontWeight: 400 }}>× {(c.tasa || 0).toLocaleString("es-VE")}</span>
             {parcial && <span style={{ color: T.gold, fontWeight: 400 }}> · parcial de {fmtUsd(c.usd)}</span>}
+            {a.manual && <span style={{ color: T.blue, fontWeight: 400 }}> · manual</span>}
           </div>
           <div style={{ fontSize: 11.5, color: T.mut, fontFamily: MONO, marginTop: 2 }}>
             {fmtDate(c.date)} · {fmtBs(a.ves)}{comUsdOf(c) > 0 ? ` · com. ${fmtUsd(comUsdOf(c) * (a.usd / (c.usd || 1)))}` : ""}{c.persona ? ` · ${c.persona}` : ""}{c.referencia ? ` · ref ${c.referencia}` : ""}
@@ -2235,6 +2406,8 @@ function DivisasTab({ divisas, onAdd, onEdit, onDelete, onPatch }) {
             const st = statsDeVenta(v);
             const open = openId === v.id;
             const pagado = !!v.pagado;
+            const completada = st.vesRestantes <= 0.01;
+            const usdPorComprar = v.tasa > 0 ? st.vesRestantes / v.tasa : 0;
             return (
               <div key={v.id} style={{ ...rowCard, flexDirection: "column", alignItems: "stretch", padding: 0, overflow: "hidden" }}>
                 <div onClick={() => setOpenId(open ? null : v.id)} style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 10, padding: "13px 15px", cursor: "pointer" }}>
@@ -2242,6 +2415,9 @@ function DivisasTab({ divisas, onAdd, onEdit, onDelete, onPatch }) {
                     <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 4, flexWrap: "wrap" }}>
                       <span style={{ fontSize: 11, fontWeight: 700, color: T.green, background: T.greenSoft, padding: "2px 8px", borderRadius: 6 }}>VENTA</span>
                       <span style={{ fontSize: 12, color: T.mut }}>{fmtDate(v.date)}</span>
+                      <span style={{ fontSize: 10.5, fontWeight: 700, padding: "2px 8px", borderRadius: 6, color: completada ? T.blue : T.gold, background: completada ? "rgba(91,141,239,0.14)" : "rgba(227,178,77,0.14)", border: `1px solid ${completada ? T.blue : T.gold}` }}>
+                        {completada ? "COMPLETADA" : "PENDIENTE"}
+                      </span>
                       <span style={{ fontSize: 10.5, fontWeight: 700, padding: "2px 8px", borderRadius: 6, color: pagado ? T.green : T.mut2, background: pagado ? T.greenSoft : T.bg2, border: `1px solid ${pagado ? T.green : T.line}` }}>
                         {pagado ? "PAGADO" : "NO PAGADO"}
                       </span>
@@ -2256,13 +2432,18 @@ function DivisasTab({ divisas, onAdd, onEdit, onDelete, onPatch }) {
                     <div style={{ fontSize: 12, marginTop: 4, color: st.gananciaUsd >= 0 ? T.green : T.red, fontWeight: 600 }}>
                       {st.allocs.length} compra(s) · {st.gananciaUsd >= 0 ? "+" : ""}{fmtUsd(st.gananciaUsd)} ({st.rentab.toFixed(2)}%)
                     </div>
+                    {!completada && (
+                      <div style={{ fontSize: 11.5, color: T.gold, marginTop: 2 }}>
+                        Falta comprar ≈ {fmtUsd(usdPorComprar)} · {fmtBs(st.vesRestantes)} disponibles
+                      </div>
+                    )}
                   </div>
                   <span style={{ color: T.mut2, fontSize: 12, paddingTop: 2 }}>{open ? "▲" : "▼"}</span>
                 </div>
 
                 {open && (
                   <div style={{ padding: "4px 15px 16px", borderTop: `1px solid ${T.lineSoft}` }}>
-                    <div style={{ ...sectionTitle, margin: "14px 0 8px" }}>Estado de pago</div>
+                    <div style={{ ...sectionTitle, margin: "14px 0 8px" }}>Entrega al cliente</div>
                     <div style={{ display: "flex", background: T.card2, borderRadius: 11, padding: 4, border: `1px solid ${T.lineSoft}` }}>
                       <button onClick={() => onPatch(v.id, { pagado: false })} style={seg(!pagado, T.mut2)}>No pagado</button>
                       <button onClick={() => onPatch(v.id, { pagado: true })} style={seg(pagado, T.green)}>Pagado</button>
@@ -2366,26 +2547,7 @@ function DivisaSheet({ state, divisas, onClose, onSave, onDelete }) {
       setDate(state.date || todayISO());
     } else if (state) {
       setUsd(""); setTasa(""); setPersona(""); setComisionTipo("mismo"); setComMode(state.kind === "venta" ? "none" : "pct"); setComVes(""); setComUsd(""); setReferencia(""); setDate(todayISO());
-      // Asignación automática: si es compra y hay una venta "abierta" (con Bs restantes),
-      // elegir la más antigua para cerrarlas en orden.
-      let auto = "";
-      if (state.kind === "compra") {
-        const abiertas = (divisas || [])
-          .filter((d) => d.kind === "venta")
-          .map((v) => {
-            const generados = (v.usd || 0) * (v.tasa || 0);
-            const usados = (divisas || [])
-              .filter((c) => c.kind === "compra" && c.ventaId === v.id)
-              .reduce((s, c) => s + (c.usd || 0) * (c.tasa || 0) + comOp(c), 0);
-            return { v, restante: generados - usados };
-          })
-          .filter((x) => x.restante > 0.01)
-          .sort((a, b) =>
-            a.v.date < b.v.date ? -1 : a.v.date > b.v.date ? 1 : (a.v.createdAt || 0) - (b.v.createdAt || 0)
-          );
-        if (abiertas.length) auto = abiertas[0].v.id;
-      }
-      setVentaId(auto);
+      setVentaId(""); // "" = automática (FIFO)
     }
   }, [state]);
 
@@ -2403,16 +2565,22 @@ function DivisaSheet({ state, divisas, onClose, onSave, onDelete }) {
 
   const readonly = { ...inputStyle, background: T.bg2, color: T.text, fontFamily: MONO };
 
-  // Ventas disponibles como origen de los VES (con su saldo restante)
-  const ventasList = (divisas || [])
-    .filter((d) => d.kind === "venta")
-    .map((v) => {
-      const generados = (v.usd || 0) * (v.tasa || 0);
-      const usados = (divisas || [])
-        .filter((c) => c.kind === "compra" && c.ventaId === v.id && c.id !== state.id)
-        .reduce((s, c) => s + (c.usd || 0) * (c.tasa || 0) + comOp(c), 0);
-      return { v, restante: generados - usados };
-    });
+  // Ventas PENDIENTES (con VES por usar) y con fecha <= la de esta compra.
+  // Se excluye esta misma compra del cálculo para no ocultar su propia capacidad.
+  const ventasList = (() => {
+    if (venta) return [];
+    const vs = (divisas || []).filter((d) => d.kind === "venta");
+    const cs = (divisas || []).filter((d) => d.kind === "compra" && d.id !== state.id);
+    const a = allocateFIFO(vs, cs);
+    return vs
+      .filter((v) => v.date <= date)
+      .map((v) => {
+        const s = a.ventaStats[v.id] || { vesUsados: 0 };
+        return { v, restante: capOf(v) - s.vesUsados };
+      })
+      .filter((x) => x.restante > 0.01)
+      .sort((x, y) => (x.v.date < y.v.date ? -1 : 1));
+  })();
 
   return (
     <Sheet open={!!state} onClose={onClose} title={(editing ? "Editar " : "") + (venta ? "Venta de USD" : "Compra de USD")}>
@@ -2499,8 +2667,18 @@ function DivisaSheet({ state, divisas, onClose, onSave, onDelete }) {
               </>
             )}
           </div>
-          <div style={{ fontSize: 12, color: T.mut, margin: "4px 2px 8px", lineHeight: 1.5 }}>
-            Esta compra se asigna automáticamente a las ventas abiertas por orden de llegada (solo ventas con fecha igual o anterior a la compra). Si agota una venta, se fracciona hacia la siguiente.
+          <Field label="Asignación de los VES">
+            <select style={{ ...inputStyle, appearance: "none" }} value={ventaId} onChange={(e) => setVentaId(e.target.value)}>
+              <option value="">Automática (por orden de llegada)</option>
+              {ventasList.map(({ v, restante }) => (
+                <option key={v.id} value={v.id}>
+                  {fmtDate(v.date)} · {v.persona || "—"} · queda {fmtBs(restante)}
+                </option>
+              ))}
+            </select>
+          </Field>
+          <div style={{ fontSize: 12, color: T.mut, margin: "-8px 2px 8px", lineHeight: 1.5 }}>
+            Por defecto se asigna sola a las ventas pendientes por orden de llegada (solo ventas con fecha igual o anterior). Podés elegir una venta puntual; si no alcanza, el resto se reparte solo.
           </div>
         </>
       )}
@@ -2525,6 +2703,7 @@ function DivisaSheet({ state, divisas, onClose, onSave, onDelete }) {
             date,
             persona: persona.trim(),
             referencia: referencia.trim() || undefined,
+            ventaId: venta ? undefined : (ventaId || undefined),
             comMode,
             comisionTipo,
             comisionVesInput: comMode === "ves" ? (numVE(comVes) || 0) : undefined,
