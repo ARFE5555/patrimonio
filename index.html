@@ -203,13 +203,19 @@ function allocateFIFO(ventas, compras) {
     st.remaining -= take;
   };
 
-  // Paso A: asignaciones manuales
+  // Paso A: asignaciones manuales (lista ordenada de ventas; llena cada una y pasa a la siguiente)
   for (const st of state) {
-    if (st.W <= EPS || !st.c.ventaId) continue;
-    const b = byId[st.c.ventaId];
-    if (!b || b.v.date > st.c.date) continue; // pin inválido: la venta es posterior
-    const take = Math.min(b.cap - b.used, st.remaining);
-    if (take > EPS) put(b, st, take, true);
+    if (st.W <= EPS) continue;
+    const manual = st.c.manualAllocs && st.c.manualAllocs.length
+      ? st.c.manualAllocs
+      : (st.c.ventaId ? [st.c.ventaId] : []);
+    for (const vid of manual) {
+      if (st.remaining <= EPS) break;
+      const b = byId[vid];
+      if (!b || b.v.date > st.c.date) continue; // destino inválido: venta posterior a la compra
+      const take = Math.min(b.cap - b.used, st.remaining);
+      if (take > EPS) put(b, st, take, true);
+    }
   }
 
   // Paso B: FIFO automático para lo que quede
@@ -2529,7 +2535,7 @@ function DivisaSheet({ state, divisas, onClose, onSave, onDelete }) {
   const [comMode, setComMode] = useState("pct");
   const [comVes, setComVes] = useState("");
   const [comUsd, setComUsd] = useState("");
-  const [ventaId, setVentaId] = useState("");
+  const [manualAllocs, setManualAllocs] = useState([]);
   const [referencia, setReferencia] = useState("");
   const [date, setDate] = useState(todayISO());
 
@@ -2542,12 +2548,12 @@ function DivisaSheet({ state, divisas, onClose, onSave, onDelete }) {
       setComMode(state.comMode || (state.kind === "venta" ? "none" : "pct"));
       setComVes(state.comisionVesInput != null ? String(state.comisionVesInput) : "");
       setComUsd(state.comisionUsdInput != null ? String(state.comisionUsdInput) : "");
-      setVentaId(state.ventaId || "");
+      setManualAllocs(state.manualAllocs || (state.ventaId ? [state.ventaId] : []));
       setReferencia(state.referencia || "");
       setDate(state.date || todayISO());
     } else if (state) {
       setUsd(""); setTasa(""); setPersona(""); setComisionTipo("mismo"); setComMode(state.kind === "venta" ? "none" : "pct"); setComVes(""); setComUsd(""); setReferencia(""); setDate(todayISO());
-      setVentaId(""); // "" = automática (FIFO)
+      setManualAllocs([]);
     }
   }, [state]);
 
@@ -2580,6 +2586,25 @@ function DivisaSheet({ state, divisas, onClose, onSave, onDelete }) {
       })
       .filter((x) => x.restante > 0.01)
       .sort((x, y) => (x.v.date < y.v.date ? -1 : 1));
+  })();
+
+  const split = (() => {
+    const gross = isNaN(nUsd) ? 0 : nUsd;
+    const W = gross * (isNaN(nTasa) ? 0 : nTasa) + comVesAmt;
+    const vs = (divisas || []).filter((d) => d.kind === "venta");
+    const others = (divisas || []).filter((d) => d.kind === "compra" && d.id !== state.id);
+    const a = allocateFIFO(vs, others);
+    let remaining = W;
+    const rows = [];
+    for (const vid of manualAllocs) {
+      const v = vs.find((x) => x.id === vid);
+      if (!v) continue;
+      const restante = Math.max(0, capOf(v) - ((a.ventaStats[v.id] || {}).vesUsados || 0));
+      const take = W > 0 ? Math.min(restante, remaining) : 0;
+      rows.push({ v, ves: take, usd: W > 0 ? gross * (take / W) : 0 });
+      remaining -= take;
+    }
+    return { rows, autoUsd: W > 0 ? gross * (Math.max(0, remaining) / W) : 0 };
   })();
 
   return (
@@ -2668,17 +2693,37 @@ function DivisaSheet({ state, divisas, onClose, onSave, onDelete }) {
             )}
           </div>
           <Field label="Asignación de los VES">
-            <select style={{ ...inputStyle, appearance: "none" }} value={ventaId} onChange={(e) => setVentaId(e.target.value)}>
-              <option value="">Automática (por orden de llegada)</option>
-              {ventasList.map(({ v, restante }) => (
+            <select
+              style={{ ...inputStyle, appearance: "none" }}
+              value=""
+              onChange={(e) => { if (e.target.value) setManualAllocs((m) => [...m, e.target.value]); }}
+            >
+              <option value="">{manualAllocs.length ? "+ Agregar otra venta al reparto…" : "Automática — o elegí una venta…"}</option>
+              {ventasList.filter(({ v }) => !manualAllocs.includes(v.id)).map(({ v, restante }) => (
                 <option key={v.id} value={v.id}>
                   {fmtDate(v.date)} · {v.persona || "—"} · queda {fmtBs(restante)}
                 </option>
               ))}
             </select>
           </Field>
-          <div style={{ fontSize: 12, color: T.mut, margin: "-8px 2px 8px", lineHeight: 1.5 }}>
-            Por defecto se asigna sola a las ventas pendientes por orden de llegada (solo ventas con fecha igual o anterior). Podés elegir una venta puntual; si no alcanza, el resto se reparte solo.
+          {manualAllocs.length > 0 && (
+            <div style={{ marginBottom: 12 }}>
+              {split.rows.map((r, i) => (
+                <div key={r.v.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", background: T.bg2, border: `1px solid ${T.lineSoft}`, borderRadius: 10, padding: "9px 11px", marginBottom: 6 }}>
+                  <div style={{ minWidth: 0 }}>
+                    <div style={{ fontSize: 13, fontWeight: 600, color: T.text }}>{i + 1}. {r.v.persona || fmtDate(r.v.date)}</div>
+                    <div style={{ fontSize: 11.5, color: T.mut, fontFamily: MONO }}>{fmtDate(r.v.date)} · asigna {fmtUsd(r.usd)}</div>
+                  </div>
+                  <button onClick={() => setManualAllocs((m) => m.filter((x) => x !== r.v.id))} style={{ ...btnGhost, color: T.mut2, fontSize: 18, lineHeight: 1 }} aria-label="Quitar">×</button>
+                </div>
+              ))}
+              <div style={{ fontSize: 12, color: split.autoUsd > 0.01 ? T.gold : T.mut, marginLeft: 2 }}>
+                {split.autoUsd > 0.01 ? `Resto ≈ ${fmtUsd(split.autoUsd)} → se asigna automáticamente` : "Estas ventas cubren toda la compra."}
+              </div>
+            </div>
+          )}
+          <div style={{ fontSize: 12, color: T.mut, margin: "0 2px 8px", lineHeight: 1.5 }}>
+            Sin elegir nada, se asigna sola por orden de llegada. Podés elegir varias ventas en orden: la compra llena la primera y el excedente pasa a la siguiente que elijas (solo ventas con fecha igual o anterior).
           </div>
         </>
       )}
@@ -2703,7 +2748,8 @@ function DivisaSheet({ state, divisas, onClose, onSave, onDelete }) {
             date,
             persona: persona.trim(),
             referencia: referencia.trim() || undefined,
-            ventaId: venta ? undefined : (ventaId || undefined),
+            manualAllocs: venta ? undefined : (manualAllocs.length ? manualAllocs : undefined),
+            ventaId: undefined,
             comMode,
             comisionTipo,
             comisionVesInput: comMode === "ves" ? (numVE(comVes) || 0) : undefined,
