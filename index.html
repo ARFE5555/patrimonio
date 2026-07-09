@@ -212,7 +212,7 @@ function allocateFIFO(ventas, compras) {
     for (const vid of manual) {
       if (st.remaining <= EPS) break;
       const b = byId[vid];
-      if (!b || b.v.date > st.c.date) continue; // destino inválido: venta posterior a la compra
+      if (!b) continue; // asignación manual: puede ir a cualquier venta, incluso posterior a la compra
       const take = Math.min(b.cap - b.used, st.remaining);
       if (take > EPS) put(b, st, take, true);
     }
@@ -241,11 +241,27 @@ function allocateFIFO(ventas, compras) {
 }
 
 /* ── Multimoneda: conversión USD ↔ VES ── */
+function latestRateFromHistory(settings, onOrBefore) {
+  const hist = (settings && settings.rateHistory) || [];
+  const elig = onOrBefore ? hist.filter((r) => r.date <= onOrBefore) : hist;
+  if (!elig.length) return null;
+  const latest = elig.slice().sort((a, b) => (a.date < b.date ? 1 : -1))[0];
+  return latest && latest.rate > 0 ? latest.rate : null;
+}
 function vesRateOf(settings, divisas) {
+  const h = latestRateFromHistory(settings, null);
+  if (h) return h;
   const manual = settings && Number(settings.vesRate);
   if (manual && manual > 0) return manual;
   const ops = (divisas || []).filter((d) => d.tasa > 0).slice().sort((a, b) => (a.date < b.date ? 1 : -1));
   return ops.length ? ops[0].tasa : null;
+}
+function rateForDate(settings, divisas, date) {
+  const h = latestRateFromHistory(settings, date);
+  if (h) return h;
+  const ops = (divisas || []).filter((d) => d.tasa > 0 && d.date <= date).slice().sort((a, b) => (a.date < b.date ? 1 : -1));
+  if (ops.length) return ops[0].tasa;
+  return vesRateOf(settings, divisas);
 }
 function convertAmt(amount, from, to, rate) {
   if (!from || from === to) return amount;
@@ -716,6 +732,10 @@ function App() {
   const cur = settings.currency;
 
   const vesRate = useMemo(() => vesRateOf(settings, divisas), [settings.vesRate, divisas]);
+  const projects = useMemo(
+    () => Array.from(new Set(txns.map((t) => t.project).filter(Boolean))).sort(),
+    [txns]
+  );
 
   const totals = useMemo(() => {
     let bank = 0, cash = 0, crypto = 0, sinConvertir = 0;
@@ -769,7 +789,8 @@ function App() {
 
   /* Acciones movimientos */
   function addTxn(data) {
-    const delta = data.kind === "income" ? data.amount : -data.amount;
+    const com = data.commission || 0;
+    const delta = (data.kind === "income" ? data.amount : -data.amount) - com;
     setAccounts((prev) =>
       prev.map((a) =>
         a.id === data.accountId ? { ...a, balance: (a.balance || 0) + delta } : a
@@ -779,7 +800,8 @@ function App() {
     setTxnSheet(false);
   }
   function deleteTxn(t) {
-    const delta = t.kind === "income" ? -t.amount : t.amount;
+    const com = t.commission || 0;
+    const delta = (t.kind === "income" ? -t.amount : t.amount) + com;
     setAccounts((prev) =>
       prev.map((a) =>
         a.id === t.accountId ? { ...a, balance: (a.balance || 0) + delta } : a
@@ -803,6 +825,13 @@ function App() {
   }
   function patchDivisa(id, patch) {
     setDivisas((prev) => prev.map((d) => (d.id === id ? { ...d, ...patch } : d)));
+  }
+  function setVesRate(date, rate) {
+    if (!(rate > 0) || !date) return;
+    setSettings((s) => {
+      const hist = (s.rateHistory || []).filter((r) => r.date !== date);
+      return { ...s, rateHistory: [...hist, { date, rate }].sort((a, b) => (a.date < b.date ? -1 : 1)) };
+    });
   }
   async function syncSheet(url) {
     const u = (url || settings.sheetUrl || "").trim();
@@ -903,6 +932,9 @@ function App() {
             accounts={accounts}
             prices={prices}
             cur={cur}
+            settings={settings}
+            vesRate={vesRate}
+            onSetRate={setVesRate}
             onAdd={(type) =>
               type === "crypto"
                 ? setCryptoSheet(true)
@@ -1004,6 +1036,8 @@ function App() {
         open={txnSheet}
         accounts={accounts}
         cur={cur}
+        vesRate={vesRate}
+        projects={projects}
         onClose={() => setTxnSheet(false)}
         onSave={addTxn}
       />
@@ -1185,10 +1219,53 @@ function BalanceTab({ totals, cur, prices }) {
 }
 
 /* ─────────────────────────────  Tab: Cuentas  ───────────────────────────── */
-function AccountsTab({ accounts, prices, cur, onAdd, onEdit }) {
+function AccountsTab({ accounts, prices, cur, settings, vesRate, onSetRate, onAdd, onEdit }) {
   const groups = ["bank", "cash", "crypto"];
+  const [rateInput, setRateInput] = useState("");
+  const [rateDate, setRateDate] = useState(todayISO());
+  const vesTotal = accounts
+    .filter((a) => a.type !== "crypto" && (a.currency || cur) === "ves")
+    .reduce((s, a) => s + (a.balance || 0), 0);
+  const vesInUsd = vesRate ? vesTotal / vesRate : null;
+  const hist = (settings && settings.rateHistory) || [];
   return (
     <div style={{ paddingTop: 8 }}>
+      {/* Tasa de cambio (manual, para cuentas VES) */}
+      <div style={{ background: `linear-gradient(160deg, ${T.card2}, ${T.card})`, border: `1px solid ${T.line}`, borderRadius: 18, padding: "18px", marginBottom: 20 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
+          <div style={{ fontSize: 13, color: T.mut, fontWeight: 500 }}>Tasa de cambio (VES/USD)</div>
+          {hist.length > 0 && <div style={{ fontSize: 11.5, color: T.mut2 }}>{hist.length} registro(s)</div>}
+        </div>
+        <div style={{ fontFamily: MONO, fontVariantNumeric: "tabular-nums", fontSize: 30, fontWeight: 600, letterSpacing: -0.5, color: T.text, margin: "4px 0 12px" }}>
+          {vesRate ? vesRate.toLocaleString("es-VE", { maximumFractionDigits: 2 }) : "—"}
+        </div>
+        <div style={{ display: "flex", gap: 8, alignItems: "flex-end" }}>
+          <div style={{ flex: 1.3 }}>
+            <label style={labelStyle}>Nueva tasa</label>
+            <input style={{ ...inputStyle, fontFamily: MONO }} value={rateInput} onChange={(e) => setRateInput(e.target.value)} inputMode="decimal" placeholder="Ej. 38,50" />
+          </div>
+          <div style={{ flex: 1 }}>
+            <label style={labelStyle}>Fecha</label>
+            <input type="date" style={{ ...inputStyle, fontFamily: MONO }} value={rateDate} onChange={(e) => setRateDate(e.target.value)} />
+          </div>
+        </div>
+        <button
+          onClick={() => { const r = numVE(rateInput); if (r > 0) { onSetRate(rateDate, r); setRateInput(""); } }}
+          disabled={!(numVE(rateInput) > 0)}
+          style={{ width: "100%", marginTop: 10, background: numVE(rateInput) > 0 ? T.gold : T.card2, color: numVE(rateInput) > 0 ? "#0A0F1E" : T.mut2, border: "none", borderRadius: 12, padding: "12px", fontSize: 15, fontWeight: 650, fontFamily: FONT, cursor: numVE(rateInput) > 0 ? "pointer" : "default" }}
+        >
+          Guardar tasa del día
+        </button>
+        {vesTotal > 0 && (
+          <div style={{ marginTop: 14, paddingTop: 14, borderTop: `1px solid ${T.lineSoft}`, display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
+            <span style={{ fontSize: 12.5, color: T.mut }}>Proyección VES → USD</span>
+            <span style={{ fontFamily: MONO, fontSize: 14, color: T.text, fontWeight: 600 }}>
+              {fmtBs(vesTotal)} ≈ {vesInUsd != null ? fmtUsd(vesInUsd) : "—"}
+            </span>
+          </div>
+        )}
+      </div>
+
       {groups.map((g) => {
         const list = accounts.filter((a) => a.type === g);
         return (
@@ -1291,12 +1368,14 @@ function TxnsTab({ txns, accounts, cur, onAdd, onDelete }) {
 
   const [fAcct, setFAcct] = useState("all");
   const [fKind, setFKind] = useState("all");
+  const [fProject, setFProject] = useState("all");
   const [fFrom, setFFrom] = useState("");
   const [fTo, setFTo] = useState("");
   const [showF, setShowF] = useState(false);
 
   const usable = accounts.filter((a) => a.type === "bank" || a.type === "cash");
-  const activos = (fAcct !== "all" ? 1 : 0) + (fKind !== "all" ? 1 : 0) + (fFrom ? 1 : 0) + (fTo ? 1 : 0);
+  const projects = useMemo(() => Array.from(new Set(txns.map((t) => t.project).filter(Boolean))).sort(), [txns]);
+  const activos = (fAcct !== "all" ? 1 : 0) + (fKind !== "all" ? 1 : 0) + (fProject !== "all" ? 1 : 0) + (fFrom ? 1 : 0) + (fTo ? 1 : 0);
 
   const filtrados = useMemo(
     () =>
@@ -1304,10 +1383,11 @@ function TxnsTab({ txns, accounts, cur, onAdd, onDelete }) {
         (t) =>
           (fAcct === "all" || t.accountId === fAcct) &&
           (fKind === "all" || t.kind === fKind) &&
+          (fProject === "all" || (fProject === "__none" ? !t.project : t.project === fProject)) &&
           (!fFrom || t.date >= fFrom) &&
           (!fTo || t.date <= fTo)
       ),
-    [txns, fAcct, fKind, fFrom, fTo]
+    [txns, fAcct, fKind, fProject, fFrom, fTo]
   );
 
   // Totales del filtro, agrupados por moneda
@@ -1366,6 +1446,13 @@ function TxnsTab({ txns, accounts, cur, onAdd, onDelete }) {
               <option value="expense">Solo egresos</option>
             </select>
           </Field>
+          <Field label="Proyecto">
+            <select style={selStyle} value={fProject} onChange={(e) => setFProject(e.target.value)}>
+              <option value="all">Todos los proyectos</option>
+              <option value="__none">Sin proyecto</option>
+              {projects.map((p) => (<option key={p} value={p}>{p}</option>))}
+            </select>
+          </Field>
           <div style={{ display: "flex", gap: 10 }}>
             <div style={{ flex: 1 }}>
               <label style={labelStyle}>Desde</label>
@@ -1378,7 +1465,7 @@ function TxnsTab({ txns, accounts, cur, onAdd, onDelete }) {
           </div>
           {activos > 0 && (
             <button
-              onClick={() => { setFAcct("all"); setFKind("all"); setFFrom(""); setFTo(""); }}
+              onClick={() => { setFAcct("all"); setFKind("all"); setFProject("all"); setFFrom(""); setFTo(""); }}
               style={{ ...btnGhost, color: T.red, marginTop: 12, padding: 4 }}
             >
               Limpiar filtros
@@ -1434,6 +1521,8 @@ function TxnsTab({ txns, accounts, cur, onAdd, onDelete }) {
                         </div>
                         <div style={{ fontSize: 12, color: T.mut }}>
                           {acctName(t.accountId)} · {c.toUpperCase()}
+                          {t.project ? ` · ${t.project}` : ""}
+                          {t.commission ? ` · com. ${t.comMode === "usd" ? fmtUsd(t.comUsd || 0) : money(t.commission, c)}` : ""}
                         </div>
                       </div>
                     </div>
@@ -1551,26 +1640,41 @@ function AccountSheet({ state, cur, onClose, onSave, onDelete }) {
 }
 
 /* ─────────────────────────────  Sheet: Movimiento  ───────────────────────────── */
-function TxnSheet({ open, accounts, cur, onClose, onSave }) {
+function TxnSheet({ open, accounts, cur, vesRate, projects, onClose, onSave }) {
   const usable = accounts.filter((a) => a.type === "bank" || a.type === "cash");
   const [kind, setKind] = useState("expense");
   const [amount, setAmount] = useState("");
   const [motivo, setMotivo] = useState("");
   const [accountId, setAccountId] = useState("");
   const [date, setDate] = useState(todayISO());
+  const [comMode, setComMode] = useState("none");
+  const [comManual, setComManual] = useState("");
+  const [comUsd, setComUsd] = useState("");
+  const [project, setProject] = useState("");
+  const [newProject, setNewProject] = useState("");
   useEffect(() => {
     if (open) {
-      setKind("expense");
-      setAmount("");
-      setMotivo("");
-      setAccountId(usable[0]?.id || "");
-      setDate(todayISO());
+      setKind("expense"); setAmount(""); setMotivo(""); setAccountId(usable[0]?.id || ""); setDate(todayISO());
+      setComMode("none"); setComManual(""); setComUsd(""); setProject(""); setNewProject("");
     }
   }, [open]);
+
   const acct = usable.find((a) => a.id === accountId);
   const acctCur = (acct && acct.currency) || cur;
   const nAmount = numVE(amount);
-  const valid = amount && !isNaN(nAmount) && nAmount > 0 && accountId && motivo.trim();
+  const comAcct =
+    comMode === "pct" ? (isNaN(nAmount) ? 0 : nAmount) * 0.003
+    : comMode === "manual" ? (numVE(comManual) || 0)
+    : comMode === "usd" ? (convertAmt(numVE(comUsd) || 0, "usd", acctCur, vesRate) ?? 0)
+    : 0;
+  const comUsdVal = comMode === "usd" ? (numVE(comUsd) || 0) : 0;
+  const proj = project === "__new" ? newProject.trim() : project;
+  const egresoTotal = (isNaN(nAmount) ? 0 : nAmount) + comAcct;
+  const saldo = acct ? acct.balance || 0 : 0;
+  const insuf = kind === "expense" && !isNaN(nAmount) && nAmount > 0 && egresoTotal > saldo + 1e-6;
+  const valid = amount && !isNaN(nAmount) && nAmount > 0 && accountId && motivo.trim() && !(project === "__new" && !newProject.trim());
+  const seg = (a, color) => ({ flex: 1, border: "none", borderRadius: 9, padding: "11px", fontSize: 14.5, fontWeight: 600, fontFamily: FONT, cursor: "pointer", background: a ? color : "transparent", color: a ? "#0A0F1E" : T.mut });
+
   return (
     <Sheet open={open} onClose={onClose} title="Nuevo movimiento">
       {usable.length === 0 ? (
@@ -1579,30 +1683,9 @@ function TxnSheet({ open, accounts, cur, onClose, onSave }) {
         </div>
       ) : (
         <>
-          {/* Segmento ingreso/egreso */}
           <div style={{ display: "flex", background: T.card, borderRadius: 12, padding: 4, marginBottom: 16 }}>
-            {[
-              ["expense", "Egreso", T.red],
-              ["income", "Ingreso", T.green],
-            ].map(([k, label, color]) => (
-              <button
-                key={k}
-                onClick={() => setKind(k)}
-                style={{
-                  flex: 1,
-                  border: "none",
-                  borderRadius: 9,
-                  padding: "11px",
-                  fontSize: 15,
-                  fontWeight: 600,
-                  fontFamily: FONT,
-                  cursor: "pointer",
-                  background: kind === k ? color : "transparent",
-                  color: kind === k ? "#0B0E14" : T.mut,
-                }}
-              >
-                {label}
-              </button>
+            {[["expense", "Egreso", T.red], ["income", "Ingreso", T.green]].map(([k, label, color]) => (
+              <button key={k} onClick={() => setKind(k)} style={seg(kind === k, color)}>{label}</button>
             ))}
           </div>
           <Field label={`Monto (${acctCur.toUpperCase()})`}>
@@ -1614,17 +1697,59 @@ function TxnSheet({ open, accounts, cur, onClose, onSave }) {
           <Field label="Cuenta / método de pago">
             <select style={{ ...inputStyle, appearance: "none" }} value={accountId} onChange={(e) => setAccountId(e.target.value)}>
               {usable.map((a) => (
-                <option key={a.id} value={a.id}>
-                  {a.name} · {TYPE_LABEL[a.type]} · {(a.currency || cur).toUpperCase()}
-                </option>
+                <option key={a.id} value={a.id}>{a.name} · {TYPE_LABEL[a.type]} · {(a.currency || cur).toUpperCase()}</option>
               ))}
             </select>
           </Field>
+
+          <Field label="Comisión">
+            <select style={{ ...inputStyle, appearance: "none" }} value={comMode} onChange={(e) => setComMode(e.target.value)}>
+              <option value="none">Sin comisión (0%)</option>
+              <option value="pct">0,3% (VES)</option>
+              <option value="usd">Monto en USD</option>
+              <option value="manual">Monto manual ({acctCur.toUpperCase()})</option>
+            </select>
+          </Field>
+          {comMode === "usd" && (
+            <Field label="Comisión en USD">
+              <input style={{ ...inputStyle, fontFamily: MONO }} value={comUsd} onChange={(e) => setComUsd(e.target.value)} inputMode="decimal" placeholder="0.00" />
+            </Field>
+          )}
+          {comMode === "manual" && (
+            <Field label={`Comisión (${acctCur.toUpperCase()})`}>
+              <input style={{ ...inputStyle, fontFamily: MONO }} value={comManual} onChange={(e) => setComManual(e.target.value)} inputMode="decimal" placeholder="0,00" />
+            </Field>
+          )}
+          {comMode !== "none" && (
+            <div style={{ fontSize: 12.5, color: T.mut, margin: "-4px 2px 14px", lineHeight: 1.5 }}>
+              Comisión: <span style={{ color: T.text, fontFamily: MONO }}>{comMode === "usd" ? fmtUsd(comUsdVal) : money(comAcct, acctCur)}</span>
+              {"  ·  "}Impacto en la cuenta: <span style={{ color: T.text, fontFamily: MONO }}>{money((kind === "income" ? nAmount - comAcct : -(nAmount + comAcct)) || 0, acctCur)}</span>
+            </div>
+          )}
+
+          <Field label="Proyecto (opcional)">
+            <select style={{ ...inputStyle, appearance: "none" }} value={project} onChange={(e) => setProject(e.target.value)}>
+              <option value="">Sin proyecto</option>
+              {projects.map((p) => (<option key={p} value={p}>{p}</option>))}
+              <option value="__new">+ Nuevo proyecto…</option>
+            </select>
+          </Field>
+          {project === "__new" && (
+            <Field label="Nombre del proyecto">
+              <input style={inputStyle} value={newProject} onChange={(e) => setNewProject(e.target.value)} placeholder="Ej. Local Centro" />
+            </Field>
+          )}
+
           <Field label="Fecha">
             <input type="date" style={{ ...inputStyle, fontFamily: MONO }} value={date} onChange={(e) => setDate(e.target.value)} />
           </Field>
-          <PrimaryBtn color={kind === "income" ? T.green : T.red} disabled={!valid} onClick={() => onSave({ kind, amount: nAmount, motivo: motivo.trim(), accountId, date, currency: acctCur })}>
-            {kind === "income" ? "Registrar ingreso" : "Registrar egreso"}
+          {insuf && (
+            <div style={{ background: T.redSoft, border: `1px solid ${T.red}`, borderRadius: 12, padding: "12px 14px", marginBottom: 12, fontSize: 13, color: T.red, lineHeight: 1.5 }}>
+              No disponés de fondos suficientes. Saldo de la cuenta: <span style={{ fontFamily: MONO, fontWeight: 600 }}>{money(saldo, acctCur)}</span>{comAcct > 0 ? ` · egreso + comisión: ${money(egresoTotal, acctCur)}` : ""} · quedaría en <span style={{ fontFamily: MONO, fontWeight: 600 }}>{money(saldo - egresoTotal, acctCur)}</span>.
+            </div>
+          )}
+          <PrimaryBtn color={kind === "income" ? T.green : T.red} disabled={!valid} onClick={() => onSave({ kind, amount: nAmount, motivo: motivo.trim(), accountId, date, currency: acctCur, commission: comAcct, comMode, comUsd: comUsdVal || undefined, project: proj || undefined })}>
+            {kind === "income" ? "Registrar ingreso" : insuf ? "Registrar de todos modos" : "Registrar egreso"}
           </PrimaryBtn>
         </>
       )}
@@ -2026,17 +2151,26 @@ function AjustesTab({ settings, setSettings, accounts, txns, prices, cur, divisa
       // Movimientos del período
       const movs = txns.filter(inRange).slice().sort((a, b) => (a.date < b.date ? -1 : 1));
       const movAoa = [
-        ["Fecha", "Tipo", "Motivo", "Cuenta / método", `Monto (${CUR})`],
-        ...movs.map((t) => [
-          t.date,
-          t.kind === "income" ? "Ingreso" : "Egreso",
-          t.motivo || "",
-          nameOf(t.accountId),
-          round2(t.kind === "income" ? t.amount : -t.amount),
-        ]),
+        ["Fecha", "Tipo", "Motivo", "Cuenta / método", "Moneda", "Monto", "Comisión", "Proyecto", "Tasa VES/USD (del día)"],
+        ...movs.map((t) => {
+          const mc = (t.currency || cur).toUpperCase();
+          const comTxt = t.commission ? (t.comMode === "usd" ? `${round2(t.comUsd || 0)} USD` : round2(t.commission)) : "";
+          const rd = rateForDate(settings, divisas, t.date);
+          return [
+            t.date,
+            t.kind === "income" ? "Ingreso" : "Egreso",
+            t.motivo || "",
+            nameOf(t.accountId),
+            mc,
+            round2(t.kind === "income" ? t.amount : -t.amount),
+            comTxt,
+            t.project || "",
+            rd ? round2(rd) : "",
+          ];
+        }),
       ];
       const wsM = XLSX.utils.aoa_to_sheet(movAoa);
-      wsM["!cols"] = [{ wch: 12 }, { wch: 10 }, { wch: 28 }, { wch: 22 }, { wch: 14 }];
+      wsM["!cols"] = [{ wch: 12 }, { wch: 10 }, { wch: 26 }, { wch: 22 }, { wch: 8 }, { wch: 14 }, { wch: 12 }, { wch: 18 }, { wch: 20 }];
 
       // Cripto (instantánea al momento de exportar)
       const cripto = accounts.filter((a) => a.type === "crypto");
@@ -2104,6 +2238,13 @@ function AjustesTab({ settings, setSettings, accounts, txns, prices, cur, divisa
       XLSX.utils.book_append_sheet(wb, wsM, "Movimientos");
       XLSX.utils.book_append_sheet(wb, wsC, "Cripto");
       XLSX.utils.book_append_sheet(wb, wsDiv, "Divisas");
+
+      // Hoja Tasas: historial diario de la tasa VES/USD
+      const histRate = (settings.rateHistory || []).slice().sort((a, b) => (a.date < b.date ? -1 : 1));
+      const tasasAoa = [["Fecha", "Tasa VES/USD"], ...histRate.map((r) => [r.date, round2(r.rate)])];
+      const wsT = XLSX.utils.aoa_to_sheet(tasasAoa);
+      wsT["!cols"] = [{ wch: 14 }, { wch: 16 }];
+      XLSX.utils.book_append_sheet(wb, wsT, "Tasas");
       if (dl && dl.url) URL.revokeObjectURL(dl.url);
       setDl(wbToBlobUrl(XLSX, wb, `patrimonio_${from}_a_${to}.xlsx`));
       setMsg("Archivo generado. Tocá el botón verde para abrirlo o guardarlo.");
@@ -2579,7 +2720,6 @@ function DivisaSheet({ state, divisas, onClose, onSave, onDelete }) {
     const cs = (divisas || []).filter((d) => d.kind === "compra" && d.id !== state.id);
     const a = allocateFIFO(vs, cs);
     return vs
-      .filter((v) => v.date <= date)
       .map((v) => {
         const s = a.ventaStats[v.id] || { vesUsados: 0 };
         return { v, restante: capOf(v) - s.vesUsados };
@@ -2701,7 +2841,7 @@ function DivisaSheet({ state, divisas, onClose, onSave, onDelete }) {
               <option value="">{manualAllocs.length ? "+ Agregar otra venta al reparto…" : "Automática — o elegí una venta…"}</option>
               {ventasList.filter(({ v }) => !manualAllocs.includes(v.id)).map(({ v, restante }) => (
                 <option key={v.id} value={v.id}>
-                  {fmtDate(v.date)} · {v.persona || "—"} · queda {fmtBs(restante)}
+                  {fmtDate(v.date)} · {v.persona || "—"} · queda {fmtBs(restante)}{v.date > date ? " · posterior" : ""}
                 </option>
               ))}
             </select>
@@ -2723,7 +2863,7 @@ function DivisaSheet({ state, divisas, onClose, onSave, onDelete }) {
             </div>
           )}
           <div style={{ fontSize: 12, color: T.mut, margin: "0 2px 8px", lineHeight: 1.5 }}>
-            Sin elegir nada, se asigna sola por orden de llegada. Podés elegir varias ventas en orden: la compra llena la primera y el excedente pasa a la siguiente que elijas (solo ventas con fecha igual o anterior).
+            Sin elegir nada, se asigna sola por orden de llegada (solo ventas con fecha igual o anterior). Si la asignás a mano, podés elegir cualquier venta pendiente, incluso una posterior a la compra.
           </div>
         </>
       )}
