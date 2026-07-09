@@ -788,26 +788,36 @@ function App() {
   }
 
   /* Acciones movimientos */
-  function addTxn(data) {
-    const com = data.commission || 0;
-    const delta = (data.kind === "income" ? data.amount : -data.amount) - com;
-    setAccounts((prev) =>
-      prev.map((a) =>
-        a.id === data.accountId ? { ...a, balance: (a.balance || 0) + delta } : a
-      )
-    );
-    setTxns((prev) => [{ ...data, id: uid(), createdAt: Date.now() }, ...prev]);
+  const txnDelta = (t) => (t.kind === "income" ? t.amount : -t.amount) - (t.commission || 0);
+  function saveTxn(data) {
+    setAccounts((prev) => {
+      let accs = prev;
+      if (data.id) {
+        const old = txns.find((x) => x.id === data.id);
+        if (old) {
+          const rev = -txnDelta(old);
+          accs = accs.map((a) => (a.id === old.accountId ? { ...a, balance: (a.balance || 0) + rev } : a));
+        }
+      }
+      const d = txnDelta(data);
+      accs = accs.map((a) => (a.id === data.accountId ? { ...a, balance: (a.balance || 0) + d } : a));
+      return accs;
+    });
+    setTxns((prev) => {
+      if (data.id) return prev.map((x) => (x.id === data.id ? { ...x, ...data } : x));
+      return [{ ...data, id: uid(), createdAt: Date.now() }, ...prev];
+    });
     setTxnSheet(false);
   }
   function deleteTxn(t) {
-    const com = t.commission || 0;
-    const delta = (t.kind === "income" ? -t.amount : t.amount) + com;
+    const delta = -txnDelta(t);
     setAccounts((prev) =>
       prev.map((a) =>
         a.id === t.accountId ? { ...a, balance: (a.balance || 0) + delta } : a
       )
     );
     setTxns((prev) => prev.filter((x) => x.id !== t.id));
+    setTxnSheet(false);
   }
 
   /* Acciones divisas */
@@ -949,6 +959,7 @@ function App() {
             accounts={accounts}
             cur={cur}
             onAdd={() => setTxnSheet(true)}
+            onEdit={(t) => setTxnSheet(t)}
             onDelete={deleteTxn}
           />
         )}
@@ -1033,13 +1044,14 @@ function App() {
         onDelete={deleteAccount}
       />
       <TxnSheet
-        open={txnSheet}
+        state={txnSheet}
         accounts={accounts}
         cur={cur}
         vesRate={vesRate}
         projects={projects}
         onClose={() => setTxnSheet(false)}
-        onSave={addTxn}
+        onSave={saveTxn}
+        onDelete={deleteTxn}
       />
       <CryptoSheet
         state={cryptoSheet}
@@ -1361,7 +1373,7 @@ function AccountsTab({ accounts, prices, cur, settings, vesRate, onSetRate, onAd
 }
 
 /* ─────────────────────────────  Tab: Movimientos  ───────────────────────────── */
-function TxnsTab({ txns, accounts, cur, onAdd, onDelete }) {
+function TxnsTab({ txns, accounts, cur, onAdd, onEdit, onDelete }) {
   const acct = (id) => accounts.find((a) => a.id === id);
   const acctName = (id) => (acct(id) || {}).name || "—";
   const acctCur = (t) => t.currency || (acct(t.accountId) || {}).currency || cur;
@@ -1503,7 +1515,7 @@ function TxnsTab({ txns, accounts, cur, onAdd, onDelete }) {
                 const inc = t.kind === "income";
                 const c = acctCur(t);
                 return (
-                  <div key={t.id} style={rowCard}>
+                  <div key={t.id} onClick={() => onEdit(t)} style={{ ...rowCard, cursor: "pointer" }}>
                     <div style={{ display: "flex", alignItems: "center", gap: 12, minWidth: 0 }}>
                       <span
                         style={{
@@ -1531,7 +1543,7 @@ function TxnsTab({ txns, accounts, cur, onAdd, onDelete }) {
                         {inc ? "+" : "−"}
                         {money(t.amount, c)}
                       </span>
-                      <button onClick={() => onDelete(t)} style={{ ...btnGhost, color: T.mut2, fontSize: 18, lineHeight: 1 }} aria-label="Eliminar">
+                      <button onClick={(e) => { e.stopPropagation(); onDelete(t); }} style={{ ...btnGhost, color: T.mut2, fontSize: 18, lineHeight: 1 }} aria-label="Eliminar">
                         ×
                       </button>
                     </div>
@@ -1640,7 +1652,9 @@ function AccountSheet({ state, cur, onClose, onSave, onDelete }) {
 }
 
 /* ─────────────────────────────  Sheet: Movimiento  ───────────────────────────── */
-function TxnSheet({ open, accounts, cur, vesRate, projects, onClose, onSave }) {
+function TxnSheet({ state, accounts, cur, vesRate, projects, onClose, onSave, onDelete }) {
+  const open = !!state;
+  const editing = state && state.id;
   const usable = accounts.filter((a) => a.type === "bank" || a.type === "cash");
   const [kind, setKind] = useState("expense");
   const [amount, setAmount] = useState("");
@@ -1653,11 +1667,22 @@ function TxnSheet({ open, accounts, cur, vesRate, projects, onClose, onSave }) {
   const [project, setProject] = useState("");
   const [newProject, setNewProject] = useState("");
   useEffect(() => {
-    if (open) {
+    if (state && state.id) {
+      setKind(state.kind || "expense");
+      setAmount(String(state.amount ?? ""));
+      setMotivo(state.motivo || "");
+      setAccountId(state.accountId || "");
+      setDate(state.date || todayISO());
+      setComMode(state.comMode || "none");
+      setComManual(state.comMode === "manual" && state.commission != null ? String(state.commission) : "");
+      setComUsd(state.comMode === "usd" && state.comUsd != null ? String(state.comUsd) : "");
+      setProject(state.project || "");
+      setNewProject("");
+    } else if (state) {
       setKind("expense"); setAmount(""); setMotivo(""); setAccountId(usable[0]?.id || ""); setDate(todayISO());
       setComMode("none"); setComManual(""); setComUsd(""); setProject(""); setNewProject("");
     }
-  }, [open]);
+  }, [state]);
 
   const acct = usable.find((a) => a.id === accountId);
   const acctCur = (acct && acct.currency) || cur;
@@ -1676,7 +1701,7 @@ function TxnSheet({ open, accounts, cur, vesRate, projects, onClose, onSave }) {
   const seg = (a, color) => ({ flex: 1, border: "none", borderRadius: 9, padding: "11px", fontSize: 14.5, fontWeight: 600, fontFamily: FONT, cursor: "pointer", background: a ? color : "transparent", color: a ? "#0A0F1E" : T.mut });
 
   return (
-    <Sheet open={open} onClose={onClose} title="Nuevo movimiento">
+    <Sheet open={open} onClose={onClose} title={editing ? "Editar movimiento" : "Nuevo movimiento"}>
       {usable.length === 0 ? (
         <div style={{ ...emptyRow, marginBottom: 4 }}>
           Primero creá una cuenta de banco o efectivo en la pestaña Cuentas.
@@ -1748,9 +1773,14 @@ function TxnSheet({ open, accounts, cur, vesRate, projects, onClose, onSave }) {
               No disponés de fondos suficientes. Saldo de la cuenta: <span style={{ fontFamily: MONO, fontWeight: 600 }}>{money(saldo, acctCur)}</span>{comAcct > 0 ? ` · egreso + comisión: ${money(egresoTotal, acctCur)}` : ""} · quedaría en <span style={{ fontFamily: MONO, fontWeight: 600 }}>{money(saldo - egresoTotal, acctCur)}</span>.
             </div>
           )}
-          <PrimaryBtn color={kind === "income" ? T.green : T.red} disabled={!valid} onClick={() => onSave({ kind, amount: nAmount, motivo: motivo.trim(), accountId, date, currency: acctCur, commission: comAcct, comMode, comUsd: comUsdVal || undefined, project: proj || undefined })}>
-            {kind === "income" ? "Registrar ingreso" : insuf ? "Registrar de todos modos" : "Registrar egreso"}
+          <PrimaryBtn color={kind === "income" ? T.green : T.red} disabled={!valid} onClick={() => onSave({ id: editing ? state.id : undefined, kind, amount: nAmount, motivo: motivo.trim(), accountId, date, currency: acctCur, commission: comAcct, comMode, comUsd: comUsdVal || undefined, project: proj || undefined })}>
+            {kind === "income" ? (editing ? "Guardar cambios" : "Registrar ingreso") : editing ? "Guardar cambios" : insuf ? "Registrar de todos modos" : "Registrar egreso"}
           </PrimaryBtn>
+          {editing && (
+            <button onClick={() => onDelete(state)} style={{ ...btnGhost, color: T.red, width: "100%", marginTop: 14, padding: 10 }}>
+              Eliminar movimiento
+            </button>
+          )}
         </>
       )}
     </Sheet>
