@@ -602,6 +602,9 @@ function App() {
   const [txnSheet, setTxnSheet] = useState(false);
   const [cryptoSheet, setCryptoSheet] = useState(false);
   const [divisas, setDivisas] = useState([]);
+  const [projectsMeta, setProjectsMeta] = useState([]);
+  const [txnView, setTxnView] = useState("mov");
+  const [projectSheet, setProjectSheet] = useState(null);
   const [divisaSheet, setDivisaSheet] = useState(null); // null | {kind,mode} | operacion
 
   /* Carga inicial */
@@ -611,6 +614,7 @@ function App() {
       setTxns(await loadKey("fin:txns", []));
       setSettings(await loadKey("fin:settings", { currency: "usd", theme: "dark", layout: "auto" }));
       setDivisas(await loadKey("fin:divisas", []));
+      setProjectsMeta(await loadKey("fin:projectsMeta", []));
       setLoaded(true);
     })();
   }, []);
@@ -631,6 +635,9 @@ function App() {
   useEffect(() => {
     if (loaded) saveKey("fin:divisas", divisas);
   }, [divisas, loaded]);
+  useEffect(() => {
+    if (loaded) saveKey("fin:projectsMeta", projectsMeta);
+  }, [projectsMeta, loaded]);
   useEffect(() => {
     if (loaded && settings.sheetUrl) syncSheet(settings.sheetUrl).catch(() => {});
   }, [loaded]);
@@ -819,6 +826,53 @@ function App() {
     setTxns((prev) => prev.filter((x) => x.id !== t.id));
     setTxnSheet(false);
   }
+  function bulkImportTxns(rows) {
+    if (!rows || rows.length < 2) return { error: "El archivo no tiene datos." };
+    const norm = (s) => String(s || "").toLowerCase().trim();
+    const header = rows[0].map(norm);
+    const col = (...keys) => header.findIndex((h) => keys.some((k) => h === k || h.includes(k)));
+    const iId = col("id"), iFecha = col("fecha"), iTipo = col("tipo"), iMotivo = col("motivo"),
+      iCuenta = col("cuenta"), iMonto = col("monto"), iCom = col("comis"), iProj = col("proyecto");
+    if (iFecha < 0 || iMonto < 0 || iCuenta < 0) return { error: "Faltan columnas (Fecha, Cuenta, Monto)." };
+    const acctByName = {};
+    accounts.forEach((a) => { if (a.type === "bank" || a.type === "cash") acctByName[norm(a.name)] = a; });
+    let updated = 0, added = 0, skipped = 0;
+    const balDelta = {};
+    const addD = (id, d) => { balDelta[id] = (balDelta[id] || 0) + d; };
+    const newTxns = [], updates = {};
+    for (let r = 1; r < rows.length; r++) {
+      const row = rows[r];
+      if (!row || row.every((c) => !String(c || "").trim())) continue;
+      const acc = acctByName[norm(row[iCuenta])];
+      const monto = numVE(row[iMonto]);
+      if (!acc || isNaN(monto) || monto <= 0) { skipped++; continue; }
+      const tipoRaw = iTipo >= 0 ? norm(row[iTipo]) : "";
+      const kind = tipoRaw.indexOf("ingr") === 0 || tipoRaw.includes("income") ? "income" : "expense";
+      const commission = iCom >= 0 ? (numVE(row[iCom]) || 0) : 0;
+      const data = {
+        kind, amount: monto,
+        motivo: iMotivo >= 0 ? String(row[iMotivo] || "").trim() : "",
+        accountId: acc.id,
+        date: iFecha >= 0 ? fechaISO(row[iFecha]) : todayISO(),
+        currency: acc.currency || cur,
+        commission, comMode: commission > 0 ? "manual" : "none",
+        project: iProj >= 0 && String(row[iProj] || "").trim() ? String(row[iProj]).trim() : undefined,
+      };
+      const id = iId >= 0 ? String(row[iId] || "").trim() : "";
+      const old = id ? txns.find((t) => t.id === id) : null;
+      if (old) {
+        addD(old.accountId, -txnDelta(old));
+        addD(data.accountId, txnDelta(data));
+        updates[id] = data; updated++;
+      } else {
+        addD(data.accountId, txnDelta(data));
+        newTxns.push({ ...data, id: uid(), createdAt: Date.now() }); added++;
+      }
+    }
+    setTxns((prev) => [...newTxns, ...prev.map((t) => (updates[t.id] ? { ...t, ...updates[t.id] } : t))]);
+    setAccounts((prev) => prev.map((a) => (balDelta[a.id] ? { ...a, balance: (a.balance || 0) + balDelta[a.id] } : a)));
+    return { updated, added, skipped };
+  }
 
   /* Acciones divisas */
   function saveDivisa(data) {
@@ -842,6 +896,23 @@ function App() {
       const hist = (s.rateHistory || []).filter((r) => r.date !== date);
       return { ...s, rateHistory: [...hist, { date, rate }].sort((a, b) => (a.date < b.date ? -1 : 1)) };
     });
+  }
+  function saveProject(oldName, data) {
+    const name = (data.name || "").trim();
+    if (!name) return;
+    if (oldName && oldName !== name) {
+      setTxns((prev) => prev.map((t) => (t.project === oldName ? { ...t, project: name } : t)));
+    }
+    setProjectsMeta((prev) => {
+      const filt = prev.filter((m) => m.name !== oldName && m.name !== name);
+      return [...filt, { name, color: data.color, emoji: data.emoji }];
+    });
+    setProjectSheet(null);
+  }
+  function deleteProject(name) {
+    setTxns((prev) => prev.map((t) => (t.project === name ? { ...t, project: undefined } : t)));
+    setProjectsMeta((prev) => prev.filter((m) => m.name !== name));
+    setProjectSheet(null);
   }
   async function syncSheet(url) {
     const u = (url || settings.sheetUrl || "").trim();
@@ -954,14 +1025,38 @@ function App() {
           />
         )}
         {tab === "txns" && (
-          <TxnsTab
-            txns={txns}
-            accounts={accounts}
-            cur={cur}
-            onAdd={() => setTxnSheet(true)}
-            onEdit={(t) => setTxnSheet(t)}
-            onDelete={deleteTxn}
-          />
+          <div style={{ paddingTop: 8 }}>
+            <div style={{ display: "flex", background: T.card, borderRadius: 12, padding: 4, marginBottom: 4, border: `1px solid ${T.lineSoft}` }}>
+              {[["mov", "Movimientos"], ["proj", "Proyectos"]].map(([v, label]) => (
+                <button
+                  key={v}
+                  onClick={() => setTxnView(v)}
+                  style={{ flex: 1, border: "none", borderRadius: 9, padding: "10px", fontSize: 14.5, fontWeight: 600, fontFamily: FONT, cursor: "pointer", background: txnView === v ? T.gold : "transparent", color: txnView === v ? "#0A0F1E" : T.mut }}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+            {txnView === "mov" ? (
+              <TxnsTab
+                txns={txns}
+                accounts={accounts}
+                cur={cur}
+                onAdd={() => setTxnSheet(true)}
+                onEdit={(t) => setTxnSheet(t)}
+                onDelete={deleteTxn}
+                onBulkImport={bulkImportTxns}
+              />
+            ) : (
+              <ProjectsTab
+                txns={txns}
+                projectsMeta={projectsMeta}
+                cur={cur}
+                onAdd={() => setProjectSheet({ mode: "new" })}
+                onEdit={(name) => setProjectSheet({ name })}
+              />
+            )}
+          </div>
         )}
         {tab === "crypto" && (
           <CryptoTab
@@ -1052,6 +1147,13 @@ function App() {
         onClose={() => setTxnSheet(false)}
         onSave={saveTxn}
         onDelete={deleteTxn}
+      />
+      <ProjectSheet
+        state={projectSheet}
+        projectsMeta={projectsMeta}
+        onClose={() => setProjectSheet(null)}
+        onSave={saveProject}
+        onDelete={deleteProject}
       />
       <CryptoSheet
         state={cryptoSheet}
@@ -1373,7 +1475,7 @@ function AccountsTab({ accounts, prices, cur, settings, vesRate, onSetRate, onAd
 }
 
 /* ─────────────────────────────  Tab: Movimientos  ───────────────────────────── */
-function TxnsTab({ txns, accounts, cur, onAdd, onEdit, onDelete }) {
+function TxnsTab({ txns, accounts, cur, onAdd, onEdit, onDelete, onBulkImport }) {
   const acct = (id) => accounts.find((a) => a.id === id);
   const acctName = (id) => (acct(id) || {}).name || "—";
   const acctCur = (t) => t.currency || (acct(t.accountId) || {}).currency || cur;
@@ -1424,11 +1526,84 @@ function TxnsTab({ txns, accounts, cur, onAdd, onEdit, onDelete }) {
 
   const selStyle = { ...inputStyle, appearance: "none", fontSize: 14, padding: "11px 12px" };
 
+  const [bulkMsg, setBulkMsg] = useState("");
+  const [bulkBusy, setBulkBusy] = useState(false);
+  const [bulkDl, setBulkDl] = useState(null);
+  const acctById = (id) => accounts.find((a) => a.id === id);
+
+  async function exportarEditable() {
+    setBulkBusy(true); setBulkMsg("");
+    try {
+      const XLSX = await ensureXLSXStyle();
+      const header = ["id", "Fecha", "Tipo", "Motivo", "Cuenta", "Monto", "Comisión", "Proyecto"];
+      const aoa = [
+        header,
+        ...filtrados.slice().sort((a, b) => (a.date < b.date ? 1 : -1)).map((t) => [
+          t.id,
+          t.date,
+          t.kind === "income" ? "Ingreso" : "Egreso",
+          t.motivo || "",
+          (acctById(t.accountId) || {}).name || "",
+          t.amount || 0,
+          t.commission || 0,
+          t.project || "",
+        ]),
+      ];
+      const ws = XLSX.utils.aoa_to_sheet(aoa);
+      ws["!cols"] = [{ wch: 14 }, { wch: 12 }, { wch: 9 }, { wch: 26 }, { wch: 20 }, { wch: 12 }, { wch: 10 }, { wch: 16 }];
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, "Movimientos");
+      if (bulkDl && bulkDl.url) URL.revokeObjectURL(bulkDl.url);
+      setBulkDl(wbToBlobUrl(XLSX, wb, "movimientos_editar.xlsx"));
+      setBulkMsg("Archivo generado. Editá filas (o agregá nuevas con id vacío) y volvé a subirlo.");
+    } catch (e) { setBulkMsg((e && e.message) || "No se pudo generar el archivo."); }
+    finally { setBulkBusy(false); }
+  }
+
+  async function importarEditable(e) {
+    const f = e.target.files && e.target.files[0];
+    e.target.value = "";
+    if (!f) return;
+    setBulkBusy(true); setBulkMsg("Leyendo archivo…");
+    try {
+      const XLSX = await ensureXLSXStyle();
+      const buf = await f.arrayBuffer();
+      const wb = XLSX.read(buf, { type: "array" });
+      const ws = wb.Sheets[wb.SheetNames[0]];
+      const rows = XLSX.utils.sheet_to_json(ws, { header: 1, raw: false, defval: "" });
+      const res = onBulkImport(rows);
+      setBulkMsg(res.error ? res.error : `Listo: ${res.updated} modificado(s), ${res.added} nuevo(s)${res.skipped ? `, ${res.skipped} omitido(s)` : ""}.`);
+    } catch (ex) { setBulkMsg((ex && ex.message) || "No se pudo leer el archivo."); }
+    finally { setBulkBusy(false); }
+  }
+
   return (
     <div style={{ paddingTop: 8 }}>
       <button onClick={onAdd} style={{ ...rowCard, cursor: "pointer", justifyContent: "center", gap: 8, color: T.gold, fontWeight: 600, fontSize: 15, marginBottom: 12 }}>
         <IconPlus color={T.gold} /> Nuevo movimiento
       </button>
+
+      {/* Edición masiva por Excel */}
+      <div style={{ background: T.bg2, border: `1px solid ${T.lineSoft}`, borderRadius: 14, padding: "12px 14px", marginBottom: 12 }}>
+        <div style={{ fontSize: 12.5, color: T.mut, marginBottom: 10, lineHeight: 1.5 }}>
+          Edición masiva: exportá los movimientos (según los filtros), editalos en Excel y volvé a subirlos. Filas con <b>id</b> se modifican; con id vacío se crean.
+        </div>
+        <div style={{ display: "flex", gap: 8 }}>
+          <button onClick={exportarEditable} disabled={bulkBusy} style={{ flex: 1, background: "transparent", color: T.text, border: `1px solid ${T.line}`, borderRadius: 11, padding: "11px", fontSize: 13.5, fontWeight: 600, fontFamily: FONT, cursor: "pointer" }}>
+            {bulkBusy ? "…" : "Exportar para editar"}
+          </button>
+          <label style={{ flex: 1, background: "transparent", color: T.blue, border: `1px solid ${T.blue}`, borderRadius: 11, padding: "11px", fontSize: 13.5, fontWeight: 600, fontFamily: FONT, cursor: "pointer", textAlign: "center" }}>
+            Subir cambios
+            <input type="file" accept=".xlsx,.xls,.csv" style={{ display: "none" }} onChange={importarEditable} />
+          </label>
+        </div>
+        {bulkDl && (
+          <a href={bulkDl.url} download={bulkDl.name} style={{ display: "block", textAlign: "center", background: T.green, color: "#0A0F1E", borderRadius: 11, padding: "11px", fontWeight: 600, textDecoration: "none", marginTop: 8, fontSize: 13.5 }}>
+            Abrir / guardar el Excel
+          </a>
+        )}
+        {bulkMsg && <div style={{ fontSize: 12.5, color: T.mut, marginTop: 8, lineHeight: 1.5 }}>{bulkMsg}</div>}
+      </div>
 
       {/* Filtros */}
       <button
@@ -3164,6 +3339,133 @@ function ConciliacionTab({ divisas }) {
         )
       )}
     </div>
+  );
+}
+
+/* ─────────────────────────────  Tab: Proyectos  ───────────────────────────── */
+const PROJECT_COLORS = ["#E3B24D", "#5B8DEF", "#3FCB8B", "#F0645F", "#9B7BEA", "#4DB6AC", "#EC87C0", "#8A93A7"];
+const PROJECT_EMOJIS = ["📁", "🏠", "🏢", "🚗", "🛒", "💼", "🍽️", "✈️", "🏗️", "💡", "📦", "🎯"];
+
+function ProjectsTab({ txns, projectsMeta, cur, onAdd, onEdit }) {
+  const metaFor = (name) => projectsMeta.find((m) => m.name === name) || { name, color: "#8A93A7", emoji: "📁" };
+  const names = Array.from(new Set([...projectsMeta.map((m) => m.name), ...txns.map((t) => t.project).filter(Boolean)])).sort();
+
+  const summary = (name) => {
+    const m = {};
+    txns.filter((t) => (t.project || "") === name).forEach((t) => {
+      const c = t.currency || cur;
+      if (!m[c]) m[c] = { inc: 0, exp: 0 };
+      if (t.kind === "income") m[c].inc += t.amount || 0;
+      else m[c].exp += t.amount || 0;
+    });
+    return Object.entries(m);
+  };
+
+  return (
+    <div style={{ paddingTop: 8 }}>
+      <button onClick={onAdd} style={{ ...rowCard, cursor: "pointer", justifyContent: "center", gap: 8, color: T.gold, fontWeight: 600, fontSize: 15, marginBottom: 16 }}>
+        <IconPlus color={T.gold} /> Nuevo proyecto
+      </button>
+
+      {names.length === 0 ? (
+        <div style={emptyRow}>Todavía no tenés proyectos. Creá uno y asigná movimientos.</div>
+      ) : (
+        <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+          {names.map((name) => {
+            const meta = metaFor(name);
+            const rows = summary(name);
+            return (
+              <div key={name} style={{ ...rowCard, flexDirection: "column", alignItems: "stretch", padding: 0, overflow: "hidden", borderLeft: `4px solid ${meta.color}` }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "14px 15px" }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 12, minWidth: 0 }}>
+                    <span style={{ width: 40, height: 40, borderRadius: 12, background: meta.color + "22", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 20, flexShrink: 0 }}>
+                      {meta.emoji || "📁"}
+                    </span>
+                    <div style={{ fontSize: 16, fontWeight: 700, color: T.text, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{name}</div>
+                  </div>
+                  <button onClick={() => onEdit(name)} style={{ ...btnGhost, color: T.mut, fontSize: 13 }}>Editar</button>
+                </div>
+                <div style={{ padding: "0 15px 14px" }}>
+                  {rows.length === 0 ? (
+                    <div style={{ fontSize: 12.5, color: T.mut }}>Sin movimientos asignados.</div>
+                  ) : (
+                    rows.map(([c, v]) => (
+                      <div key={c} style={{ borderTop: `1px solid ${T.lineSoft}`, paddingTop: 10, marginTop: 10 }}>
+                        <div style={{ fontSize: 11.5, color: T.mut2, fontWeight: 600, marginBottom: 6 }}>{c.toUpperCase()}</div>
+                        <div style={{ display: "flex", gap: 10 }}>
+                          <div style={{ flex: 1 }}>
+                            <div style={{ fontSize: 11, color: T.mut }}>Ingresos</div>
+                            <div style={{ fontFamily: MONO, fontSize: 13.5, fontWeight: 600, color: T.green }}>{money(v.inc, c)}</div>
+                          </div>
+                          <div style={{ flex: 1 }}>
+                            <div style={{ fontSize: 11, color: T.mut }}>Egresos</div>
+                            <div style={{ fontFamily: MONO, fontSize: 13.5, fontWeight: 600, color: T.red }}>{money(v.exp, c)}</div>
+                          </div>
+                          <div style={{ flex: 1 }}>
+                            <div style={{ fontSize: 11, color: T.mut }}>Balance</div>
+                            <div style={{ fontFamily: MONO, fontSize: 13.5, fontWeight: 700, color: v.inc - v.exp >= 0 ? T.text : T.red }}>{money(v.inc - v.exp, c)}</div>
+                          </div>
+                        </div>
+                      </div>
+                    ))
+                  )}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ─────────────────────────────  Sheet: Proyecto  ───────────────────────────── */
+function ProjectSheet({ state, projectsMeta, onClose, onSave, onDelete }) {
+  const editing = state && state.name;
+  const [name, setName] = useState("");
+  const [emoji, setEmoji] = useState("📁");
+  const [color, setColor] = useState(PROJECT_COLORS[0]);
+  useEffect(() => {
+    if (state && state.name) {
+      const m = projectsMeta.find((x) => x.name === state.name) || {};
+      setName(state.name);
+      setEmoji(m.emoji || "📁");
+      setColor(m.color || PROJECT_COLORS[0]);
+    } else if (state) {
+      setName(""); setEmoji("📁"); setColor(PROJECT_COLORS[0]);
+    }
+  }, [state]);
+  if (!state) return null;
+  const valid = name.trim();
+  return (
+    <Sheet open={!!state} onClose={onClose} title={editing ? "Editar proyecto" : "Nuevo proyecto"}>
+      <Field label="Nombre">
+        <input style={inputStyle} value={name} onChange={(e) => setName(e.target.value)} placeholder="Ej. Local Centro" />
+      </Field>
+      <Field label="Logo (emoji)">
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginBottom: 8 }}>
+          {PROJECT_EMOJIS.map((e) => (
+            <button key={e} onClick={() => setEmoji(e)} style={{ width: 42, height: 42, borderRadius: 10, fontSize: 20, cursor: "pointer", background: emoji === e ? T.goldSoft : T.card, border: `1px solid ${emoji === e ? T.gold : T.line}` }}>{e}</button>
+          ))}
+        </div>
+        <input style={{ ...inputStyle, width: 80, textAlign: "center", fontSize: 20 }} value={emoji} onChange={(e) => setEmoji(e.target.value.slice(0, 2))} maxLength={2} />
+      </Field>
+      <Field label="Color">
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 10 }}>
+          {PROJECT_COLORS.map((c) => (
+            <button key={c} onClick={() => setColor(c)} style={{ width: 34, height: 34, borderRadius: 17, background: c, cursor: "pointer", border: color === c ? `3px solid ${T.text}` : `3px solid transparent` }} aria-label={c} />
+          ))}
+        </div>
+      </Field>
+      <PrimaryBtn color={color} disabled={!valid} onClick={() => onSave(editing ? state.name : null, { name: name.trim(), emoji, color })}>
+        {editing ? "Guardar cambios" : "Crear proyecto"}
+      </PrimaryBtn>
+      {editing && (
+        <button onClick={() => onDelete(state.name)} style={{ ...btnGhost, color: T.red, width: "100%", marginTop: 14, padding: 10 }}>
+          Eliminar proyecto (los movimientos quedan sin proyecto)
+        </button>
+      )}
+    </Sheet>
   );
 }
 
