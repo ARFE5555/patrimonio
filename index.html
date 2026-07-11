@@ -1509,9 +1509,10 @@ function TxnsTab({ txns, accounts, cur, onAdd, onEdit, onDelete, onBulkImport })
     const m = {};
     filtrados.forEach((t) => {
       const c = acctCur(t);
+      const com = t.commission || 0;
       if (!m[c]) m[c] = { inc: 0, exp: 0 };
-      if (t.kind === "income") m[c].inc += t.amount || 0;
-      else m[c].exp += t.amount || 0;
+      if (t.kind === "income") m[c].inc += (t.amount || 0) - com;
+      else m[c].exp += (t.amount || 0) + com;
     });
     return Object.entries(m);
   }, [filtrados, accounts, cur]);
@@ -2304,8 +2305,8 @@ function AjustesTab({ settings, setSettings, accounts, txns, prices, cur, divisa
         const fromOn = txns.filter((t) => t.accountId === a.id && t.date >= from).reduce((s, t) => s + delta(t), 0);
         const fin = bal - after;
         const ini = bal - fromOn;
-        const ing = txns.filter((t) => t.accountId === a.id && inRange(t) && t.kind === "income").reduce((s, t) => s + t.amount, 0);
-        const egr = txns.filter((t) => t.accountId === a.id && inRange(t) && t.kind === "expense").reduce((s, t) => s + t.amount, 0);
+        const ing = txns.filter((t) => t.accountId === a.id && inRange(t) && t.kind === "income").reduce((s, t) => s + (t.amount || 0) - (t.commission || 0), 0);
+        const egr = txns.filter((t) => t.accountId === a.id && inRange(t) && t.kind === "expense").reduce((s, t) => s + (t.amount || 0) + (t.commission || 0), 0);
         const cIni = convertAmt(ini, aCur, cur, rate), cFin = convertAmt(fin, aCur, cur, rate);
         const cIng = convertAmt(ing, aCur, cur, rate), cEgr = convertAmt(egr, aCur, cur, rate);
         if (cIni == null || cFin == null) sinConv++;
@@ -3354,9 +3355,13 @@ function ProjectsTab({ txns, projectsMeta, cur, onAdd, onEdit }) {
     const m = {};
     txns.filter((t) => (t.project || "") === name).forEach((t) => {
       const c = t.currency || cur;
-      if (!m[c]) m[c] = { inc: 0, exp: 0 };
-      if (t.kind === "income") m[c].inc += t.amount || 0;
-      else m[c].exp += t.amount || 0;
+      const com = t.commission || 0;
+      if (!m[c]) m[c] = { inc: 0, exp: 0, com: 0 };
+      // Mismo criterio que el saldo de la cuenta:
+      // ingreso neto = monto - comisión ; egreso total = monto + comisión
+      if (t.kind === "income") m[c].inc += (t.amount || 0) - com;
+      else m[c].exp += (t.amount || 0) + com;
+      m[c].com += com;
     });
     return Object.entries(m);
   };
@@ -3406,6 +3411,11 @@ function ProjectsTab({ txns, projectsMeta, cur, onAdd, onEdit }) {
                             <div style={{ fontFamily: MONO, fontSize: 13.5, fontWeight: 700, color: v.inc - v.exp >= 0 ? T.text : T.red }}>{money(v.inc - v.exp, c)}</div>
                           </div>
                         </div>
+                        {v.com > 0 && (
+                          <div style={{ fontSize: 11, color: T.mut2, marginTop: 6 }}>
+                            Comisiones incluidas: <span style={{ fontFamily: MONO }}>{money(v.com, c)}</span>
+                          </div>
+                        )}
                       </div>
                     ))
                   )}
