@@ -905,7 +905,7 @@ function App() {
     }
     setProjectsMeta((prev) => {
       const filt = prev.filter((m) => m.name !== oldName && m.name !== name);
-      return [...filt, { name, color: data.color, emoji: data.emoji }];
+      return [...filt, { name, color: data.color, emoji: data.emoji, opening: data.opening || {} }];
     });
     setProjectSheet(null);
   }
@@ -3353,10 +3353,16 @@ function ProjectsTab({ txns, projectsMeta, cur, onAdd, onEdit }) {
 
   const summary = (name) => {
     const m = {};
+    const meta = metaFor(name);
+    const opening = meta.opening || {};
+    // Semilla con los saldos iniciales cargados en el proyecto
+    Object.entries(opening).forEach(([c, v]) => {
+      if (v != null && !isNaN(v)) m[c] = { inc: 0, exp: 0, com: 0, open: v };
+    });
     txns.filter((t) => (t.project || "") === name).forEach((t) => {
       const c = t.currency || cur;
       const com = t.commission || 0;
-      if (!m[c]) m[c] = { inc: 0, exp: 0, com: 0 };
+      if (!m[c]) m[c] = { inc: 0, exp: 0, com: 0, open: 0 };
       // Mismo criterio que el saldo de la cuenta:
       // ingreso neto = monto - comisión ; egreso total = monto + comisión
       if (t.kind === "income") m[c].inc += (t.amount || 0) - com;
@@ -3397,6 +3403,12 @@ function ProjectsTab({ txns, projectsMeta, cur, onAdd, onEdit }) {
                     rows.map(([c, v]) => (
                       <div key={c} style={{ borderTop: `1px solid ${T.lineSoft}`, paddingTop: 10, marginTop: 10 }}>
                         <div style={{ fontSize: 11.5, color: T.mut2, fontWeight: 600, marginBottom: 6 }}>{c.toUpperCase()}</div>
+                        {(v.open || 0) !== 0 && (
+                          <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11.5, color: T.mut, marginBottom: 8 }}>
+                            <span>Saldo inicial</span>
+                            <span style={{ fontFamily: MONO, color: T.text }}>{money(v.open || 0, c)}</span>
+                          </div>
+                        )}
                         <div style={{ display: "flex", gap: 10 }}>
                           <div style={{ flex: 1 }}>
                             <div style={{ fontSize: 11, color: T.mut }}>Ingresos</div>
@@ -3408,7 +3420,9 @@ function ProjectsTab({ txns, projectsMeta, cur, onAdd, onEdit }) {
                           </div>
                           <div style={{ flex: 1 }}>
                             <div style={{ fontSize: 11, color: T.mut }}>Balance</div>
-                            <div style={{ fontFamily: MONO, fontSize: 13.5, fontWeight: 700, color: v.inc - v.exp >= 0 ? T.text : T.red }}>{money(v.inc - v.exp, c)}</div>
+                            <div style={{ fontFamily: MONO, fontSize: 13.5, fontWeight: 700, color: (v.open || 0) + v.inc - v.exp >= 0 ? T.text : T.red }}>
+                              {money((v.open || 0) + v.inc - v.exp, c)}
+                            </div>
                           </div>
                         </div>
                         {v.com > 0 && (
@@ -3435,18 +3449,26 @@ function ProjectSheet({ state, projectsMeta, onClose, onSave, onDelete }) {
   const [name, setName] = useState("");
   const [emoji, setEmoji] = useState("📁");
   const [color, setColor] = useState(PROJECT_COLORS[0]);
+  const [openUsd, setOpenUsd] = useState("");
+  const [openVes, setOpenVes] = useState("");
   useEffect(() => {
     if (state && state.name) {
       const m = projectsMeta.find((x) => x.name === state.name) || {};
       setName(state.name);
       setEmoji(m.emoji || "📁");
       setColor(m.color || PROJECT_COLORS[0]);
+      const ob = m.opening || {};
+      setOpenUsd(ob.usd != null ? String(ob.usd) : "");
+      setOpenVes(ob.ves != null ? String(ob.ves) : "");
     } else if (state) {
-      setName(""); setEmoji("📁"); setColor(PROJECT_COLORS[0]);
+      setName(""); setEmoji("📁"); setColor(PROJECT_COLORS[0]); setOpenUsd(""); setOpenVes("");
     }
   }, [state]);
   if (!state) return null;
   const valid = name.trim();
+  const opening = {};
+  if (openUsd !== "" && !isNaN(numVE(openUsd))) opening.usd = numVE(openUsd);
+  if (openVes !== "" && !isNaN(numVE(openVes))) opening.ves = numVE(openVes);
   return (
     <Sheet open={!!state} onClose={onClose} title={editing ? "Editar proyecto" : "Nuevo proyecto"}>
       <Field label="Nombre">
@@ -3467,9 +3489,27 @@ function ProjectSheet({ state, projectsMeta, onClose, onSave, onDelete }) {
           ))}
         </div>
       </Field>
-      <PrimaryBtn color={color} disabled={!valid} onClick={() => onSave(editing ? state.name : null, { name: name.trim(), emoji, color })}>
-        {editing ? "Guardar cambios" : "Crear proyecto"}
-      </PrimaryBtn>
+
+      <div style={{ ...sectionTitle, margin: "20px 0 8px" }}>Saldo inicial del proyecto</div>
+      <div style={{ fontSize: 12.5, color: T.mut, marginBottom: 12, lineHeight: 1.5 }}>
+        Fondos con los que arranca el proyecto, antes de sus movimientos. Se suma al balance.
+      </div>
+      <div style={{ display: "flex", gap: 10 }}>
+        <div style={{ flex: 1 }}>
+          <label style={labelStyle}>USD</label>
+          <input style={{ ...inputStyle, fontFamily: MONO }} value={openUsd} onChange={(e) => setOpenUsd(e.target.value)} inputMode="decimal" placeholder="0.00" />
+        </div>
+        <div style={{ flex: 1 }}>
+          <label style={labelStyle}>VES (Bs)</label>
+          <input style={{ ...inputStyle, fontFamily: MONO }} value={openVes} onChange={(e) => setOpenVes(e.target.value)} inputMode="decimal" placeholder="0,00" />
+        </div>
+      </div>
+
+      <div style={{ marginTop: 16 }}>
+        <PrimaryBtn color={color} disabled={!valid} onClick={() => onSave(editing ? state.name : null, { name: name.trim(), emoji, color, opening })}>
+          {editing ? "Guardar cambios" : "Crear proyecto"}
+        </PrimaryBtn>
+      </div>
       {editing && (
         <button onClick={() => onDelete(state.name)} style={{ ...btnGhost, color: T.red, width: "100%", marginTop: 14, padding: 10 }}>
           Eliminar proyecto (los movimientos quedan sin proyecto)
