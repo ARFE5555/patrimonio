@@ -176,7 +176,10 @@ const capOf = (v) => Math.max(0, (v.usd || 0) * (v.tasa || 0) - comOp(v));
 //  - el resto se asigna automáticamente por orden de llegada (FIFO), fraccionando
 // El automático no restringe por fecha: una compra puede alimentar una venta anterior o posterior.
 function allocateFIFO(ventas, compras) {
-  const arriv = (a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : (a.createdAt || 0) - (b.createdAt || 0));
+  // Orden de llegada: el orden en que se cargaron (fila del Excel para lo sincronizado).
+  // No se ordena por fecha: una compra puede alimentar una venta anterior o posterior.
+  const seq = (x) => (x.row != null ? x.row : (x.createdAt || 0));
+  const arriv = (a, b) => seq(a) - seq(b);
   const buckets = ventas.slice().sort(arriv).map((v) => ({ v, cap: capOf(v), used: 0 }));
   const byId = {};
   buckets.forEach((b) => { byId[b.v.id] = b; });
@@ -335,7 +338,7 @@ function parseDivisasCSV(text) {
     const referencia = iR >= 0 ? String(row[iR] || "").trim() : "";
     const date = fechaISO(row[iF]);
     const refKey = referencia || `${kind}|${date}|${usd}|${tasa}|${persona}`;
-    const op = { kind, date, persona, usd, tasa, referencia, refKey, source: "sheet" };
+    const op = { kind, date, persona, usd, tasa, referencia, refKey, source: "sheet", row: out.length };
     const comUsd = iComUsd >= 0 ? numVE(row[iComUsd]) : NaN;
     if (!isNaN(comUsd) && comUsd > 0) {
       op.comMode = "usd";
@@ -355,13 +358,15 @@ function mergeSheetOps(prev, rows) {
   const prevByRef = {};
   prev.forEach((d) => { if (d.source === "sheet" && d.refKey) prevByRef[d.refKey] = d; });
   const manual = prev.filter((d) => d.source !== "sheet");
-  const sheetOps = rows.map((r) => {
+  // El orden de llegada es el orden de las filas del Excel/Sheet (no la fecha).
+  const sheetOps = rows.map((r, i) => {
     const ex = prevByRef[r.refKey];
     return {
       ...r,
       id: (ex && ex.id) || uid(),
-      createdAt: (ex && ex.createdAt) || Date.now(),
-      ventaId: ex ? ex.ventaId : undefined,
+      createdAt: i, // índice de fila: preserva el orden de carga del Excel
+      row: i,
+      manualAllocs: ex ? ex.manualAllocs : undefined,
       pagado: ex ? ex.pagado : undefined,
       hasReceipt: ex ? ex.hasReceipt : undefined,
     };
