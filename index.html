@@ -172,9 +172,9 @@ function comUsdOf(d) {
 const capOf = (v) => Math.max(0, (v.usd || 0) * (v.tasa || 0) - comOp(v));
 
 // Asignación de compras a ventas:
-//  - respeta las asignaciones manuales (compra.ventaId)
+//  - respeta las asignaciones manuales (compra.manualAllocs, en orden)
 //  - el resto se asigna automáticamente por orden de llegada (FIFO), fraccionando
-// Regla: una venta solo puede recibir compras con fecha igual o posterior a la venta.
+// El automático no restringe por fecha: una compra puede alimentar una venta anterior o posterior.
 function allocateFIFO(ventas, compras) {
   const arriv = (a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : (a.createdAt || 0) - (b.createdAt || 0));
   const buckets = ventas.slice().sort(arriv).map((v) => ({ v, cap: capOf(v), used: 0 }));
@@ -218,12 +218,11 @@ function allocateFIFO(ventas, compras) {
     }
   }
 
-  // Paso B: FIFO automático para lo que quede
+  // Paso B: FIFO automático para lo que quede (por orden de llegada, sin restricción de fecha)
   for (const st of state) {
     if (st.W <= EPS || st.remaining <= EPS) continue;
     for (const b of buckets) {
       if (st.remaining <= EPS) break;
-      if (b.v.date > st.c.date) break; // ordenadas por fecha: las siguientes también son posteriores
       if (b.used >= b.cap - EPS) continue;
       const take = Math.min(b.cap - b.used, st.remaining);
       if (take > EPS) put(b, st, take, false);
@@ -3047,7 +3046,7 @@ function DivisaSheet({ state, divisas, onClose, onSave, onDelete }) {
               <option value="">{manualAllocs.length ? "+ Agregar otra venta al reparto…" : "Automática — o elegí una venta…"}</option>
               {ventasList.filter(({ v }) => !manualAllocs.includes(v.id)).map(({ v, restante }) => (
                 <option key={v.id} value={v.id}>
-                  {fmtDate(v.date)} · {v.persona || "—"} · queda {fmtBs(restante)}{v.date > date ? " · posterior" : ""}
+                  {fmtDate(v.date)} · {v.persona || "—"} · queda {fmtBs(restante)}
                 </option>
               ))}
             </select>
@@ -3069,7 +3068,7 @@ function DivisaSheet({ state, divisas, onClose, onSave, onDelete }) {
             </div>
           )}
           <div style={{ fontSize: 12, color: T.mut, margin: "0 2px 8px", lineHeight: 1.5 }}>
-            Sin elegir nada, se asigna sola por orden de llegada (solo ventas con fecha igual o anterior). Si la asignás a mano, podés elegir cualquier venta pendiente, incluso una posterior a la compra.
+            Sin elegir nada, se asigna sola a las ventas pendientes por orden de llegada (sin importar la fecha). Podés elegir varias ventas en orden: la compra llena la primera y el excedente pasa a la siguiente.
           </div>
         </>
       )}
