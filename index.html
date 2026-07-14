@@ -240,11 +240,14 @@ function useCollection(localKey, table, session, canWrite) {
         const sb = await getSB();
         const byId = {};
         before.forEach((x) => { byId[x.id] = x; });
+        const noId = items.filter((x) => x.id == null).length;
+        if (noId) console.warn(table + ": " + noId + " elemento(s) sin id no se sincronizan");
         const ups = items
+          .filter((x) => x.id != null)
           .filter((x) => { const p = byId[x.id]; return !p || stableStr(p) !== stableStr(x); })
           .map((x) => { const { id, ...data } = x; return { id, data, updated_at: new Date().toISOString() }; });
         const ids = new Set(items.map((x) => x.id));
-        const dels = before.filter((x) => !ids.has(x.id)).map((x) => x.id);
+        const dels = before.filter((x) => x.id != null && !ids.has(x.id)).map((x) => x.id);
         const BATCH = 100;
         for (let i = 0; i < ups.length; i += BATCH) {
           const { error } = await sb.from(table).upsert(ups.slice(i, i + BATCH));
@@ -1130,7 +1133,7 @@ function AppMain({ session, role, signOut }) {
     if (d.accounts) setAccounts(d.accounts);
     if (d.txns) setTxns(d.txns);
     if (d.divisas) setDivisas(d.divisas);
-    if (d.projectsMeta) setProjectsMeta(d.projectsMeta);
+    if (d.projectsMeta) setProjectsMeta(d.projectsMeta.map((m) => ({ ...m, id: m.id || m.name })));
     if (d.settings) setSettings((s) => ({ ...s, ...d.settings }));
   }
   function saveProject(oldName, data) {
@@ -1141,7 +1144,7 @@ function AppMain({ session, role, signOut }) {
     }
     setProjectsMeta((prev) => {
       const filt = prev.filter((m) => m.name !== oldName && m.name !== name);
-      return [...filt, { name, color: data.color, emoji: data.emoji, opening: data.opening || {} }];
+      return [...filt, { id: name, name, color: data.color, emoji: data.emoji, opening: data.opening || {} }];
     });
     setProjectSheet(null);
   }
