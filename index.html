@@ -125,6 +125,18 @@ const CLOUD = !!(SUPABASE_URL && SUPABASE_ANON_KEY);
 const ROLE_LABEL = { viewer: "Consulta", loader: "Carga de datos", editor: "Editor (todo)" };
 const TABLES = { accounts: "accounts", txns: "txns", divisas: "divisas", projectsMeta: "projects" };
 
+// Comparación estable (ignora el orden de las claves y los undefined)
+function stableStr(v) {
+  if (v === null || typeof v !== "object") return JSON.stringify(v);
+  if (Array.isArray(v)) return "[" + v.map((x) => (x === undefined ? "null" : stableStr(x))).join(",") + "]";
+  return "{" + Object.keys(v).filter((k) => v[k] !== undefined).sort()
+    .map((k) => JSON.stringify(k) + ":" + stableStr(v[k])).join(",") + "}";
+}
+
+function notifySyncError(msg) {
+  try { window.dispatchEvent(new CustomEvent("sync-error", { detail: msg })); } catch (e) { /* no-op */ }
+}
+
 let _sb = null;
 async function getSB() {
   if (_sb) return _sb;
@@ -146,35 +158,53 @@ async function getSB() {
 function useCollection(localKey, table, session, canWrite) {
   const [items, setItems] = useState([]);
   const [ready, setReady] = useState(false);
-  const skip = useRef(true);
   const prev = useRef([]);
   const cloud = CLOUD && !!session;
 
+  /* Carga inicial.
+     CRÍTICO: en la nube NUNCA se marca "listo" tras un fallo. Arrancar con una
+     lista vacía por un error de red/token llevaría a escrituras que duplican o
+     pisan lo que está en el servidor. Se reintenta hasta lograr una lectura buena. */
   useEffect(() => {
     let alive = true;
     (async () => {
       setReady(false);
-      let rows = [];
-      if (cloud) {
+      if (!cloud) {
+        const rows = await loadKey(localKey, []);
+        if (!alive) return;
+        prev.current = rows;
+        setItems(rows);
+        setReady(true);
+        return;
+      }
+      for (let attempt = 0; alive; attempt++) {
         try {
           const sb = await getSB();
-          const { data, error } = await sb.from(table).select("id,data");
-          if (error) throw error;
-          rows = (data || []).map((r) => ({ ...(r.data || {}), id: r.id }));
-        } catch (e) { console.error("load " + table, e); }
-      } else {
-        rows = await loadKey(localKey, []);
+          const { data: s } = await sb.auth.getSession();
+          if (!s || !s.session) throw new Error("Sesión no disponible todavía");
+          const PAGE = 1000;
+          let rows = [];
+          for (let off = 0; ; off += PAGE) {
+            const { data, error } = await sb.from(table).select("id,data").range(off, off + PAGE - 1);
+            if (error) throw error;
+            rows = rows.concat((data || []).map((r) => ({ id: r.id, ...(r.data || {}) })));
+            if (!data || data.length < PAGE) break;
+          }
+          if (!alive) return;
+          prev.current = rows;
+          setItems(rows);
+          setReady(true);
+          return;
+        } catch (e) {
+          console.error("load " + table, e);
+          await new Promise((r) => setTimeout(r, Math.min(5000, 700 * (attempt + 1))));
+        }
       }
-      if (!alive) return;
-      skip.current = true;
-      prev.current = rows;
-      setItems(rows);
-      setReady(true);
     })();
     return () => { alive = false; };
   }, [cloud, session && session.user && session.user.id]);
 
-  // Realtime: refleja los cambios de otros usuarios
+  // Realtime: refleja los cambios de otros usuarios (ignora ecos idénticos)
   useEffect(() => {
     if (!cloud) return;
     let ch = null, alive = true;
@@ -183,11 +213,11 @@ function useCollection(localKey, table, session, canWrite) {
       if (!alive) return;
       ch = sb.channel("rt_" + table)
         .on("postgres_changes", { event: "*", schema: "public", table }, (p) => {
-          skip.current = true;
           setItems((cur) => {
             if (p.eventType === "DELETE") return cur.filter((x) => x.id !== (p.old || {}).id);
-            const row = { ...((p.new || {}).data || {}), id: (p.new || {}).id };
+            const row = { id: (p.new || {}).id, ...((p.new || {}).data || {}) };
             const i = cur.findIndex((x) => x.id === row.id);
+            if (i >= 0 && stableStr(cur[i]) === stableStr(row)) return cur; // eco de nuestra propia escritura
             if (i < 0) return [row, ...cur];
             const c = cur.slice(); c[i] = row; return c;
           });
@@ -197,12 +227,12 @@ function useCollection(localKey, table, session, canWrite) {
     return () => { alive = false; if (ch) ch.unsubscribe(); };
   }, [cloud, table]);
 
-  // Persistencia (diff: solo lo que cambió)
+  // Persistencia por diferencia: solo lo que realmente cambió
   useEffect(() => {
     if (!ready) return;
     const before = prev.current;
     prev.current = items;
-    if (skip.current) { skip.current = false; return; }
+    if (before === items) return; // misma referencia: es la carga inicial
     if (!cloud) { saveKey(localKey, items); return; }
     if (!canWrite) return;
     (async () => {
@@ -211,13 +241,23 @@ function useCollection(localKey, table, session, canWrite) {
         const byId = {};
         before.forEach((x) => { byId[x.id] = x; });
         const ups = items
-          .filter((x) => { const p = byId[x.id]; return !p || JSON.stringify(p) !== JSON.stringify(x); })
+          .filter((x) => { const p = byId[x.id]; return !p || stableStr(p) !== stableStr(x); })
           .map((x) => { const { id, ...data } = x; return { id, data, updated_at: new Date().toISOString() }; });
         const ids = new Set(items.map((x) => x.id));
         const dels = before.filter((x) => !ids.has(x.id)).map((x) => x.id);
-        if (ups.length) { const { error } = await sb.from(table).upsert(ups); if (error) throw error; }
-        if (dels.length) { const { error } = await sb.from(table).delete().in("id", dels); if (error) throw error; }
-      } catch (e) { console.error("save " + table, e); }
+        const BATCH = 100;
+        for (let i = 0; i < ups.length; i += BATCH) {
+          const { error } = await sb.from(table).upsert(ups.slice(i, i + BATCH));
+          if (error) throw error;
+        }
+        for (let i = 0; i < dels.length; i += BATCH) {
+          const { error } = await sb.from(table).delete().in("id", dels.slice(i, i + BATCH));
+          if (error) throw error;
+        }
+      } catch (e) {
+        console.error("save " + table, e);
+        notifySyncError("No se pudo guardar en la nube (" + table + "): " + ((e && e.message) || "error") + ". Tus últimos cambios podrían NO estar guardados. Verificá tu rol y tu conexión, y reintentá el cambio.");
+      }
     })();
   }, [items, ready, cloud, canWrite]);
 
@@ -228,27 +268,39 @@ function useCollection(localKey, table, session, canWrite) {
 function useSettings(session, canWrite, defaults) {
   const [settings, setSettings] = useState(defaults);
   const [ready, setReady] = useState(false);
-  const skip = useRef(true);
+  const prev = useRef(defaults);
   const cloud = CLOUD && !!session;
 
   useEffect(() => {
     let alive = true;
     (async () => {
       setReady(false);
-      let val = defaults;
-      if (cloud) {
+      if (!cloud) {
+        const val = await loadKey("fin:settings", defaults);
+        if (!alive) return;
+        prev.current = val;
+        setSettings(val);
+        setReady(true);
+        return;
+      }
+      for (let attempt = 0; alive; attempt++) {
         try {
           const sb = await getSB();
-          const { data } = await sb.from("settings").select("data").eq("id", "global").maybeSingle();
-          if (data && data.data) val = { ...defaults, ...data.data };
-        } catch (e) { console.error("load settings", e); }
-      } else {
-        val = await loadKey("fin:settings", defaults);
+          const { data: s } = await sb.auth.getSession();
+          if (!s || !s.session) throw new Error("Sesión no disponible todavía");
+          const { data, error } = await sb.from("settings").select("data").eq("id", "global").maybeSingle();
+          if (error) throw error;
+          if (!alive) return;
+          const val = data && data.data ? { ...defaults, ...data.data } : defaults;
+          prev.current = val;
+          setSettings(val);
+          setReady(true);
+          return;
+        } catch (e) {
+          console.error("load settings", e);
+          await new Promise((r) => setTimeout(r, Math.min(5000, 700 * (attempt + 1))));
+        }
       }
-      if (!alive) return;
-      skip.current = true;
-      setSettings(val);
-      setReady(true);
     })();
     return () => { alive = false; };
   }, [cloud, session && session.user && session.user.id]);
@@ -262,8 +314,10 @@ function useSettings(session, canWrite, defaults) {
       ch = sb.channel("rt_settings")
         .on("postgres_changes", { event: "*", schema: "public", table: "settings" }, (p) => {
           if ((p.new || {}).id !== "global") return;
-          skip.current = true;
-          setSettings((cur) => ({ ...cur, ...((p.new || {}).data || {}) }));
+          setSettings((cur) => {
+            const next = { ...cur, ...((p.new || {}).data || {}) };
+            return stableStr(next) === stableStr(cur) ? cur : next;
+          });
         })
         .subscribe();
     })();
@@ -272,14 +326,20 @@ function useSettings(session, canWrite, defaults) {
 
   useEffect(() => {
     if (!ready) return;
-    if (skip.current) { skip.current = false; return; }
+    const before = prev.current;
+    prev.current = settings;
+    if (before === settings) return;
     if (!cloud) { saveKey("fin:settings", settings); return; }
     if (!canWrite) return;
+    if (stableStr(before) === stableStr(settings)) return;
     (async () => {
       try {
         const sb = await getSB();
         await sb.from("settings").upsert([{ id: "global", data: settings, updated_at: new Date().toISOString() }]);
-      } catch (e) { console.error("save settings", e); }
+      } catch (e) {
+        console.error("save settings", e);
+        notifySyncError("No se pudieron guardar los ajustes en la nube: " + ((e && e.message) || "error"));
+      }
     })();
   }, [settings, ready, cloud, canWrite]);
 
@@ -528,23 +588,27 @@ function parseDivisasCSV(text) {
   return out;
 }
 function mergeSheetOps(prev, rows) {
-  const prevByRef = {};
-  prev.forEach((d) => { if (d.source === "sheet" && d.refKey) prevByRef[d.refKey] = d; });
+  const prevSheet = prev.filter((d) => d.source === "sheet");
   const manual = prev.filter((d) => d.source !== "sheet");
-  // El orden de llegada es el orden de las filas del Excel/Sheet (no la fecha).
-  const sheetOps = rows.map((r, i) => {
+  const prevByRef = {};
+  prevSheet.forEach((d) => { if (d.refKey) prevByRef[d.refKey] = d; });
+  // El orden de llegada es el orden de las filas del Sheet. Las operaciones ya
+  // conocidas CONSERVAN su posición original (no se reindexan), y las que ya no
+  // aparecen en el Sheet NO se borran: la nube es la fuente de verdad histórica.
+  let nextRow = prevSheet.reduce((m, d) => Math.max(m, (d.row != null ? d.row : 0) + 1), 0);
+  const seen = new Set();
+  const merged = rows.map((r) => {
+    seen.add(r.refKey);
     const ex = prevByRef[r.refKey];
-    return {
-      ...r,
-      id: (ex && ex.id) || uid(),
-      createdAt: i, // índice de fila: preserva el orden de carga del Excel
-      row: i,
-      manualAllocs: ex ? ex.manualAllocs : undefined,
-      pagado: ex ? ex.pagado : undefined,
-      hasReceipt: ex ? ex.hasReceipt : undefined,
-    };
+    if (ex) {
+      const pos = ex.row != null ? ex.row : (ex.createdAt || 0);
+      return { ...r, id: ex.id, createdAt: pos, row: pos, manualAllocs: ex.manualAllocs, pagado: ex.pagado, hasReceipt: ex.hasReceipt };
+    }
+    const pos = nextRow++;
+    return { ...r, id: uid(), createdAt: pos, row: pos };
   });
-  return [...sheetOps, ...manual];
+  const kept = prevSheet.filter((d) => !seen.has(d.refKey));
+  return [...merged, ...kept, ...manual];
 }
 
 /* ── Comprobantes: guardados en IndexedDB (soporta archivos grandes) ── */
@@ -766,6 +830,12 @@ function AppMain({ session, role, signOut }) {
   const canWriteData = !CLOUD || role === "loader" || role === "editor";
   const canEditAll = !CLOUD || role === "editor";
   const readOnly = !canWriteData;
+  const [syncErr, setSyncErr] = useState("");
+  useEffect(() => {
+    const h = (e) => setSyncErr((e && e.detail) || "Error de sincronización con la nube.");
+    window.addEventListener("sync-error", h);
+    return () => window.removeEventListener("sync-error", h);
+  }, []);
   const [tab, setTab] = useState("balance");
   const [accounts, setAccounts, rAcc] = useCollection("fin:accounts", TABLES.accounts, session, canEditAll);
   const [txns, setTxns, rTxn] = useCollection("fin:txns", TABLES.txns, session, canWriteData);
@@ -792,9 +862,14 @@ function AppMain({ session, role, signOut }) {
     if (typeof document !== "undefined")
       document.documentElement.setAttribute("data-theme", settings.theme || "dark");
   }, [settings.theme]);
+  const didAutoSync = useRef(false);
   useEffect(() => {
-    if (loaded && settings.sheetUrl && canWriteData) syncSheet(settings.sheetUrl).catch(() => {});
-  }, [loaded]);
+    if (didAutoSync.current) return;
+    if (loaded && settings.sheetUrl && canWriteData) {
+      didAutoSync.current = true;
+      syncSheet(settings.sheetUrl).catch(() => {});
+    }
+  }, [loaded, canWriteData, settings.sheetUrl]);
 
   /* Precios en vivo (24/7) */
   const trackedIds = useMemo(() => {
@@ -1082,7 +1157,12 @@ function AppMain({ session, role, signOut }) {
     if (!res.ok) throw new Error("No se pudo leer el Sheet (código " + res.status + ").");
     const text = await res.text();
     const rows = parseDivisasCSV(text);
-    setDivisas((prev) => mergeSheetOps(prev, rows));
+    // Protección: si el CSV llega vacío pero ya teníamos operaciones del Sheet,
+    // lo más probable es un fallo de descarga/parseo — no borrar nada.
+    setDivisas((prev) => {
+      if (!rows.length && prev.some((d) => d.source === "sheet")) return prev;
+      return mergeSheetOps(prev, rows);
+    });
     return { ok: true, count: rows.length };
   }
 
@@ -1092,6 +1172,10 @@ function AppMain({ session, role, signOut }) {
         <div style={{ color: T.mut, fontFamily: FONT }}>Cargando…</div>
       </div>
     );
+
+  if (CLOUD && session && !loaded) {
+    return <Splash msg="Cargando datos de la nube…" />;
+  }
 
   return (
     <div style={desktop ? shellDesktop : shell}>
@@ -1166,6 +1250,12 @@ function AppMain({ session, role, signOut }) {
 
       <main style={desktop ? mainDesktop : mainMobile}>
         <div style={desktop ? { maxWidth: 860, margin: "0 auto" } : undefined}>
+        {syncErr && (
+          <div style={{ background: T.redSoft, border: `1px solid ${T.red}`, borderRadius: 12, padding: "10px 14px", marginBottom: 14, fontSize: 12.5, color: T.red, display: "flex", justifyContent: "space-between", gap: 10, alignItems: "flex-start", lineHeight: 1.5 }}>
+            <span>{syncErr}</span>
+            <button onClick={() => setSyncErr("")} style={{ ...btnGhost, color: T.red, fontSize: 16, lineHeight: 1, flexShrink: 0 }} aria-label="Cerrar">×</button>
+          </div>
+        )}
         {readOnly && (
           <div style={{ background: T.card2, border: `1px solid ${T.line}`, borderRadius: 12, padding: "10px 14px", marginBottom: 14, fontSize: 12.5, color: T.mut }}>
             Modo <b>solo consulta</b>: podés ver todo, pero no modificar. Pedile a un editor que cambie tu rol.
