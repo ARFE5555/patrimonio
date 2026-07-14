@@ -246,8 +246,14 @@ function useCollection(localKey, table, session, canWrite) {
           .filter((x) => x.id != null)
           .filter((x) => { const p = byId[x.id]; return !p || stableStr(p) !== stableStr(x); })
           .map((x) => { const { id, ...data } = x; return { id, data, updated_at: new Date().toISOString() }; });
+        // Dedupe defensivo: si dos elementos comparten id, sube solo el último
+        const seenUp = new Set();
+        for (let i = ups.length - 1; i >= 0; i--) {
+          if (seenUp.has(ups[i].id)) ups.splice(i, 1);
+          else seenUp.add(ups[i].id);
+        }
         const ids = new Set(items.map((x) => x.id));
-        const dels = before.filter((x) => x.id != null && !ids.has(x.id)).map((x) => x.id);
+        const dels = Array.from(new Set(before.filter((x) => x.id != null && !ids.has(x.id)).map((x) => x.id)));
         const BATCH = 100;
         for (let i = 0; i < ups.length; i += BATCH) {
           const { error } = await sb.from(table).upsert(ups.slice(i, i + BATCH));
@@ -561,6 +567,7 @@ function parseDivisasCSV(text) {
   const iComUsd = header.findIndex((h) => (h.includes("comi") || h.includes("fee")) && h.includes("usd"));
   const iCom = header.findIndex((h, idx) => h.includes("comi") && idx !== iComUsd);
   const out = [];
+  const seenRef = {};
   for (let r = 1; r < rows.length; r++) {
     const row = rows[r];
     if (!row || row.every((c) => !String(c || "").trim())) continue;
@@ -573,7 +580,11 @@ function parseDivisasCSV(text) {
     const persona = iP >= 0 ? String(row[iP] || "").trim() : "";
     const referencia = iR >= 0 ? String(row[iR] || "").trim() : "";
     const date = fechaISO(row[iF]);
-    const refKey = referencia || `${kind}|${date}|${usd}|${tasa}|${persona}`;
+    let refKey = referencia || `${kind}|${date}|${usd}|${tasa}|${persona}`;
+    // Referencias repetidas (o operaciones idénticas sin referencia): cada
+    // ocurrencia recibe un sufijo estable para que sean operaciones distintas.
+    const occ = (seenRef[refKey] = (seenRef[refKey] || 0) + 1);
+    if (occ > 1) refKey = refKey + "#" + occ;
     const op = { kind, date, persona, usd, tasa, referencia, refKey, source: "sheet", row: out.length };
     const comUsd = iComUsd >= 0 ? numVE(row[iComUsd]) : NaN;
     if (!isNaN(comUsd) && comUsd > 0) {
@@ -1130,9 +1141,19 @@ function AppMain({ session, role, signOut }) {
     });
   }
   function restoreBackup(d) {
-    if (d.accounts) setAccounts(d.accounts);
-    if (d.txns) setTxns(d.txns);
-    if (d.divisas) setDivisas(d.divisas);
+    // Repara ids faltantes o duplicados (de datos con el bug viejo) sin perder filas
+    const fixIds = (arr) => {
+      const seen = new Set();
+      return (arr || []).map((x) => {
+        let id = x.id;
+        if (id == null || seen.has(id)) id = uid();
+        seen.add(id);
+        return { ...x, id };
+      });
+    };
+    if (d.accounts) setAccounts(fixIds(d.accounts));
+    if (d.txns) setTxns(fixIds(d.txns));
+    if (d.divisas) setDivisas(fixIds(d.divisas));
     if (d.projectsMeta) setProjectsMeta(d.projectsMeta.map((m) => ({ ...m, id: m.id || m.name })));
     if (d.settings) setSettings((s) => ({ ...s, ...d.settings }));
   }
