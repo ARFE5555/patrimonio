@@ -118,8 +118,8 @@ const store = {
    Al pegar la URL y la clave anónima del proyecto, se activan login, roles y datos compartidos.
    La clave "anon" es pública por diseño: los permisos reales los aplica Row Level Security
    en la base de datos (ver supabase-schema.sql). No pongas nunca la service_role key acá. */
-const SUPABASE_URL = "";
-const SUPABASE_ANON_KEY = "";
+const SUPABASE_URL = "https://isrvenwebojpuqvbfffp.supabase.co";
+const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImlzcnZlbndlYm9qcHVxdmJmZmZwIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQwNDkwMDksImV4cCI6MjA5OTYyNTAwOX0.C2453daC4rHnzeKHHWpDqK68qYOJgVAnbPBcrUEtIYI";
 const CLOUD = !!(SUPABASE_URL && SUPABASE_ANON_KEY);
 
 const ROLE_LABEL = { viewer: "Consulta", loader: "Carga de datos", editor: "Editor (todo)" };
