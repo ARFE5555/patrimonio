@@ -113,6 +113,179 @@ const store = {
   async get(k) { try { return localStorage.getItem(k); } catch { return null; } },
   async set(k, v) { try { localStorage.setItem(k, v); } catch (e) { console.error(e); } },
 };
+/* ─────────────────────────────  Nube (Supabase) — multiusuario  ─────────────────────────────
+   Dejar vacío = la app funciona 100% local (como hasta ahora, sin login).
+   Al pegar la URL y la clave anónima del proyecto, se activan login, roles y datos compartidos.
+   La clave "anon" es pública por diseño: los permisos reales los aplica Row Level Security
+   en la base de datos (ver supabase-schema.sql). No pongas nunca la service_role key acá. */
+const SUPABASE_URL = "";
+const SUPABASE_ANON_KEY = "";
+const CLOUD = !!(SUPABASE_URL && SUPABASE_ANON_KEY);
+
+const ROLE_LABEL = { viewer: "Consulta", loader: "Carga de datos", editor: "Editor (todo)" };
+const TABLES = { accounts: "accounts", txns: "txns", divisas: "divisas", projectsMeta: "projects" };
+
+let _sb = null;
+async function getSB() {
+  if (_sb) return _sb;
+  if (!window.supabase) {
+    await new Promise((res, rej) => {
+      const s = document.createElement("script");
+      s.src = "https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js";
+      s.onload = res;
+      s.onerror = () => rej(new Error("No se pudo cargar Supabase. Revisá tu conexión."));
+      document.head.appendChild(s);
+    });
+  }
+  _sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+  return _sb;
+}
+
+/* Colección sincronizada: local (localStorage) o nube (una fila por entidad, con realtime).
+   Mantiene la misma API que useState, así el resto de la app no cambia. */
+function useCollection(localKey, table, session, canWrite) {
+  const [items, setItems] = useState([]);
+  const [ready, setReady] = useState(false);
+  const skip = useRef(true);
+  const prev = useRef([]);
+  const cloud = CLOUD && !!session;
+
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      setReady(false);
+      let rows = [];
+      if (cloud) {
+        try {
+          const sb = await getSB();
+          const { data, error } = await sb.from(table).select("id,data");
+          if (error) throw error;
+          rows = (data || []).map((r) => ({ ...(r.data || {}), id: r.id }));
+        } catch (e) { console.error("load " + table, e); }
+      } else {
+        rows = await loadKey(localKey, []);
+      }
+      if (!alive) return;
+      skip.current = true;
+      prev.current = rows;
+      setItems(rows);
+      setReady(true);
+    })();
+    return () => { alive = false; };
+  }, [cloud, session && session.user && session.user.id]);
+
+  // Realtime: refleja los cambios de otros usuarios
+  useEffect(() => {
+    if (!cloud) return;
+    let ch = null, alive = true;
+    (async () => {
+      const sb = await getSB();
+      if (!alive) return;
+      ch = sb.channel("rt_" + table)
+        .on("postgres_changes", { event: "*", schema: "public", table }, (p) => {
+          skip.current = true;
+          setItems((cur) => {
+            if (p.eventType === "DELETE") return cur.filter((x) => x.id !== (p.old || {}).id);
+            const row = { ...((p.new || {}).data || {}), id: (p.new || {}).id };
+            const i = cur.findIndex((x) => x.id === row.id);
+            if (i < 0) return [row, ...cur];
+            const c = cur.slice(); c[i] = row; return c;
+          });
+        })
+        .subscribe();
+    })();
+    return () => { alive = false; if (ch) ch.unsubscribe(); };
+  }, [cloud, table]);
+
+  // Persistencia (diff: solo lo que cambió)
+  useEffect(() => {
+    if (!ready) return;
+    const before = prev.current;
+    prev.current = items;
+    if (skip.current) { skip.current = false; return; }
+    if (!cloud) { saveKey(localKey, items); return; }
+    if (!canWrite) return;
+    (async () => {
+      try {
+        const sb = await getSB();
+        const byId = {};
+        before.forEach((x) => { byId[x.id] = x; });
+        const ups = items
+          .filter((x) => { const p = byId[x.id]; return !p || JSON.stringify(p) !== JSON.stringify(x); })
+          .map((x) => { const { id, ...data } = x; return { id, data, updated_at: new Date().toISOString() }; });
+        const ids = new Set(items.map((x) => x.id));
+        const dels = before.filter((x) => !ids.has(x.id)).map((x) => x.id);
+        if (ups.length) { const { error } = await sb.from(table).upsert(ups); if (error) throw error; }
+        if (dels.length) { const { error } = await sb.from(table).delete().in("id", dels); if (error) throw error; }
+      } catch (e) { console.error("save " + table, e); }
+    })();
+  }, [items, ready, cloud, canWrite]);
+
+  return [items, setItems, ready];
+}
+
+/* Ajustes: una sola fila compartida (id = 'global') */
+function useSettings(session, canWrite, defaults) {
+  const [settings, setSettings] = useState(defaults);
+  const [ready, setReady] = useState(false);
+  const skip = useRef(true);
+  const cloud = CLOUD && !!session;
+
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      setReady(false);
+      let val = defaults;
+      if (cloud) {
+        try {
+          const sb = await getSB();
+          const { data } = await sb.from("settings").select("data").eq("id", "global").maybeSingle();
+          if (data && data.data) val = { ...defaults, ...data.data };
+        } catch (e) { console.error("load settings", e); }
+      } else {
+        val = await loadKey("fin:settings", defaults);
+      }
+      if (!alive) return;
+      skip.current = true;
+      setSettings(val);
+      setReady(true);
+    })();
+    return () => { alive = false; };
+  }, [cloud, session && session.user && session.user.id]);
+
+  useEffect(() => {
+    if (!cloud) return;
+    let ch = null, alive = true;
+    (async () => {
+      const sb = await getSB();
+      if (!alive) return;
+      ch = sb.channel("rt_settings")
+        .on("postgres_changes", { event: "*", schema: "public", table: "settings" }, (p) => {
+          if ((p.new || {}).id !== "global") return;
+          skip.current = true;
+          setSettings((cur) => ({ ...cur, ...((p.new || {}).data || {}) }));
+        })
+        .subscribe();
+    })();
+    return () => { alive = false; if (ch) ch.unsubscribe(); };
+  }, [cloud]);
+
+  useEffect(() => {
+    if (!ready) return;
+    if (skip.current) { skip.current = false; return; }
+    if (!cloud) { saveKey("fin:settings", settings); return; }
+    if (!canWrite) return;
+    (async () => {
+      try {
+        const sb = await getSB();
+        await sb.from("settings").upsert([{ id: "global", data: settings, updated_at: new Date().toISOString() }]);
+      } catch (e) { console.error("save settings", e); }
+    })();
+  }, [settings, ready, cloud, canWrite]);
+
+  return [settings, setSettings, ready];
+}
+
 async function loadKey(k, fb) {
   const raw = await store.get(k);
   if (!raw) return fb;
@@ -589,12 +762,14 @@ function Field({ label, children }) {
 }
 
 /* ─────────────────────────────  App  ───────────────────────────── */
-function App() {
-  const [loaded, setLoaded] = useState(false);
+function AppMain({ session, role, signOut }) {
+  const canWriteData = !CLOUD || role === "loader" || role === "editor";
+  const canEditAll = !CLOUD || role === "editor";
+  const readOnly = !canWriteData;
   const [tab, setTab] = useState("balance");
-  const [accounts, setAccounts] = useState([]);
-  const [txns, setTxns] = useState([]);
-  const [settings, setSettings] = useState({ currency: "usd", theme: "dark", layout: "auto" });
+  const [accounts, setAccounts, rAcc] = useCollection("fin:accounts", TABLES.accounts, session, canEditAll);
+  const [txns, setTxns, rTxn] = useCollection("fin:txns", TABLES.txns, session, canWriteData);
+  const [settings, setSettings, rSet] = useSettings(session, canEditAll, { currency: "usd", theme: "dark", layout: "auto" });
 
   const [prices, setPrices] = useState({});
   const [priceStatus, setPriceStatus] = useState("loading"); // loading | live | error
@@ -605,45 +780,20 @@ function App() {
   const [acctSheet, setAcctSheet] = useState(null); // {mode,'bank'|'cash'} | account
   const [txnSheet, setTxnSheet] = useState(false);
   const [cryptoSheet, setCryptoSheet] = useState(false);
-  const [divisas, setDivisas] = useState([]);
-  const [projectsMeta, setProjectsMeta] = useState([]);
+  const [divisas, setDivisas, rDiv] = useCollection("fin:divisas", TABLES.divisas, session, canWriteData);
+  const [projectsMeta, setProjectsMeta, rPrj] = useCollection("fin:projectsMeta", TABLES.projectsMeta, session, canEditAll);
   const [txnView, setTxnView] = useState("mov");
   const [projectSheet, setProjectSheet] = useState(null);
   const [divisaSheet, setDivisaSheet] = useState(null); // null | {kind,mode} | operacion
 
-  /* Carga inicial */
-  useEffect(() => {
-    (async () => {
-      setAccounts(await loadKey("fin:accounts", []));
-      setTxns(await loadKey("fin:txns", []));
-      setSettings(await loadKey("fin:settings", { currency: "usd", theme: "dark", layout: "auto" }));
-      setDivisas(await loadKey("fin:divisas", []));
-      setProjectsMeta(await loadKey("fin:projectsMeta", []));
-      setLoaded(true);
-    })();
-  }, []);
-  /* Guardado */
-  useEffect(() => {
-    if (loaded) saveKey("fin:accounts", accounts);
-  }, [accounts, loaded]);
-  useEffect(() => {
-    if (loaded) saveKey("fin:txns", txns);
-  }, [txns, loaded]);
-  useEffect(() => {
-    if (loaded) saveKey("fin:settings", settings);
-  }, [settings, loaded]);
+  /* Carga: las colecciones se sincronizan solas (local o nube) */
+  const loaded = rAcc && rTxn && rSet && rDiv && rPrj;
   useEffect(() => {
     if (typeof document !== "undefined")
       document.documentElement.setAttribute("data-theme", settings.theme || "dark");
   }, [settings.theme]);
   useEffect(() => {
-    if (loaded) saveKey("fin:divisas", divisas);
-  }, [divisas, loaded]);
-  useEffect(() => {
-    if (loaded) saveKey("fin:projectsMeta", projectsMeta);
-  }, [projectsMeta, loaded]);
-  useEffect(() => {
-    if (loaded && settings.sheetUrl) syncSheet(settings.sheetUrl).catch(() => {});
+    if (loaded && settings.sheetUrl && canWriteData) syncSheet(settings.sheetUrl).catch(() => {});
   }, [loaded]);
 
   /* Precios en vivo (24/7) */
@@ -901,6 +1051,13 @@ function App() {
       return { ...s, rateHistory: [...hist, { date, rate }].sort((a, b) => (a.date < b.date ? -1 : 1)) };
     });
   }
+  function restoreBackup(d) {
+    if (d.accounts) setAccounts(d.accounts);
+    if (d.txns) setTxns(d.txns);
+    if (d.divisas) setDivisas(d.divisas);
+    if (d.projectsMeta) setProjectsMeta(d.projectsMeta);
+    if (d.settings) setSettings((s) => ({ ...s, ...d.settings }));
+  }
   function saveProject(oldName, data) {
     const name = (data.name || "").trim();
     if (!name) return;
@@ -1009,6 +1166,11 @@ function App() {
 
       <main style={desktop ? mainDesktop : mainMobile}>
         <div style={desktop ? { maxWidth: 860, margin: "0 auto" } : undefined}>
+        {readOnly && (
+          <div style={{ background: T.card2, border: `1px solid ${T.line}`, borderRadius: 12, padding: "10px 14px", marginBottom: 14, fontSize: 12.5, color: T.mut }}>
+            Modo <b>solo consulta</b>: podés ver todo, pero no modificar. Pedile a un editor que cambie tu rol.
+          </div>
+        )}
         {tab === "balance" && (
           <BalanceTab totals={totals} cur={cur} prices={prices} />
         )}
@@ -1020,6 +1182,7 @@ function App() {
             settings={settings}
             vesRate={vesRate}
             onSetRate={setVesRate}
+            canEdit={canEditAll}
             onAdd={(type) =>
               type === "crypto"
                 ? setCryptoSheet(true)
@@ -1046,6 +1209,7 @@ function App() {
                 txns={txns}
                 accounts={accounts}
                 cur={cur}
+                canWrite={canWriteData}
                 onAdd={() => setTxnSheet(true)}
                 onEdit={(t) => setTxnSheet(t)}
                 onDelete={deleteTxn}
@@ -1056,6 +1220,7 @@ function App() {
                 txns={txns}
                 projectsMeta={projectsMeta}
                 cur={cur}
+                canEdit={canEditAll}
                 onAdd={() => setProjectSheet({ mode: "new" })}
                 onEdit={(name) => setProjectSheet({ name })}
               />
@@ -1067,12 +1232,14 @@ function App() {
             accounts={accounts}
             prices={prices}
             cur={cur}
+            canEdit={canEditAll}
             onAdd={() => setCryptoSheet(true)}
             onEdit={(a) => setCryptoSheet(a)}
           />
         )}
         {tab === "divisas" && (
           <DivisasTab
+            canWrite={canWriteData}
             divisas={divisas}
             onAdd={(kind) => setDivisaSheet({ kind, mode: "new" })}
             onEdit={(d) => setDivisaSheet(d)}
@@ -1090,7 +1257,13 @@ function App() {
             prices={prices}
             cur={cur}
             divisas={divisas}
+            projectsMeta={projectsMeta}
             onSync={syncSheet}
+            onRestore={restoreBackup}
+            session={session}
+            role={role}
+            signOut={signOut}
+            canEditAll={canEditAll}
           />
         )}
         </div>
@@ -1174,6 +1347,195 @@ function App() {
         onSave={saveDivisa}
         onDelete={deleteDivisa}
       />
+    </div>
+  );
+}
+
+/* ─────────────────────────────  Autenticación / Roles  ───────────────────────────── */
+function App() {
+  const [session, setSession] = useState(null);
+  const [role, setRole] = useState(null);
+  const [checking, setChecking] = useState(CLOUD);
+  const [authErr, setAuthErr] = useState("");
+
+  useEffect(() => {
+    if (!CLOUD) return;
+    let alive = true, sub = null;
+    (async () => {
+      try {
+        const sb = await getSB();
+        const { data } = await sb.auth.getSession();
+        if (!alive) return;
+        setSession(data.session || null);
+        setChecking(false);
+        sub = sb.auth.onAuthStateChange((_e, s) => { setSession(s || null); }).data.subscription;
+      } catch (e) {
+        if (alive) { setAuthErr(e.message || "No se pudo conectar."); setChecking(false); }
+      }
+    })();
+    return () => { alive = false; if (sub) sub.unsubscribe(); };
+  }, []);
+
+  // Rol del usuario (viene del servidor; la app solo lo refleja)
+  useEffect(() => {
+    if (!CLOUD || !session) { setRole(null); return; }
+    let alive = true;
+    (async () => {
+      const sb = await getSB();
+      const { data } = await sb.from("profiles").select("role").eq("id", session.user.id).maybeSingle();
+      if (alive) setRole((data && data.role) || "viewer");
+    })();
+    return () => { alive = false; };
+  }, [session && session.user && session.user.id]);
+
+  async function signOut() {
+    const sb = await getSB();
+    await sb.auth.signOut();
+    setSession(null);
+  }
+
+  if (!CLOUD) return <AppMain session={null} role={null} signOut={null} />;
+  if (checking) return <Splash msg="Conectando…" />;
+  if (authErr) return <Splash msg={authErr} />;
+  if (!session) return <LoginScreen onDone={setSession} />;
+  if (!role) return <Splash msg="Cargando permisos…" />;
+  return <AppMain session={session} role={role} signOut={signOut} />;
+}
+
+function Splash({ msg }) {
+  return (
+    <div style={{ ...shell, alignItems: "center", justifyContent: "center" }}>
+      <style>{css}</style>
+      <div style={{ color: T.mut, fontFamily: FONT, padding: 24, textAlign: "center" }}>{msg}</div>
+    </div>
+  );
+}
+
+function LoginScreen({ onDone }) {
+  const [mode, setMode] = useState("in"); // in | up
+  const [email, setEmail] = useState("");
+  const [pass, setPass] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState("");
+
+  async function submit() {
+    setBusy(true); setMsg("");
+    try {
+      const sb = await getSB();
+      if (mode === "up") {
+        const { data, error } = await sb.auth.signUp({ email: email.trim(), password: pass });
+        if (error) throw error;
+        if (data.session) onDone(data.session);
+        else setMsg("Cuenta creada. Revisá tu email para confirmarla y después iniciá sesión.");
+      } else {
+        const { data, error } = await sb.auth.signInWithPassword({ email: email.trim(), password: pass });
+        if (error) throw error;
+        onDone(data.session);
+      }
+    } catch (e) {
+      setMsg(e.message || "No se pudo completar la operación.");
+    } finally { setBusy(false); }
+  }
+
+  return (
+    <div style={{ ...shell, justifyContent: "center", padding: "0 24px" }}>
+      <style>{css}</style>
+      <div style={{ marginBottom: 28, textAlign: "center" }}>
+        <div style={{ width: 60, height: 60, borderRadius: 16, background: T.goldSoft, display: "inline-flex", alignItems: "center", justifyContent: "center", marginBottom: 14 }}>
+          <IconChart color={T.gold} />
+        </div>
+        <div style={{ fontSize: 24, fontWeight: 700, color: T.text, letterSpacing: -0.4 }}>Patrimonio</div>
+        <div style={{ fontSize: 13.5, color: T.mut, marginTop: 4 }}>
+          {mode === "in" ? "Iniciá sesión para continuar" : "Creá tu cuenta"}
+        </div>
+      </div>
+      <Field label="Email">
+        <input style={inputStyle} value={email} onChange={(e) => setEmail(e.target.value)} type="email" autoCapitalize="none" autoCorrect="off" placeholder="tu@email.com" />
+      </Field>
+      <Field label="Contraseña">
+        <input style={inputStyle} value={pass} onChange={(e) => setPass(e.target.value)} type="password" placeholder="••••••••" />
+      </Field>
+      <PrimaryBtn color={T.gold} disabled={busy || !email.trim() || pass.length < 6} onClick={submit}>
+        {busy ? "…" : mode === "in" ? "Entrar" : "Crear cuenta"}
+      </PrimaryBtn>
+      <button onClick={() => { setMode(mode === "in" ? "up" : "in"); setMsg(""); }} style={{ ...btnGhost, width: "100%", marginTop: 14, color: T.mut }}>
+        {mode === "in" ? "No tengo cuenta — registrarme" : "Ya tengo cuenta — iniciar sesión"}
+      </button>
+      {msg && <div style={{ fontSize: 13, color: T.mut, marginTop: 14, textAlign: "center", lineHeight: 1.5 }}>{msg}</div>}
+      <div style={{ fontSize: 11.5, color: T.mut2, marginTop: 26, textAlign: "center", lineHeight: 1.6 }}>
+        Las cuentas nuevas entran como <b>Consulta</b>. Un editor puede cambiar tu rol desde Ajustes.
+      </div>
+    </div>
+  );
+}
+
+/* Gestión de usuarios (solo editor) */
+function UsersPanel({ session, role, signOut }) {
+  const [users, setUsers] = useState([]);
+  const [msg, setMsg] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  async function load() {
+    if (role !== "editor") return;
+    const sb = await getSB();
+    const { data, error } = await sb.from("profiles").select("id,email,role").order("email");
+    if (!error) setUsers(data || []);
+  }
+  useEffect(() => { load(); }, [role]);
+
+  async function changeRole(id, newRole) {
+    setBusy(true); setMsg("");
+    try {
+      const sb = await getSB();
+      const { error } = await sb.from("profiles").update({ role: newRole }).eq("id", id);
+      if (error) throw error;
+      setUsers((u) => u.map((x) => (x.id === id ? { ...x, role: newRole } : x)));
+      setMsg("Rol actualizado.");
+    } catch (e) { setMsg(e.message || "No se pudo cambiar el rol."); }
+    finally { setBusy(false); }
+  }
+
+  return (
+    <div>
+      <div style={{ ...sectionTitle, marginBottom: 10 }}>Mi cuenta</div>
+      <div style={{ ...rowCard, marginBottom: 10 }}>
+        <div style={{ minWidth: 0 }}>
+          <div style={{ fontSize: 14, fontWeight: 600, color: T.text, overflow: "hidden", textOverflow: "ellipsis" }}>
+            {session.user.email}
+          </div>
+          <div style={{ fontSize: 12, color: T.mut }}>{ROLE_LABEL[role] || role}</div>
+        </div>
+        <button onClick={signOut} style={{ ...btnGhost, color: T.red }}>Salir</button>
+      </div>
+
+      {role === "editor" && (
+        <>
+          <div style={{ ...sectionTitle, margin: "24px 0 10px" }}>Usuarios</div>
+          <div style={{ fontSize: 12.5, color: T.mut, marginBottom: 12, lineHeight: 1.5 }}>
+            Consulta: solo ve. Carga de datos: agrega movimientos y divisas. Editor: acceso total.
+          </div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            {users.map((u) => (
+              <div key={u.id} style={{ ...rowCard, flexDirection: "column", alignItems: "stretch", gap: 8 }}>
+                <div style={{ fontSize: 13.5, fontWeight: 600, color: T.text, overflow: "hidden", textOverflow: "ellipsis" }}>
+                  {u.email}{u.id === session.user.id ? " (vos)" : ""}
+                </div>
+                <select
+                  style={{ ...inputStyle, appearance: "none", fontSize: 13.5, padding: "9px 11px" }}
+                  value={u.role}
+                  disabled={busy || u.id === session.user.id}
+                  onChange={(e) => changeRole(u.id, e.target.value)}
+                >
+                  <option value="viewer">{ROLE_LABEL.viewer}</option>
+                  <option value="loader">{ROLE_LABEL.loader}</option>
+                  <option value="editor">{ROLE_LABEL.editor}</option>
+                </select>
+              </div>
+            ))}
+          </div>
+          {msg && <div style={{ fontSize: 12.5, color: T.mut, marginTop: 10 }}>{msg}</div>}
+        </>
+      )}
     </div>
   );
 }
@@ -1337,7 +1699,7 @@ function BalanceTab({ totals, cur, prices }) {
 }
 
 /* ─────────────────────────────  Tab: Cuentas  ───────────────────────────── */
-function AccountsTab({ accounts, prices, cur, settings, vesRate, onSetRate, onAdd, onEdit }) {
+function AccountsTab({ accounts, prices, cur, settings, vesRate, onSetRate, onAdd, onEdit, canEdit = true }) {
   const groups = ["bank", "cash", "crypto"];
   const [rateInput, setRateInput] = useState("");
   const [rateDate, setRateDate] = useState(todayISO());
@@ -1369,7 +1731,7 @@ function AccountsTab({ accounts, prices, cur, settings, vesRate, onSetRate, onAd
         </div>
         <button
           onClick={() => { const r = numVE(rateInput); if (r > 0) { onSetRate(rateDate, r); setRateInput(""); } }}
-          disabled={!(numVE(rateInput) > 0)}
+          disabled={!canEdit || !(numVE(rateInput) > 0)}
           style={{ width: "100%", marginTop: 10, background: numVE(rateInput) > 0 ? T.gold : T.card2, color: numVE(rateInput) > 0 ? "#0A0F1E" : T.mut2, border: "none", borderRadius: 12, padding: "12px", fontSize: 15, fontWeight: 650, fontFamily: FONT, cursor: numVE(rateInput) > 0 ? "pointer" : "default" }}
         >
           Guardar tasa del día
@@ -1397,9 +1759,11 @@ function AccountsTab({ accounts, prices, cur, settings, vesRate, onSetRate, onAd
               }}
             >
               <span style={sectionTitle}>{TYPE_LABEL[g]}</span>
-              <button onClick={() => onAdd(g)} style={{ ...btnGhost, color: ACCENT[g] }}>
-                + Agregar
-              </button>
+              {canEdit && (
+                <button onClick={() => onAdd(g)} style={{ ...btnGhost, color: ACCENT[g] }}>
+                  + Agregar
+                </button>
+              )}
             </div>
             {list.length === 0 ? (
               <div style={emptyRow}>Sin cuentas de {TYPE_LABEL[g].toLowerCase()}</div>
@@ -1479,7 +1843,7 @@ function AccountsTab({ accounts, prices, cur, settings, vesRate, onSetRate, onAd
 }
 
 /* ─────────────────────────────  Tab: Movimientos  ───────────────────────────── */
-function TxnsTab({ txns, accounts, cur, onAdd, onEdit, onDelete, onBulkImport }) {
+function TxnsTab({ txns, accounts, cur, onAdd, onEdit, onDelete, onBulkImport, canWrite = true }) {
   const acct = (id) => accounts.find((a) => a.id === id);
   const acctName = (id) => (acct(id) || {}).name || "—";
   const acctCur = (t) => t.currency || (acct(t.accountId) || {}).currency || cur;
@@ -1584,12 +1948,14 @@ function TxnsTab({ txns, accounts, cur, onAdd, onEdit, onDelete, onBulkImport })
 
   return (
     <div style={{ paddingTop: 8 }}>
-      <button onClick={onAdd} style={{ ...rowCard, cursor: "pointer", justifyContent: "center", gap: 8, color: T.gold, fontWeight: 600, fontSize: 15, marginBottom: 12 }}>
-        <IconPlus color={T.gold} /> Nuevo movimiento
-      </button>
+      {canWrite && (
+        <button onClick={onAdd} style={{ ...rowCard, cursor: "pointer", justifyContent: "center", gap: 8, color: T.gold, fontWeight: 600, fontSize: 15, marginBottom: 12 }}>
+          <IconPlus color={T.gold} /> Nuevo movimiento
+        </button>
+      )}
 
       {/* Edición masiva por Excel */}
-      <div style={{ background: T.bg2, border: `1px solid ${T.lineSoft}`, borderRadius: 14, padding: "12px 14px", marginBottom: 12 }}>
+      <div style={{ background: T.bg2, border: `1px solid ${T.lineSoft}`, borderRadius: 14, padding: "12px 14px", marginBottom: 12, display: canWrite ? "block" : "none" }}>
         <div style={{ fontSize: 12.5, color: T.mut, marginBottom: 10, lineHeight: 1.5 }}>
           Edición masiva: exportá los movimientos (según los filtros), editalos en Excel y volvé a subirlos. Filas con <b>id</b> se modifican; con id vacío se crean.
         </div>
@@ -1695,7 +2061,7 @@ function TxnsTab({ txns, accounts, cur, onAdd, onEdit, onDelete, onBulkImport })
                 const inc = t.kind === "income";
                 const c = acctCur(t);
                 return (
-                  <div key={t.id} onClick={() => onEdit(t)} style={{ ...rowCard, cursor: "pointer" }}>
+                  <div key={t.id} onClick={() => canWrite && onEdit(t)} style={{ ...rowCard, cursor: canWrite ? "pointer" : "default" }}>
                     <div style={{ display: "flex", alignItems: "center", gap: 12, minWidth: 0 }}>
                       <span
                         style={{
@@ -1723,9 +2089,11 @@ function TxnsTab({ txns, accounts, cur, onAdd, onEdit, onDelete, onBulkImport })
                         {inc ? "+" : "−"}
                         {money(t.amount, c)}
                       </span>
-                      <button onClick={(e) => { e.stopPropagation(); onDelete(t); }} style={{ ...btnGhost, color: T.mut2, fontSize: 18, lineHeight: 1 }} aria-label="Eliminar">
-                        ×
-                      </button>
+                      {canWrite && (
+                        <button onClick={(e) => { e.stopPropagation(); onDelete(t); }} style={{ ...btnGhost, color: T.mut2, fontSize: 18, lineHeight: 1 }} aria-label="Eliminar">
+                          ×
+                        </button>
+                      )}
                     </div>
                   </div>
                 );
@@ -1739,13 +2107,15 @@ function TxnsTab({ txns, accounts, cur, onAdd, onEdit, onDelete, onBulkImport })
 }
 
 /* ─────────────────────────────  Tab: Cripto  ───────────────────────────── */
-function CryptoTab({ accounts, prices, cur, onAdd, onEdit }) {
+function CryptoTab({ accounts, prices, cur, onAdd, onEdit, canEdit = true }) {
   const list = accounts.filter((a) => a.type === "crypto");
   return (
     <div style={{ paddingTop: 8 }}>
-      <button onClick={onAdd} style={{ ...rowCard, cursor: "pointer", justifyContent: "center", gap: 8, color: T.gold, fontWeight: 600, fontSize: 15, marginBottom: 20 }}>
-        <IconPlus color={T.gold} /> Agregar cripto
-      </button>
+      {canEdit && (
+        <button onClick={onAdd} style={{ ...rowCard, cursor: "pointer", justifyContent: "center", gap: 8, color: T.gold, fontWeight: 600, fontSize: 15, marginBottom: 20 }}>
+          <IconPlus color={T.gold} /> Agregar cripto
+        </button>
+      )}
       {list.length === 0 ? (
         <div style={emptyRow}>Agregá tus tenencias (BTC, SOL, ETH o cualquier otra)</div>
       ) : (
@@ -2222,7 +2592,7 @@ function CoinBadge({ sym }) {
 }
 
 /* ─────────────────────────────  Tab: Ajustes  ───────────────────────────── */
-function AjustesTab({ settings, setSettings, accounts, txns, prices, cur, divisas, onSync }) {
+function AjustesTab({ settings, setSettings, accounts, txns, prices, cur, divisas, projectsMeta, onSync, onRestore, session, role, signOut, canEditAll }) {
   const theme = settings.theme || "dark";
   const autoRate = vesRateOf(settings, divisas);
   const [syncing, setSyncing] = useState(false);
@@ -2252,6 +2622,44 @@ function AjustesTab({ settings, setSettings, accounts, txns, prices, cur, divisa
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState("");
   const [dl, setDl] = useState(null);
+  const [restorePrev, setRestorePrev] = useState(null);
+
+  async function onRestoreFile(e) {
+    const f = e.target.files && e.target.files[0];
+    e.target.value = "";
+    if (!f) return;
+    setBusy(true); setMsg("Leyendo respaldo…"); setRestorePrev(null);
+    try {
+      const XLSX = await ensureXLSX();
+      const buf = await f.arrayBuffer();
+      const wb = XLSX.read(buf, { type: "array" });
+      const ws = wb.Sheets["Respaldo"];
+      if (!ws) throw new Error("Este archivo no tiene hoja 'Respaldo'. Usá un Excel generado por la app (versión actual).");
+      const rows = XLSX.utils.sheet_to_json(ws, { header: 1, raw: false, defval: "" });
+      const keys = ["accounts", "txns", "divisas", "projectsMeta", "settings"];
+      const parts = {};
+      rows.forEach((r) => {
+        const k = String(r[0] || "");
+        if (keys.indexOf(k) < 0) return;
+        const idx = parseInt(r[1], 10) || 0;
+        (parts[k] = parts[k] || [])[idx] = String(r[2] || "");
+      });
+      const data = {};
+      keys.forEach((k) => { if (parts[k]) data[k] = JSON.parse(parts[k].join("")); });
+      if (!data.accounts && !data.txns && !data.divisas) throw new Error("El respaldo está vacío o dañado.");
+      setRestorePrev({
+        data,
+        counts: [
+          [(data.accounts || []).length, "cuentas"],
+          [(data.txns || []).length, "movimientos"],
+          [(data.divisas || []).length, "operaciones de divisas"],
+          [(data.projectsMeta || []).length, "proyectos"],
+        ],
+      });
+      setMsg("");
+    } catch (ex) { setMsg((ex && ex.message) || "No se pudo leer el respaldo."); }
+    finally { setBusy(false); }
+  }
 
   function thisMonth() {
     setFrom(monthStart());
@@ -2455,6 +2863,24 @@ function AjustesTab({ settings, setSettings, accounts, txns, prices, cur, divisa
       const wsT = XLSX.utils.aoa_to_sheet(tasasAoa);
       wsT["!cols"] = [{ wch: 14 }, { wch: 16 }];
       XLSX.utils.book_append_sheet(wb, wsT, "Tasas");
+
+      // Hoja "Respaldo": datos crudos completos (todas las fechas), restaurables desde Ajustes.
+      // El JSON se parte en trozos porque Excel limita cada celda a ~32.000 caracteres.
+      const CHUNK = 30000;
+      const bAoa = [["PATRIMONIO_BACKUP", "v1", "No editar esta hoja: permite restaurar todos los datos."]];
+      Object.entries({
+        accounts: accounts || [],
+        txns: txns || [],
+        divisas: divisas || [],
+        projectsMeta: projectsMeta || [],
+        settings: settings || {},
+      }).forEach(([k, v]) => {
+        const s = JSON.stringify(v);
+        for (let i = 0; i * CHUNK < s.length; i++) bAoa.push([k, i, s.slice(i * CHUNK, (i + 1) * CHUNK)]);
+      });
+      const wsB = XLSX.utils.aoa_to_sheet(bAoa);
+      wsB["!cols"] = [{ wch: 16 }, { wch: 6 }, { wch: 90 }];
+      XLSX.utils.book_append_sheet(wb, wsB, "Respaldo");
       if (dl && dl.url) URL.revokeObjectURL(dl.url);
       setDl(wbToBlobUrl(XLSX, wb, `patrimonio_${from}_a_${to}.xlsx`));
       setMsg("Archivo generado. Tocá el botón verde para abrirlo o guardarlo.");
@@ -2478,6 +2904,11 @@ function AjustesTab({ settings, setSettings, accounts, txns, prices, cur, divisa
 
   return (
     <div style={{ paddingTop: 8 }}>
+      {session && (
+        <div style={{ marginBottom: 28 }}>
+          <UsersPanel session={session} role={role} signOut={signOut} />
+        </div>
+      )}
       {/* Apariencia */}
       <div style={{ ...sectionTitle, marginBottom: 10 }}>Apariencia</div>
       <div style={{ display: "flex", background: T.card, borderRadius: 12, padding: 4, marginBottom: 8, border: `1px solid ${T.lineSoft}` }}>
@@ -2556,6 +2987,40 @@ function AjustesTab({ settings, setSettings, accounts, txns, prices, cur, divisa
           Abrir / guardar el Excel
         </a>
       )}
+
+      {canEditAll && (
+        <>
+          <div style={{ ...sectionTitle, margin: "26px 0 8px" }}>Restaurar respaldo</div>
+          <div style={{ fontSize: 12.5, color: T.mut, marginBottom: 12, lineHeight: 1.5 }}>
+            Subí un Excel generado por la app (con su hoja "Respaldo") para recuperar todos los datos.
+          </div>
+          <label style={{ display: "block", textAlign: "center", background: "transparent", color: T.blue, border: `1px solid ${T.blue}`, borderRadius: 12, padding: "12px", fontSize: 14.5, fontWeight: 600, cursor: "pointer" }}>
+            {busy ? "Procesando…" : "Subir Excel de respaldo"}
+            <input type="file" accept=".xlsx" style={{ display: "none" }} onChange={onRestoreFile} />
+          </label>
+          {restorePrev && (
+            <div style={{ background: T.redSoft, border: `1px solid ${T.red}`, borderRadius: 14, padding: "14px 15px", marginTop: 12 }}>
+              <div style={{ fontSize: 13.5, fontWeight: 700, color: T.red, marginBottom: 6 }}>
+                Esto reemplaza TODOS los datos actuales
+              </div>
+              <div style={{ fontSize: 12.5, color: T.mut, lineHeight: 1.6, marginBottom: 12 }}>
+                El respaldo contiene: {restorePrev.counts.map(([n, l]) => `${n} ${l}`).join(" · ")}.
+              </div>
+              <div style={{ display: "flex", gap: 8 }}>
+                <button
+                  onClick={() => { onRestore(restorePrev.data); setRestorePrev(null); setMsg("Datos restaurados desde el respaldo."); }}
+                  style={{ flex: 1, background: T.red, color: "#fff", border: "none", borderRadius: 11, padding: "12px", fontSize: 14, fontWeight: 650, fontFamily: FONT, cursor: "pointer" }}
+                >
+                  Restaurar ahora
+                </button>
+                <button onClick={() => setRestorePrev(null)} style={{ flex: 1, background: "transparent", color: T.mut, border: `1px solid ${T.line}`, borderRadius: 11, padding: "12px", fontSize: 14, fontWeight: 600, fontFamily: FONT, cursor: "pointer" }}>
+                  Cancelar
+                </button>
+              </div>
+            </div>
+          )}
+        </>
+      )}
       {msg && (
         <div style={{ fontSize: 13, color: T.mut, marginTop: 12, marginLeft: 2, lineHeight: 1.5 }}>{msg}</div>
       )}
@@ -2587,7 +3052,7 @@ function AjustesTab({ settings, setSettings, accounts, txns, prices, cur, divisa
 }
 
 /* ─────────────────────────────  Tab: Divisas (USD / VES)  ───────────────────────────── */
-function DivisasTab({ divisas, onAdd, onEdit, onDelete, onPatch }) {
+function DivisasTab({ divisas, onAdd, onEdit, onDelete, onPatch, canWrite = true }) {
   const [openId, setOpenId] = useState(null);
   const [busyId, setBusyId] = useState(null);
   const [receiptErr, setReceiptErr] = useState("");
@@ -2738,7 +3203,7 @@ function DivisasTab({ divisas, onAdd, onEdit, onDelete, onPatch }) {
       </div>
 
       {/* Botones de alta */}
-      <div style={{ display: "flex", gap: 10, marginBottom: 20 }}>
+      <div style={{ display: canWrite ? "flex" : "none", gap: 10, marginBottom: 20 }}>
         <button
           onClick={() => onAdd("venta")}
           style={{ flex: 1, background: T.greenSoft, color: T.green, border: `1px solid ${T.green}`, borderRadius: 13, padding: "13px", fontSize: 14.5, fontWeight: 600, fontFamily: FONT, cursor: "pointer" }}
@@ -3351,7 +3816,7 @@ function ConciliacionTab({ divisas }) {
 const PROJECT_COLORS = ["#E3B24D", "#5B8DEF", "#3FCB8B", "#F0645F", "#9B7BEA", "#4DB6AC", "#EC87C0", "#8A93A7"];
 const PROJECT_EMOJIS = ["📁", "🏠", "🏢", "🚗", "🛒", "💼", "🍽️", "✈️", "🏗️", "💡", "📦", "🎯"];
 
-function ProjectsTab({ txns, projectsMeta, cur, onAdd, onEdit }) {
+function ProjectsTab({ txns, projectsMeta, cur, onAdd, onEdit, canEdit = true }) {
   const metaFor = (name) => projectsMeta.find((m) => m.name === name) || { name, color: "#8A93A7", emoji: "📁" };
   const names = Array.from(new Set([...projectsMeta.map((m) => m.name), ...txns.map((t) => t.project).filter(Boolean)])).sort();
 
@@ -3378,9 +3843,11 @@ function ProjectsTab({ txns, projectsMeta, cur, onAdd, onEdit }) {
 
   return (
     <div style={{ paddingTop: 8 }}>
-      <button onClick={onAdd} style={{ ...rowCard, cursor: "pointer", justifyContent: "center", gap: 8, color: T.gold, fontWeight: 600, fontSize: 15, marginBottom: 16 }}>
-        <IconPlus color={T.gold} /> Nuevo proyecto
-      </button>
+      {canEdit && (
+        <button onClick={onAdd} style={{ ...rowCard, cursor: "pointer", justifyContent: "center", gap: 8, color: T.gold, fontWeight: 600, fontSize: 15, marginBottom: 16 }}>
+          <IconPlus color={T.gold} /> Nuevo proyecto
+        </button>
+      )}
 
       {names.length === 0 ? (
         <div style={emptyRow}>Todavía no tenés proyectos. Creá uno y asigná movimientos.</div>
@@ -3398,7 +3865,7 @@ function ProjectsTab({ txns, projectsMeta, cur, onAdd, onEdit }) {
                     </span>
                     <div style={{ fontSize: 16, fontWeight: 700, color: T.text, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{name}</div>
                   </div>
-                  <button onClick={() => onEdit(name)} style={{ ...btnGhost, color: T.mut, fontSize: 13 }}>Editar</button>
+                  {canEdit && <button onClick={() => onEdit(name)} style={{ ...btnGhost, color: T.mut, fontSize: 13 }}>Editar</button>}
                 </div>
                 <div style={{ padding: "0 15px 14px" }}>
                   {rows.length === 0 ? (
