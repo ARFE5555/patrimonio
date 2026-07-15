@@ -616,7 +616,16 @@ function mergeSheetOps(prev, rows) {
     const ex = prevByRef[r.refKey];
     if (ex) {
       const pos = ex.row != null ? ex.row : (ex.createdAt || 0);
-      return { ...r, id: ex.id, createdAt: pos, row: pos, manualAllocs: ex.manualAllocs, pagado: ex.pagado, hasReceipt: ex.hasReceipt };
+      // Si la comisión fue definida en la app (p. ej. fee de Binance en USD) y el
+      // Sheet no trae una comisión USD propia, se preserva la de la app.
+      const keepCom = ex.comMode && r.comMode !== "usd";
+      return {
+        ...r, id: ex.id, createdAt: pos, row: pos,
+        manualAllocs: ex.manualAllocs, pagado: ex.pagado, hasReceipt: ex.hasReceipt, abonos: ex.abonos,
+        ...(keepCom
+          ? { comMode: ex.comMode, comisionTipo: ex.comisionTipo, comisionUsdInput: ex.comisionUsdInput, comisionVesInput: ex.comisionVesInput, comisionBs: undefined }
+          : {}),
+      };
     }
     const pos = nextRow++;
     return { ...r, id: uid(), createdAt: pos, row: pos };
@@ -867,6 +876,7 @@ function AppMain({ session, role, signOut }) {
   const [divisas, setDivisas, rDiv] = useCollection("fin:divisas", TABLES.divisas, session, canWriteData);
   const [projectsMeta, setProjectsMeta, rPrj] = useCollection("fin:projectsMeta", TABLES.projectsMeta, session, canEditAll);
   const [txnView, setTxnView] = useState("mov");
+  const [divView, setDivView] = useState("ops");
   const [projectSheet, setProjectSheet] = useState(null);
   const [divisaSheet, setDivisaSheet] = useState(null); // null | {kind,mode} | operacion
 
@@ -1125,6 +1135,9 @@ function AppMain({ session, role, signOut }) {
     });
     setDivisaSheet(null);
   }
+  function addAbono(data) {
+    setDivisas((prev) => [{ ...data, kind: "abono", id: uid(), createdAt: Date.now() }, ...prev]);
+  }
   function deleteDivisa(id) {
     setDivisas((prev) => prev.filter((d) => d.id !== id));
     idbDel(id);
@@ -1352,14 +1365,37 @@ function AppMain({ session, role, signOut }) {
           />
         )}
         {tab === "divisas" && (
-          <DivisasTab
-            canWrite={canWriteData}
-            divisas={divisas}
-            onAdd={(kind) => setDivisaSheet({ kind, mode: "new" })}
-            onEdit={(d) => setDivisaSheet(d)}
-            onDelete={deleteDivisa}
-            onPatch={patchDivisa}
-          />
+          <div style={{ paddingTop: 8 }}>
+            <div style={{ display: "flex", background: T.card, borderRadius: 12, padding: 4, marginBottom: 4, border: `1px solid ${T.lineSoft}` }}>
+              {[["ops", "Operaciones"], ["cxc", "Por cobrar"]].map(([v, label]) => (
+                <button
+                  key={v}
+                  onClick={() => setDivView(v)}
+                  style={{ flex: 1, border: "none", borderRadius: 9, padding: "10px", fontSize: 14.5, fontWeight: 600, fontFamily: FONT, cursor: "pointer", background: divView === v ? T.gold : "transparent", color: divView === v ? "#0A0F1E" : T.mut }}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+            {divView === "ops" ? (
+              <DivisasTab
+                canWrite={canWriteData}
+                divisas={divisas}
+                onAdd={(kind) => setDivisaSheet({ kind, mode: "new" })}
+                onEdit={(d) => setDivisaSheet(d)}
+                onDelete={deleteDivisa}
+                onPatch={patchDivisa}
+              />
+            ) : (
+              <CxCTab
+                divisas={divisas}
+                canWrite={canWriteData}
+                onAddAbono={addAbono}
+                onDeleteAbono={deleteDivisa}
+                onPatch={patchDivisa}
+              />
+            )}
+          </div>
         )}
         {tab === "concil" && <ConciliacionTab divisas={divisas} />}
         {tab === "ajustes" && (
@@ -3166,6 +3202,202 @@ function AjustesTab({ settings, setSettings, accounts, txns, prices, cur, divisa
 }
 
 /* ─────────────────────────────  Tab: Divisas (USD / VES)  ───────────────────────────── */
+/* ─────────────────────────────  Cuentas por cobrar (por cliente)  ───────────────────────────── */
+function CxCTab({ divisas, canWrite = true, onAddAbono, onDeleteAbono, onPatch }) {
+  const [openKey, setOpenKey] = useState(null);
+  const [monto, setMonto] = useState("");
+  const [fecha, setFecha] = useState(todayISO());
+  const [nota, setNota] = useState("");
+  const [busyId, setBusyId] = useState(null);
+  const [err, setErr] = useState("");
+  const [viewer, setViewer] = useState(null);
+
+  const keyOf = (p) => String(p || "").trim().toLowerCase();
+  const clientes = useMemo(() => {
+    const m = {};
+    (divisas || []).forEach((d) => {
+      const k = keyOf(d.persona);
+      if (!k) return;
+      if (!m[k]) m[k] = { nombre: String(d.persona).trim(), compras: [], ventas: [], abonos: [] };
+      if (d.kind === "compra") m[k].compras.push(d);
+      else if (d.kind === "venta") m[k].ventas.push(d);
+      else if (d.kind === "abono") m[k].abonos.push(d);
+    });
+    return Object.entries(m)
+      .map(([key, c]) => {
+        const totalUsd = c.compras.reduce((s, x) => s + (x.usd || 0), 0);
+        const abonado = c.abonos.reduce((s, x) => s + (x.usd || 0), 0);
+        return { key, ...c, totalUsd, abonado, pendiente: totalUsd - abonado };
+      })
+      .filter((c) => c.compras.length || c.abonos.length)
+      .sort((a, b) => b.pendiente - a.pendiente);
+  }, [divisas]);
+
+  const totalPendiente = clientes.reduce((s, c) => s + Math.max(0, c.pendiente), 0);
+  const byDateDesc = (a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : (b.createdAt || 0) - (a.createdAt || 0));
+
+  async function onReceiptFile(op, e) {
+    const f = e.target.files && e.target.files[0];
+    e.target.value = "";
+    if (!f) return;
+    setBusyId(op.id); setErr("");
+    try { const stored = await fileToStored(f); await idbPut(op.id, stored); onPatch(op.id, { hasReceipt: true }); }
+    catch (ex) { setErr((ex && ex.message) || "No se pudo guardar el comprobante."); }
+    finally { setBusyId(null); }
+  }
+  async function openReceipt(op) {
+    setErr("");
+    try { const stored = await idbGet(op.id); if (stored) setViewer({ stored }); else setErr("No se encontró el comprobante en este dispositivo."); }
+    catch (ex) { setErr("No se pudo abrir el comprobante."); }
+  }
+
+  function registrarAbono(c) {
+    const n = numVE(monto);
+    if (!(n > 0)) return;
+    onAddAbono({ persona: c.nombre, usd: n, date: fecha, note: nota.trim() || undefined });
+    setMonto(""); setNota(""); setFecha(todayISO());
+  }
+
+  const miniBtn = { borderRadius: 10, padding: "9px 12px", fontSize: 12.5, fontWeight: 600, fontFamily: FONT, cursor: "pointer", textAlign: "center" };
+
+  return (
+    <div style={{ paddingTop: 8 }}>
+      <div style={{ background: `linear-gradient(160deg, ${T.card2}, ${T.card})`, border: `1px solid ${T.line}`, borderRadius: 18, padding: "18px", marginBottom: 18 }}>
+        <div style={{ fontSize: 13, color: T.mut, fontWeight: 500 }}>Total por cobrar</div>
+        <div style={{ fontFamily: MONO, fontVariantNumeric: "tabular-nums", fontSize: 30, fontWeight: 600, letterSpacing: -0.5, color: T.gold, margin: "4px 0 2px" }}>
+          {fmtUsd(totalPendiente)}
+        </div>
+        <div style={{ fontSize: 12, color: T.mut2 }}>{clientes.filter((c) => c.pendiente > 0.01).length} cliente(s) con saldo abierto</div>
+      </div>
+
+      {clientes.length === 0 ? (
+        <div style={emptyRow}>Las compras de divisas con cliente aparecen acá agrupadas.</div>
+      ) : (
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          {clientes.map((c) => {
+            const open = openKey === c.key;
+            const saldada = c.pendiente <= 0.01;
+            return (
+              <div key={c.key} style={{ ...rowCard, flexDirection: "column", alignItems: "stretch", padding: 0, overflow: "hidden" }}>
+                <div onClick={() => setOpenKey(open ? null : c.key)} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10, padding: "13px 15px", cursor: "pointer" }}>
+                  <div style={{ minWidth: 0, flex: 1 }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", marginBottom: 3 }}>
+                      <span style={{ fontSize: 15, fontWeight: 700, color: T.text }}>{c.nombre}</span>
+                      <span style={{ fontSize: 10.5, fontWeight: 700, padding: "2px 8px", borderRadius: 6, color: saldada ? T.green : T.gold, background: saldada ? T.greenSoft : "rgba(227,178,77,0.14)", border: `1px solid ${saldada ? T.green : T.gold}` }}>
+                        {saldada ? "SALDADA" : "ABIERTA"}
+                      </span>
+                    </div>
+                    <div style={{ fontSize: 12, color: T.mut, fontFamily: MONO }}>
+                      {c.compras.length} compra(s) · total {fmtUsd(c.totalUsd)} · abonado {fmtUsd(c.abonado)}
+                    </div>
+                    <div style={{ fontSize: 13, fontWeight: 700, marginTop: 3, color: saldada ? T.green : T.gold }}>
+                      Pendiente: {fmtUsd(Math.max(0, c.pendiente))}{c.pendiente < -0.01 ? ` (a favor ${fmtUsd(-c.pendiente)})` : ""}
+                    </div>
+                  </div>
+                  <span style={{ color: T.mut2, fontSize: 12 }}>{open ? "▲" : "▼"}</span>
+                </div>
+
+                {open && (
+                  <div style={{ padding: "4px 15px 16px", borderTop: `1px solid ${T.lineSoft}` }}>
+                    <div style={{ ...sectionTitle, margin: "14px 0 8px" }}>Operaciones ({c.compras.length + c.ventas.length})</div>
+                    <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                      {[...c.compras, ...c.ventas].sort(byDateDesc).map((d) => (
+                        <div key={d.id} style={{ display: "flex", justifyContent: "space-between", background: T.bg2, border: `1px solid ${T.lineSoft}`, borderRadius: 10, padding: "8px 11px" }}>
+                          <span style={{ fontSize: 12, color: d.kind === "compra" ? T.text : T.mut }}>
+                            {d.kind === "compra" ? "Compra" : "Venta"} · {fmtDate(d.date)}{d.referencia ? ` · ref ${d.referencia}` : ""}
+                          </span>
+                          <span style={{ fontSize: 12.5, fontFamily: MONO, fontWeight: 600, color: T.text }}>{fmtUsd(d.usd)}</span>
+                        </div>
+                      ))}
+                    </div>
+                    {c.ventas.length > 0 && (
+                      <div style={{ fontSize: 11.5, color: T.mut2, marginTop: 6 }}>
+                        Las ventas se muestran como referencia; el pendiente se calcula sobre las compras.
+                      </div>
+                    )}
+
+                    <div style={{ ...sectionTitle, margin: "16px 0 8px" }}>Abonos ({c.abonos.length})</div>
+                    {c.abonos.length === 0 ? (
+                      <div style={{ fontSize: 12.5, color: T.mut, marginBottom: 6 }}>Sin abonos registrados.</div>
+                    ) : (
+                      <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                        {c.abonos.slice().sort(byDateDesc).map((a) => (
+                          <div key={a.id} style={{ background: T.bg2, border: `1px solid ${T.lineSoft}`, borderRadius: 10, padding: "9px 11px" }}>
+                            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}>
+                              <div style={{ minWidth: 0 }}>
+                                <div style={{ fontSize: 13, fontWeight: 600, color: T.green, fontFamily: MONO }}>+{fmtUsd(a.usd)}</div>
+                                <div style={{ fontSize: 11.5, color: T.mut, fontFamily: MONO }}>{fmtDate(a.date)}{a.note ? ` · ${a.note}` : ""}</div>
+                              </div>
+                              {canWrite && (
+                                <button onClick={() => onDeleteAbono(a.id)} style={{ ...btnGhost, color: T.mut2, fontSize: 17, lineHeight: 1 }} aria-label="Eliminar abono">×</button>
+                              )}
+                            </div>
+                            <div style={{ display: "flex", gap: 6, marginTop: 8 }}>
+                              {a.hasReceipt ? (
+                                <button onClick={() => openReceipt(a)} style={{ ...miniBtn, flex: 1, background: T.blue, color: "#0A0F1E", border: "none" }}>Ver comprobante</button>
+                              ) : canWrite ? (
+                                <label style={{ ...miniBtn, flex: 1, display: "block", background: "transparent", color: T.gold, border: `1px solid ${T.gold}` }}>
+                                  {busyId === a.id ? "Guardando…" : "Cargar comprobante"}
+                                  <input type="file" accept="image/*,application/pdf" style={{ display: "none" }} onChange={(e) => onReceiptFile(a, e)} />
+                                </label>
+                              ) : null}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                    {err && <div style={{ fontSize: 12.5, color: T.red, marginTop: 8 }}>{err}</div>}
+
+                    {canWrite && (
+                      <div style={{ marginTop: 14, background: T.card2, border: `1px solid ${T.lineSoft}`, borderRadius: 12, padding: "12px 13px" }}>
+                        <div style={{ ...sectionTitle, marginBottom: 8 }}>Registrar abono</div>
+                        <div style={{ display: "flex", gap: 8 }}>
+                          <div style={{ flex: 1 }}>
+                            <label style={labelStyle}>Monto USD</label>
+                            <input style={{ ...inputStyle, fontFamily: MONO }} value={monto} onChange={(e) => setMonto(e.target.value)} inputMode="decimal" placeholder="0.00" />
+                          </div>
+                          <div style={{ flex: 1 }}>
+                            <label style={labelStyle}>Fecha</label>
+                            <input type="date" style={{ ...inputStyle, fontFamily: MONO }} value={fecha} onChange={(e) => setFecha(e.target.value)} />
+                          </div>
+                        </div>
+                        <label style={labelStyle}>Nota (opcional)</label>
+                        <input style={inputStyle} value={nota} onChange={(e) => setNota(e.target.value)} placeholder="Ej. transferencia parcial" />
+                        <button
+                          onClick={() => registrarAbono(c)}
+                          disabled={!(numVE(monto) > 0)}
+                          style={{ width: "100%", marginTop: 10, background: numVE(monto) > 0 ? T.green : T.card, color: numVE(monto) > 0 ? "#0A0F1E" : T.mut2, border: "none", borderRadius: 11, padding: "12px", fontSize: 14.5, fontWeight: 650, fontFamily: FONT, cursor: numVE(monto) > 0 ? "pointer" : "default" }}
+                        >
+                          Registrar abono
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      <Sheet open={!!viewer} onClose={() => setViewer(null)} title="Comprobante de pago">
+        {viewer && (viewer.stored && viewer.stored.type === "image" ? (
+          <img src={viewer.stored.dataUrl} alt="comprobante" style={{ width: "100%", borderRadius: 12, display: "block" }} />
+        ) : (
+          viewer && (
+            <div>
+              <div style={{ color: T.mut, fontSize: 13, marginBottom: 12 }}>{(viewer.stored && viewer.stored.name) || "Archivo adjunto"}</div>
+              <a href={viewer.stored.dataUrl} download={(viewer.stored && viewer.stored.name) || "comprobante"} style={{ display: "block", textAlign: "center", background: T.gold, color: "#0A0F1E", borderRadius: 12, padding: "13px", fontWeight: 600, textDecoration: "none" }}>
+                Abrir / descargar
+              </a>
+            </div>
+          )
+        ))}
+      </Sheet>
+    </div>
+  );
+}
+
 function DivisasTab({ divisas, onAdd, onEdit, onDelete, onPatch, canWrite = true }) {
   const [openId, setOpenId] = useState(null);
   const [busyId, setBusyId] = useState(null);
@@ -3237,6 +3469,37 @@ function DivisasTab({ divisas, onAdd, onEdit, onDelete, onPatch, canWrite = true
     catch { setReceiptErr("No se pudo abrir el comprobante."); }
   }
   async function removeReceipt(op) { await idbDel(op.id); onPatch(op.id, { hasReceipt: false }); }
+
+  const [pagoMonto, setPagoMonto] = useState("");
+  const [pagoFecha, setPagoFecha] = useState(todayISO());
+  function addPagoVenta(v) {
+    const n = numVE(pagoMonto);
+    if (!(n > 0)) return;
+    const ab = { id: uid(), usd: n, date: pagoFecha };
+    onPatch(v.id, { abonos: [...(v.abonos || []), ab] });
+    setPagoMonto(""); setPagoFecha(todayISO());
+  }
+  function delPagoVenta(v, a) {
+    idbDel(a.id);
+    onPatch(v.id, { abonos: (v.abonos || []).filter((x) => x.id !== a.id) });
+  }
+  async function onPagoReceiptFile(v, a, e) {
+    const f = e.target.files && e.target.files[0];
+    e.target.value = "";
+    if (!f) return;
+    setBusyId(a.id); setReceiptErr("");
+    try {
+      const stored = await fileToStored(f);
+      await idbPut(a.id, stored);
+      onPatch(v.id, { abonos: (v.abonos || []).map((x) => (x.id === a.id ? { ...x, hasReceipt: true } : x)) });
+    } catch (ex) { setReceiptErr((ex && ex.message) || "No se pudo guardar el comprobante."); }
+    finally { setBusyId(null); }
+  }
+  async function openPagoReceipt(a) {
+    setReceiptErr("");
+    try { const stored = await idbGet(a.id); if (stored) setViewer({ stored }); else setReceiptErr("No se encontró el comprobante en este dispositivo."); }
+    catch (ex) { setReceiptErr("No se pudo abrir el comprobante."); }
+  }
 
   const allocRow = (a, i) => {
     const c = a.compra;
@@ -3341,7 +3604,11 @@ function DivisasTab({ divisas, onAdd, onEdit, onDelete, onPatch, canWrite = true
           {ventasOrden.map((v) => {
             const st = statsDeVenta(v);
             const open = openId === v.id;
-            const pagado = !!v.pagado;
+            const pagos = v.abonos || [];
+            const abonadoPago = pagos.reduce((s, a) => s + (a.usd || 0), 0);
+            const pendientePago = (v.usd || 0) - abonadoPago;
+            const pagado = abonadoPago >= (v.usd || 0) - 0.01 || !!v.pagado;
+            const pagoParcial = !pagado && abonadoPago > 0.009;
             const completada = st.vesRestantes <= 0.01;
             const usdPorComprar = v.tasa > 0 ? st.vesRestantes / v.tasa : 0;
             return (
@@ -3354,8 +3621,8 @@ function DivisasTab({ divisas, onAdd, onEdit, onDelete, onPatch, canWrite = true
                       <span style={{ fontSize: 10.5, fontWeight: 700, padding: "2px 8px", borderRadius: 6, color: completada ? T.blue : T.gold, background: completada ? "rgba(91,141,239,0.14)" : "rgba(227,178,77,0.14)", border: `1px solid ${completada ? T.blue : T.gold}` }}>
                         {completada ? "COMPLETADA" : "PENDIENTE"}
                       </span>
-                      <span style={{ fontSize: 10.5, fontWeight: 700, padding: "2px 8px", borderRadius: 6, color: pagado ? T.green : T.mut2, background: pagado ? T.greenSoft : T.bg2, border: `1px solid ${pagado ? T.green : T.line}` }}>
-                        {pagado ? "PAGADO" : "NO PAGADO"}
+                      <span style={{ fontSize: 10.5, fontWeight: 700, padding: "2px 8px", borderRadius: 6, color: pagado ? T.green : pagoParcial ? T.gold : T.mut2, background: pagado ? T.greenSoft : pagoParcial ? "rgba(227,178,77,0.14)" : T.bg2, border: `1px solid ${pagado ? T.green : pagoParcial ? T.gold : T.line}` }}>
+                        {pagado ? "PAGADO" : pagoParcial ? "PARCIAL" : "NO PAGADO"}
                       </span>
                       {v.hasReceipt && <span style={{ fontSize: 10, fontWeight: 700, padding: "2px 7px", borderRadius: 6, color: T.blue, background: "rgba(91,141,239,0.14)" }}>ADJUNTO</span>}
                     </div>
@@ -3373,6 +3640,11 @@ function DivisasTab({ divisas, onAdd, onEdit, onDelete, onPatch, canWrite = true
                         Falta comprar ≈ {fmtUsd(usdPorComprar)} · {fmtBs(st.vesRestantes)} disponibles
                       </div>
                     )}
+                    {pagoParcial && (
+                      <div style={{ fontSize: 11.5, color: T.mut, marginTop: 2, fontFamily: MONO }}>
+                        Pagado {fmtUsd(abonadoPago)} de {fmtUsd(v.usd)} · pendiente {fmtUsd(pendientePago)}
+                      </div>
+                    )}
                   </div>
                   <span style={{ color: T.mut2, fontSize: 12, paddingTop: 2 }}>{open ? "▲" : "▼"}</span>
                 </div>
@@ -3385,17 +3657,65 @@ function DivisasTab({ divisas, onAdd, onEdit, onDelete, onPatch, canWrite = true
                       <button onClick={() => onPatch(v.id, { pagado: true })} style={seg(pagado, T.green)}>Pagado</button>
                     </div>
 
-                    <div style={{ ...sectionTitle, margin: "16px 0 8px" }}>Comprobante de pago</div>
-                    {v.hasReceipt ? (
-                      <div style={{ display: "flex", gap: 8 }}>
-                        <button onClick={() => openReceipt(v)} style={{ ...miniBtn, background: T.blue, color: "#0A0F1E" }}>Ver comprobante</button>
+                    <div style={{ ...sectionTitle, margin: "16px 0 8px" }}>Pagos y comprobantes ({pagos.length})</div>
+                    {pagos.length === 0 ? (
+                      <div style={{ fontSize: 12.5, color: T.mut, marginBottom: 6 }}>Sin pagos registrados.</div>
+                    ) : (
+                      <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                        {pagos.map((a) => (
+                          <div key={a.id} style={{ background: T.bg2, border: `1px solid ${T.lineSoft}`, borderRadius: 10, padding: "9px 11px" }}>
+                            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}>
+                              <div style={{ minWidth: 0 }}>
+                                <div style={{ fontSize: 13, fontWeight: 600, color: T.green, fontFamily: MONO }}>+{fmtUsd(a.usd)}</div>
+                                <div style={{ fontSize: 11.5, color: T.mut, fontFamily: MONO }}>{fmtDate(a.date)}{a.note ? ` · ${a.note}` : ""}</div>
+                              </div>
+                              {canWrite && (
+                                <button onClick={() => delPagoVenta(v, a)} style={{ ...btnGhost, color: T.mut2, fontSize: 17, lineHeight: 1 }} aria-label="Eliminar pago">×</button>
+                              )}
+                            </div>
+                            <div style={{ display: "flex", gap: 6, marginTop: 8 }}>
+                              {a.hasReceipt ? (
+                                <button onClick={() => openPagoReceipt(a)} style={{ ...miniBtn, flex: 1, background: T.blue, color: "#0A0F1E" }}>Ver comprobante</button>
+                              ) : canWrite ? (
+                                <label style={{ ...miniBtn, flex: 1, display: "block", background: "transparent", color: T.gold, border: `1px solid ${T.gold}` }}>
+                                  {busyId === a.id ? "Guardando…" : "Cargar comprobante"}
+                                  <input type="file" accept="image/*,application/pdf" style={{ display: "none" }} onChange={(e) => onPagoReceiptFile(v, a, e)} />
+                                </label>
+                              ) : null}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                    <div style={{ fontSize: 12, color: pendientePago > 0.01 ? T.gold : T.green, marginTop: 8, fontFamily: MONO }}>
+                      {pendientePago > 0.01 ? `Pendiente por pagar: ${fmtUsd(pendientePago)}` : "Pago completo."}
+                    </div>
+                    {canWrite && (
+                      <div style={{ marginTop: 10, background: T.card2, border: `1px solid ${T.lineSoft}`, borderRadius: 12, padding: "11px 12px" }}>
+                        <div style={{ display: "flex", gap: 8 }}>
+                          <div style={{ flex: 1 }}>
+                            <label style={labelStyle}>Monto USD</label>
+                            <input style={{ ...inputStyle, fontFamily: MONO }} value={pagoMonto} onChange={(e) => setPagoMonto(e.target.value)} inputMode="decimal" placeholder="0.00" />
+                          </div>
+                          <div style={{ flex: 1 }}>
+                            <label style={labelStyle}>Fecha</label>
+                            <input type="date" style={{ ...inputStyle, fontFamily: MONO }} value={pagoFecha} onChange={(e) => setPagoFecha(e.target.value)} />
+                          </div>
+                        </div>
+                        <button
+                          onClick={() => addPagoVenta(v)}
+                          disabled={!(numVE(pagoMonto) > 0)}
+                          style={{ width: "100%", marginTop: 8, background: numVE(pagoMonto) > 0 ? T.green : T.card, color: numVE(pagoMonto) > 0 ? "#0A0F1E" : T.mut2, border: "none", borderRadius: 11, padding: "11px", fontSize: 14, fontWeight: 650, fontFamily: FONT, cursor: numVE(pagoMonto) > 0 ? "pointer" : "default" }}
+                        >
+                          Registrar pago
+                        </button>
+                      </div>
+                    )}
+                    {v.hasReceipt && (
+                      <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+                        <button onClick={() => openReceipt(v)} style={{ ...miniBtn, flex: 1, background: "transparent", color: T.blue, border: `1px solid ${T.blue}` }}>Comprobante anterior</button>
                         <button onClick={() => removeReceipt(v)} style={{ ...miniBtn, background: "transparent", color: T.red, border: `1px solid ${T.red}` }}>Quitar</button>
                       </div>
-                    ) : (
-                      <label style={{ ...miniBtn, display: "block", background: T.goldSoft, color: T.gold, border: `1px solid ${T.gold}` }}>
-                        {busyId === v.id ? "Guardando…" : "Cargar comprobante"}
-                        <input type="file" accept="image/*,application/pdf" style={{ display: "none" }} onChange={(e) => onReceiptFile(v, e)} />
-                      </label>
                     )}
                     {receiptErr && <div style={{ fontSize: 12.5, color: T.red, marginTop: 8 }}>{receiptErr}</div>}
 
@@ -3769,7 +4089,7 @@ function ConciliacionTab({ divisas }) {
   const [busy, setBusy] = useState(false);
   const [dl, setDl] = useState(null);
 
-  const ops = (divisas || []).filter((d) => d.date >= from && d.date <= to);
+  const ops = (divisas || []).filter((d) => (d.kind === "venta" || d.kind === "compra") && d.date >= from && d.date <= to);
   const result = useMemo(() => {
     if (!bankRows) return null;
     const byRef = {};
