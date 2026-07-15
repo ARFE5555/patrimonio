@@ -3513,7 +3513,7 @@ function DivisasTab({ divisas, onAdd, onEdit, onDelete, onPatch, canWrite = true
             {a.manual && <span style={{ color: T.blue, fontWeight: 400 }}> · manual</span>}
           </div>
           <div style={{ fontSize: 11.5, color: T.mut, fontFamily: MONO, marginTop: 2 }}>
-            {fmtDate(c.date)} · {fmtBs(a.ves)}{comUsdOf(c) > 0 ? ` · com. ${fmtUsd(comUsdOf(c) * (a.usd / (c.usd || 1)))}` : ""}{c.persona ? ` · ${c.persona}` : ""}{c.referencia ? ` · ref ${c.referencia}` : ""}
+            {fmtDate(c.date)} · {fmtBs(a.ves)}{comUsdOf(c) > 0 ? ` · com. ${fmtUsd(comUsdOf(c) * (a.usd / (c.usd || 1)))} · neto ${fmtUsd(a.net != null ? a.net : a.usd)}` : ""}{c.persona ? ` · ${c.persona}` : ""}{c.referencia ? ` · ref ${c.referencia}` : ""}
           </div>
         </div>
         <button onClick={(e) => { e.stopPropagation(); onDelete(c.id); }} style={{ ...btnGhost, color: T.mut2, fontSize: 18, lineHeight: 1, paddingLeft: 8 }} aria-label="Eliminar">×</button>
