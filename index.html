@@ -2961,7 +2961,7 @@ function AjustesTab({ settings, setSettings, accounts, txns, prices, cur, divisa
       const allC2 = divs2.filter((d) => d.kind === "compra");
       const allo2 = allocateFIFO(allV2, allC2);
       const ventasRango = allV2.filter((v) => v.date >= from && v.date <= to).slice().sort(byDate);
-      const header = ["Tipo", "Fecha", "Cliente", "USD", "Tasa (VES)", "VES", "Comisión (VES)", "Total VES", "Ganancia (USD)", "Rentab. %", "Referencia"];
+      const header = ["Tipo", "Fecha", "Cliente", "USD (neto)", "Tasa (VES)", "VES", "Comisión (VES)", "Comisión (USD)", "Total VES", "Ganancia (USD)", "Rentab. %", "Referencia"];
       const aoa = [[`Divisas por venta · ${from} a ${to}  (USD y Bs)`], []];
       let gTotal = 0;
       ventasRango.forEach((v) => {
@@ -2969,21 +2969,22 @@ function AjustesTab({ settings, setSettings, accounts, txns, prices, cur, divisa
         const s = allo2.ventaStats[v.id] || { usdRecomprado: 0, vesUsados: 0, allocs: [] };
         const comV = comOp(v), comU = comUsdOf(v);
         aoa.push(header);
-        aoa.push(["VENTA", v.date, v.persona || "", round2(v.usd || 0), v.tasa || 0, round2(gen), round2(comV), round2(gen - comV), "", "", v.referencia || ""]);
+        aoa.push(["VENTA", v.date, v.persona || "", round2(v.usd || 0), v.tasa || 0, round2(gen), round2(comV), round2(comU), round2(gen - comV), "", "", v.referencia || ""]);
         s.allocs.forEach((a) => {
           const c = a.compra;
           const frac = (c.usd || 0) > 0 ? a.usd / (c.usd || 1) : 0;
           const cCom = comOp(c) * frac;
           const cVes = a.usd * (c.tasa || 0);
-          aoa.push(["Compra", c.date, c.persona || "", round2(a.usd), c.tasa || 0, round2(cVes), round2(cCom), round2(a.ves), "", "", c.referencia || ""]);
+          const cComUsd = comUsdOf(c) * frac;
+          aoa.push(["Compra", c.date, c.persona || "", round2(a.net != null ? a.net : a.usd), c.tasa || 0, round2(cVes), round2(cCom), round2(cComUsd), round2(a.ves), "", "", c.referencia || ""]);
         });
-        if (s.allocs.length === 0) aoa.push(["(sin compras asignadas)", "", "", "", "", "", "", "", "", "", ""]);
+        if (s.allocs.length === 0) aoa.push(["(sin compras asignadas)", "", "", "", "", "", "", "", "", "", "", ""]);
         const usdRe = s.usdRecomprado, vesUs = s.vesUsados;
         const usdEq = v.tasa > 0 ? vesUs / v.tasa : 0;
         const gan = usdRe - usdEq - comU;
         const rent = usdEq > 0 ? (gan / usdEq) * 100 : 0;
         gTotal += gan;
-        aoa.push(["TOTAL RENTABILIDAD", "", "", round2(usdRe), "", round2(vesUs), "", "", round2(gan), round2(rent), ""]);
+        aoa.push(["TOTAL RENTABILIDAD", "", "", round2(usdRe), "", round2(vesUs), "", "", "", round2(gan), round2(rent), ""]);
         aoa.push([]);
       });
       // Porciones sin asignar (compras sin venta con VES disponibles), del período
@@ -2993,13 +2994,13 @@ function AjustesTab({ settings, setSettings, accounts, txns, prices, cur, divisa
         sinAsig.forEach((a) => {
           const c = a.compra;
           const frac = (c.usd || 0) > 0 ? a.usd / (c.usd || 1) : 0;
-          aoa.push(["Compra", c.date, c.persona || "", round2(a.usd), c.tasa || 0, round2(a.usd * (c.tasa || 0)), round2(comOp(c) * frac), round2(a.ves), "", "", c.referencia || ""]);
+          aoa.push(["Compra", c.date, c.persona || "", round2(a.net != null ? a.net : a.usd), c.tasa || 0, round2(a.usd * (c.tasa || 0)), round2(comOp(c) * frac), round2(comUsdOf(c) * frac), round2(a.ves), "", "", c.referencia || ""]);
         });
         aoa.push([]);
       }
-      aoa.push(["GANANCIA TOTAL (USD)", "", "", "", "", "", "", "", round2(gTotal), "", ""]);
+      aoa.push(["GANANCIA TOTAL (USD)", "", "", "", "", "", "", "", "", round2(gTotal), "", ""]);
       const wsDiv = XLSX.utils.aoa_to_sheet(aoa);
-      wsDiv["!cols"] = [{ wch: 20 }, { wch: 12 }, { wch: 18 }, { wch: 12 }, { wch: 12 }, { wch: 16 }, { wch: 15 }, { wch: 16 }, { wch: 15 }, { wch: 10 }, { wch: 16 }];
+      wsDiv["!cols"] = [{ wch: 20 }, { wch: 12 }, { wch: 18 }, { wch: 12 }, { wch: 12 }, { wch: 16 }, { wch: 15 }, { wch: 15 }, { wch: 16 }, { wch: 15 }, { wch: 10 }, { wch: 16 }];
 
       const wb = XLSX.utils.book_new();
       XLSX.utils.book_append_sheet(wb, wsR, "Resumen");
@@ -3225,7 +3226,7 @@ function CxCTab({ divisas, canWrite = true, onAddAbono, onDeleteAbono, onPatch }
     });
     return Object.entries(m)
       .map(([key, c]) => {
-        const totalUsd = c.compras.reduce((s, x) => s + (x.usd || 0), 0);
+        const totalUsd = c.compras.reduce((s, x) => s + (x.usd || 0) - comUsdOf(x), 0); // neto: descuenta el fee en USD
         const abonado = c.abonos.reduce((s, x) => s + (x.usd || 0), 0);
         return { key, ...c, totalUsd, abonado, pendiente: totalUsd - abonado };
       })
@@ -3306,7 +3307,7 @@ function CxCTab({ divisas, canWrite = true, onAddAbono, onDeleteAbono, onPatch }
                           <span style={{ fontSize: 12, color: d.kind === "compra" ? T.text : T.mut }}>
                             {d.kind === "compra" ? "Compra" : "Venta"} · {fmtDate(d.date)}{d.referencia ? ` · ref ${d.referencia}` : ""}
                           </span>
-                          <span style={{ fontSize: 12.5, fontFamily: MONO, fontWeight: 600, color: T.text }}>{fmtUsd(d.usd)}</span>
+                          <span style={{ fontSize: 12.5, fontFamily: MONO, fontWeight: 600, color: T.text }}>{fmtUsd(d.kind === "compra" ? (d.usd || 0) - comUsdOf(d) : d.usd)}</span>
                         </div>
                       ))}
                     </div>
@@ -3508,12 +3509,12 @@ function DivisasTab({ divisas, onAdd, onEdit, onDelete, onPatch, canWrite = true
       <button key={c.id + "-" + i} onClick={() => onEdit(c)} style={{ ...rowCard, cursor: "pointer", textAlign: "left" }}>
         <div style={{ minWidth: 0 }}>
           <div style={{ fontSize: 13.5, fontWeight: 600, color: T.text }}>
-            {fmtUsd(a.usd)} <span style={{ color: T.mut, fontWeight: 400 }}>× {(c.tasa || 0).toLocaleString("es-VE")}</span>
+            {fmtUsd(a.net != null ? a.net : a.usd)} <span style={{ color: T.mut, fontWeight: 400 }}>× {(c.tasa || 0).toLocaleString("es-VE")}</span>
             {parcial && <span style={{ color: T.gold, fontWeight: 400 }}> · parcial de {fmtUsd(c.usd)}</span>}
             {a.manual && <span style={{ color: T.blue, fontWeight: 400 }}> · manual</span>}
           </div>
           <div style={{ fontSize: 11.5, color: T.mut, fontFamily: MONO, marginTop: 2 }}>
-            {fmtDate(c.date)} · {fmtBs(a.ves)}{comUsdOf(c) > 0 ? ` · com. ${fmtUsd(comUsdOf(c) * (a.usd / (c.usd || 1)))} · neto ${fmtUsd(a.net != null ? a.net : a.usd)}` : ""}{c.persona ? ` · ${c.persona}` : ""}{c.referencia ? ` · ref ${c.referencia}` : ""}
+            {fmtDate(c.date)} · {fmtBs(a.ves)}{comUsdOf(c) > 0 ? ` · bruto ${fmtUsd(a.usd)} · com. ${fmtUsd(comUsdOf(c) * (a.usd / (c.usd || 1)))}` : ""}{c.persona ? ` · ${c.persona}` : ""}{c.referencia ? ` · ref ${c.referencia}` : ""}
           </div>
         </div>
         <button onClick={(e) => { e.stopPropagation(); onDelete(c.id); }} style={{ ...btnGhost, color: T.mut2, fontSize: 18, lineHeight: 1, paddingLeft: 8 }} aria-label="Eliminar">×</button>
