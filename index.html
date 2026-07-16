@@ -155,13 +155,18 @@ async function getSB() {
 
 /* Colección sincronizada: local (localStorage) o nube (una fila por entidad, con realtime).
    Mantiene la misma API que useState, así el resto de la app no cambia. */
-function useCollection(localKey, table, session, canWrite) {
-  const [items, setItems] = useState([]);
+function useCollection(localKey, table, session, canWrite, refreshTick) {
+  const [items, setItemsRaw] = useState([]);
   const [ready, setReady] = useState(false);
   const prev = useRef([]);
+  const dirty = useRef(false);          // true SOLO cuando el cambio lo hizo el usuario
+  const written = useRef(new Map());    // id -> { s, t }: nuestras escrituras recientes (para ignorar ecos)
   const cloud = CLOUD && !!session;
 
-  /* Carga inicial.
+  // Setter local: únicamente los cambios del usuario disparan guardado.
+  const setItems = (updater) => { dirty.current = true; setItemsRaw(updater); };
+
+  /* Carga inicial y refrescos (refreshTick).
      CRÍTICO: en la nube NUNCA se marca "listo" tras un fallo. Arrancar con una
      lista vacía por un error de red/token llevaría a escrituras que duplican o
      pisan lo que está en el servidor. Se reintenta hasta lograr una lectura buena. */
@@ -173,7 +178,8 @@ function useCollection(localKey, table, session, canWrite) {
         const rows = await loadKey(localKey, []);
         if (!alive) return;
         prev.current = rows;
-        setItems(rows);
+        dirty.current = false;
+        setItemsRaw(rows);
         setReady(true);
         return;
       }
@@ -192,7 +198,8 @@ function useCollection(localKey, table, session, canWrite) {
           }
           if (!alive) return;
           prev.current = rows;
-          setItems(rows);
+          dirty.current = false;
+          setItemsRaw(rows);
           setReady(true);
           return;
         } catch (e) {
@@ -202,22 +209,30 @@ function useCollection(localKey, table, session, canWrite) {
       }
     })();
     return () => { alive = false; };
-  }, [cloud, session && session.user && session.user.id]);
+  }, [cloud, session && session.user && session.user.id, refreshTick]);
 
-  // Realtime: refleja los cambios de otros usuarios (ignora ecos idénticos)
+  // Realtime: cambios de otros usuarios. Se re-suscribe en cada refresco porque
+  // iOS mata los websockets al pasar la app a segundo plano.
   useEffect(() => {
     if (!cloud) return;
     let ch = null, alive = true;
     (async () => {
       const sb = await getSB();
       if (!alive) return;
-      ch = sb.channel("rt_" + table)
+      ch = sb.channel("rt_" + table + "_" + (refreshTick || 0))
         .on("postgres_changes", { event: "*", schema: "public", table }, (p) => {
-          setItems((cur) => {
+          setItemsRaw((cur) => {
             if (p.eventType === "DELETE") return cur.filter((x) => x.id !== (p.old || {}).id);
             const row = { id: (p.new || {}).id, ...((p.new || {}).data || {}) };
+            const w = written.current.get(row.id);
+            if (w && Date.now() - w.t < 15000) {
+              // Fila que NOSOTROS escribimos hace instantes: si es el eco exacto se descarta;
+              // si es un eco viejo (ya hicimos otra edición encima), también. Nuestra versión manda.
+              if (w.s === stableStr(row)) written.current.delete(row.id);
+              return cur;
+            }
             const i = cur.findIndex((x) => x.id === row.id);
-            if (i >= 0 && stableStr(cur[i]) === stableStr(row)) return cur; // eco de nuestra propia escritura
+            if (i >= 0 && stableStr(cur[i]) === stableStr(row)) return cur;
             if (i < 0) return [row, ...cur];
             const c = cur.slice(); c[i] = row; return c;
           });
@@ -225,35 +240,44 @@ function useCollection(localKey, table, session, canWrite) {
         .subscribe();
     })();
     return () => { alive = false; if (ch) ch.unsubscribe(); };
-  }, [cloud, table]);
+  }, [cloud, table, refreshTick]);
 
-  // Persistencia por diferencia: solo lo que realmente cambió
+  // Persistencia por diferencia: SOLO cambios locales (dirty), y solo lo que cambió
   useEffect(() => {
     if (!ready) return;
     const before = prev.current;
     prev.current = items;
-    if (before === items) return; // misma referencia: es la carga inicial
+    if (!dirty.current) return; // carga inicial, refresco o realtime: nada que guardar
+    dirty.current = false;
     if (!cloud) { saveKey(localKey, items); return; }
     if (!canWrite) return;
+
+    const byId = {};
+    before.forEach((x) => { byId[x.id] = x; });
+    const noId = items.filter((x) => x.id == null).length;
+    if (noId) console.warn(table + ": " + noId + " elemento(s) sin id no se sincronizan");
+    const ups = items
+      .filter((x) => x.id != null)
+      .filter((x) => { const p = byId[x.id]; return !p || stableStr(p) !== stableStr(x); })
+      .map((x) => { const { id, ...data } = x; return { id, data, updated_at: new Date().toISOString() }; });
+    // Dedupe defensivo: si dos elementos comparten id, sube solo el último
+    const seenUp = new Set();
+    for (let i = ups.length - 1; i >= 0; i--) {
+      if (seenUp.has(ups[i].id)) ups.splice(i, 1);
+      else seenUp.add(ups[i].id);
+    }
+    const ids = new Set(items.map((x) => x.id));
+    const dels = Array.from(new Set(before.filter((x) => x.id != null && !ids.has(x.id)).map((x) => x.id)));
+    if (!ups.length && !dels.length) return;
+
+    // Registrar lo que vamos a escribir ANTES de enviarlo (el eco puede volver muy rápido)
+    const now = Date.now();
+    ups.forEach((u) => written.current.set(u.id, { s: stableStr({ id: u.id, ...u.data }), t: now }));
+    written.current.forEach((v, k) => { if (now - v.t > 60000) written.current.delete(k); });
+
     (async () => {
       try {
         const sb = await getSB();
-        const byId = {};
-        before.forEach((x) => { byId[x.id] = x; });
-        const noId = items.filter((x) => x.id == null).length;
-        if (noId) console.warn(table + ": " + noId + " elemento(s) sin id no se sincronizan");
-        const ups = items
-          .filter((x) => x.id != null)
-          .filter((x) => { const p = byId[x.id]; return !p || stableStr(p) !== stableStr(x); })
-          .map((x) => { const { id, ...data } = x; return { id, data, updated_at: new Date().toISOString() }; });
-        // Dedupe defensivo: si dos elementos comparten id, sube solo el último
-        const seenUp = new Set();
-        for (let i = ups.length - 1; i >= 0; i--) {
-          if (seenUp.has(ups[i].id)) ups.splice(i, 1);
-          else seenUp.add(ups[i].id);
-        }
-        const ids = new Set(items.map((x) => x.id));
-        const dels = Array.from(new Set(before.filter((x) => x.id != null && !ids.has(x.id)).map((x) => x.id)));
         const BATCH = 100;
         for (let i = 0; i < ups.length; i += BATCH) {
           const { error } = await sb.from(table).upsert(ups.slice(i, i + BATCH));
@@ -274,11 +298,15 @@ function useCollection(localKey, table, session, canWrite) {
 }
 
 /* Ajustes: una sola fila compartida (id = 'global') */
-function useSettings(session, canWrite, defaults) {
-  const [settings, setSettings] = useState(defaults);
+function useSettings(session, canWrite, defaults, refreshTick) {
+  const [settings, setSettingsRaw] = useState(defaults);
   const [ready, setReady] = useState(false);
   const prev = useRef(defaults);
+  const dirty = useRef(false);
+  const written = useRef(null); // { s, t } de nuestra última escritura
   const cloud = CLOUD && !!session;
+
+  const setSettings = (updater) => { dirty.current = true; setSettingsRaw(updater); };
 
   useEffect(() => {
     let alive = true;
@@ -288,7 +316,8 @@ function useSettings(session, canWrite, defaults) {
         const val = await loadKey("fin:settings", defaults);
         if (!alive) return;
         prev.current = val;
-        setSettings(val);
+        dirty.current = false;
+        setSettingsRaw(val);
         setReady(true);
         return;
       }
@@ -302,7 +331,8 @@ function useSettings(session, canWrite, defaults) {
           if (!alive) return;
           const val = data && data.data ? { ...defaults, ...data.data } : defaults;
           prev.current = val;
-          setSettings(val);
+          dirty.current = false;
+          setSettingsRaw(val);
           setReady(true);
           return;
         } catch (e) {
@@ -312,7 +342,7 @@ function useSettings(session, canWrite, defaults) {
       }
     })();
     return () => { alive = false; };
-  }, [cloud, session && session.user && session.user.id]);
+  }, [cloud, session && session.user && session.user.id, refreshTick]);
 
   useEffect(() => {
     if (!cloud) return;
@@ -320,31 +350,40 @@ function useSettings(session, canWrite, defaults) {
     (async () => {
       const sb = await getSB();
       if (!alive) return;
-      ch = sb.channel("rt_settings")
+      ch = sb.channel("rt_settings_" + (refreshTick || 0))
         .on("postgres_changes", { event: "*", schema: "public", table: "settings" }, (p) => {
           if ((p.new || {}).id !== "global") return;
-          setSettings((cur) => {
-            const next = { ...cur, ...((p.new || {}).data || {}) };
+          setSettingsRaw((cur) => {
+            const incoming = (p.new || {}).data || {};
+            const w = written.current;
+            if (w && Date.now() - w.t < 15000) {
+              if (w.s === stableStr(incoming)) written.current = null;
+              return cur; // eco (exacto o viejo) de nuestra propia escritura
+            }
+            const next = { ...cur, ...incoming };
             return stableStr(next) === stableStr(cur) ? cur : next;
           });
         })
         .subscribe();
     })();
     return () => { alive = false; if (ch) ch.unsubscribe(); };
-  }, [cloud]);
+  }, [cloud, refreshTick]);
 
   useEffect(() => {
     if (!ready) return;
     const before = prev.current;
     prev.current = settings;
-    if (before === settings) return;
+    if (!dirty.current) return;
+    dirty.current = false;
     if (!cloud) { saveKey("fin:settings", settings); return; }
     if (!canWrite) return;
     if (stableStr(before) === stableStr(settings)) return;
+    written.current = { s: stableStr(settings), t: Date.now() };
     (async () => {
       try {
         const sb = await getSB();
-        await sb.from("settings").upsert([{ id: "global", data: settings, updated_at: new Date().toISOString() }]);
+        const { error } = await sb.from("settings").upsert([{ id: "global", data: settings, updated_at: new Date().toISOString() }]);
+        if (error) throw error;
       } catch (e) {
         console.error("save settings", e);
         notifySyncError("No se pudieron guardar los ajustes en la nube: " + ((e && e.message) || "error"));
@@ -701,6 +740,39 @@ function fileToStored(file) {
     }
   });
 }
+
+/* ── Comprobantes compartidos: caché local (IndexedDB) + Supabase Storage ──
+   En modo nube, el archivo se sube a Storage y cualquier dispositivo puede verlo.
+   En modo local funciona igual que antes (solo IndexedDB). */
+async function receiptPut(id, stored) {
+  try { await idbPut(id, stored); } catch (e) { /* caché local opcional */ }
+  if (!CLOUD) return;
+  const sb = await getSB();
+  const blob = new Blob([JSON.stringify(stored)], { type: "application/json" });
+  const { error } = await sb.storage.from("receipts").upload(id + ".json", blob, { upsert: true, contentType: "application/json" });
+  if (error) {
+    notifySyncError("El comprobante quedó guardado solo en este dispositivo (no se pudo subir a la nube): " + (error.message || "error"));
+    throw error;
+  }
+}
+async function receiptGet(id) {
+  const local = await idbGet(id).catch(() => null);
+  if (local) return local;
+  if (!CLOUD) return null;
+  try {
+    const sb = await getSB();
+    const { data, error } = await sb.storage.from("receipts").download(id + ".json");
+    if (error || !data) return null;
+    const stored = JSON.parse(await data.text());
+    idbPut(id, stored).catch(() => {});
+    return stored;
+  } catch (e) { return null; }
+}
+async function receiptDel(id) {
+  try { await idbDel(id); } catch (e) { /* no-op */ }
+  if (!CLOUD) return;
+  try { const sb = await getSB(); await sb.storage.from("receipts").remove([id + ".json"]); } catch (e) { /* no-op */ }
+}
 function relTime(ts) {
   if (!ts) return "—";
   const s = Math.round((Date.now() - ts) / 1000);
@@ -859,10 +931,24 @@ function AppMain({ session, role, signOut }) {
     window.addEventListener("sync-error", h);
     return () => window.removeEventListener("sync-error", h);
   }, []);
+
+  // Refresco de datos: manual (botón) y automático al volver la app al frente
+  // (iOS corta los websockets en segundo plano y se pierden actualizaciones).
+  const [refreshTick, setRefreshTick] = useState(0);
+  useEffect(() => {
+    if (!CLOUD) return;
+    let hiddenAt = 0;
+    const onVis = () => {
+      if (document.visibilityState === "hidden") { hiddenAt = Date.now(); return; }
+      if (hiddenAt && Date.now() - hiddenAt > 15000) setRefreshTick((t) => t + 1);
+    };
+    document.addEventListener("visibilitychange", onVis);
+    return () => document.removeEventListener("visibilitychange", onVis);
+  }, []);
   const [tab, setTab] = useState("balance");
-  const [accounts, setAccounts, rAcc] = useCollection("fin:accounts", TABLES.accounts, session, canEditAll);
-  const [txns, setTxns, rTxn] = useCollection("fin:txns", TABLES.txns, session, canWriteData);
-  const [settings, setSettings, rSet] = useSettings(session, canEditAll, { currency: "usd", theme: "dark", layout: "auto" });
+  const [accounts, setAccounts, rAcc] = useCollection("fin:accounts", TABLES.accounts, session, canEditAll, refreshTick);
+  const [txns, setTxns, rTxn] = useCollection("fin:txns", TABLES.txns, session, canWriteData, refreshTick);
+  const [settings, setSettings, rSet] = useSettings(session, canEditAll, { currency: "usd", theme: "dark", layout: "auto" }, refreshTick);
 
   const [prices, setPrices] = useState({});
   const [priceStatus, setPriceStatus] = useState("loading"); // loading | live | error
@@ -873,8 +959,8 @@ function AppMain({ session, role, signOut }) {
   const [acctSheet, setAcctSheet] = useState(null); // {mode,'bank'|'cash'} | account
   const [txnSheet, setTxnSheet] = useState(false);
   const [cryptoSheet, setCryptoSheet] = useState(false);
-  const [divisas, setDivisas, rDiv] = useCollection("fin:divisas", TABLES.divisas, session, canWriteData);
-  const [projectsMeta, setProjectsMeta, rPrj] = useCollection("fin:projectsMeta", TABLES.projectsMeta, session, canEditAll);
+  const [divisas, setDivisas, rDiv] = useCollection("fin:divisas", TABLES.divisas, session, canWriteData, refreshTick);
+  const [projectsMeta, setProjectsMeta, rPrj] = useCollection("fin:projectsMeta", TABLES.projectsMeta, session, canEditAll, refreshTick);
   const [txnView, setTxnView] = useState("mov");
   const [divView, setDivView] = useState("ops");
   const [projectSheet, setProjectSheet] = useState(null);
@@ -1140,7 +1226,7 @@ function AppMain({ session, role, signOut }) {
   }
   function deleteDivisa(id) {
     setDivisas((prev) => prev.filter((d) => d.id !== id));
-    idbDel(id);
+    receiptDel(id);
     setDivisaSheet(null);
   }
   function patchDivisa(id, patch) {
@@ -1261,7 +1347,20 @@ function AppMain({ session, role, signOut }) {
               Patrimonio
             </div>
           )}
-          <StatusDot status={priceStatus} lastUpdate={lastUpdate} source={source} />
+          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            <StatusDot status={priceStatus} lastUpdate={lastUpdate} source={source} />
+            {CLOUD && session && (
+              <button
+                onClick={() => setRefreshTick((t) => t + 1)}
+                disabled={!loaded}
+                aria-label="Actualizar datos"
+                title="Actualizar datos"
+                style={{ background: "transparent", border: `1px solid ${T.line}`, borderRadius: 8, color: loaded ? T.mut : T.mut2, width: 26, height: 26, display: "inline-flex", alignItems: "center", justifyContent: "center", cursor: loaded ? "pointer" : "default", padding: 0 }}
+              >
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36" /><path d="M21 3v6h-6" /></svg>
+              </button>
+            )}
+          </div>
         </div>
         <select
           value={cur}
@@ -3242,13 +3341,13 @@ function CxCTab({ divisas, canWrite = true, onAddAbono, onDeleteAbono, onPatch }
     e.target.value = "";
     if (!f) return;
     setBusyId(op.id); setErr("");
-    try { const stored = await fileToStored(f); await idbPut(op.id, stored); onPatch(op.id, { hasReceipt: true }); }
+    try { const stored = await fileToStored(f); await receiptPut(op.id, stored); onPatch(op.id, { hasReceipt: true }); }
     catch (ex) { setErr((ex && ex.message) || "No se pudo guardar el comprobante."); }
     finally { setBusyId(null); }
   }
   async function openReceipt(op) {
     setErr("");
-    try { const stored = await idbGet(op.id); if (stored) setViewer({ stored }); else setErr("No se encontró el comprobante en este dispositivo."); }
+    try { const stored = await receiptGet(op.id); if (stored) setViewer({ stored }); else setErr("No se encontró el comprobante en este dispositivo."); }
     catch (ex) { setErr("No se pudo abrir el comprobante."); }
   }
 
@@ -3460,16 +3559,16 @@ function DivisasTab({ divisas, onAdd, onEdit, onDelete, onPatch, canWrite = true
     e.target.value = "";
     if (!f) return;
     setBusyId(op.id); setReceiptErr("");
-    try { const stored = await fileToStored(f); await idbPut(op.id, stored); onPatch(op.id, { hasReceipt: true }); }
+    try { const stored = await fileToStored(f); await receiptPut(op.id, stored); onPatch(op.id, { hasReceipt: true }); }
     catch (ex) { setReceiptErr((ex && ex.message) || "No se pudo guardar el comprobante."); }
     finally { setBusyId(null); }
   }
   async function openReceipt(op) {
     setReceiptErr("");
-    try { const stored = await idbGet(op.id); if (stored) setViewer({ op, stored }); else setReceiptErr("No se encontró el comprobante."); }
+    try { const stored = await receiptGet(op.id); if (stored) setViewer({ op, stored }); else setReceiptErr("No se encontró el comprobante."); }
     catch { setReceiptErr("No se pudo abrir el comprobante."); }
   }
-  async function removeReceipt(op) { await idbDel(op.id); onPatch(op.id, { hasReceipt: false }); }
+  async function removeReceipt(op) { await receiptDel(op.id); onPatch(op.id, { hasReceipt: false }); }
 
   const [pagoMonto, setPagoMonto] = useState("");
   const [pagoFecha, setPagoFecha] = useState(todayISO());
@@ -3481,7 +3580,7 @@ function DivisasTab({ divisas, onAdd, onEdit, onDelete, onPatch, canWrite = true
     setPagoMonto(""); setPagoFecha(todayISO());
   }
   function delPagoVenta(v, a) {
-    idbDel(a.id);
+    receiptDel(a.id);
     onPatch(v.id, { abonos: (v.abonos || []).filter((x) => x.id !== a.id) });
   }
   async function onPagoReceiptFile(v, a, e) {
@@ -3491,14 +3590,14 @@ function DivisasTab({ divisas, onAdd, onEdit, onDelete, onPatch, canWrite = true
     setBusyId(a.id); setReceiptErr("");
     try {
       const stored = await fileToStored(f);
-      await idbPut(a.id, stored);
+      await receiptPut(a.id, stored);
       onPatch(v.id, { abonos: (v.abonos || []).map((x) => (x.id === a.id ? { ...x, hasReceipt: true } : x)) });
     } catch (ex) { setReceiptErr((ex && ex.message) || "No se pudo guardar el comprobante."); }
     finally { setBusyId(null); }
   }
   async function openPagoReceipt(a) {
     setReceiptErr("");
-    try { const stored = await idbGet(a.id); if (stored) setViewer({ stored }); else setReceiptErr("No se encontró el comprobante en este dispositivo."); }
+    try { const stored = await receiptGet(a.id); if (stored) setViewer({ stored }); else setReceiptErr("No se encontró el comprobante en este dispositivo."); }
     catch (ex) { setReceiptErr("No se pudo abrir el comprobante."); }
   }
 
