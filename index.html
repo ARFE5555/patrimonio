@@ -946,7 +946,9 @@ function AppMain({ session, role, signOut }) {
     return () => document.removeEventListener("visibilitychange", onVis);
   }, []);
   const [tab, setTab] = useState("balance");
-  const [accounts, setAccounts, rAcc] = useCollection("fin:accounts", TABLES.accounts, session, canEditAll, refreshTick);
+  // canWriteData (no canEditAll): el rol "Carga de datos" ajusta SALDOS al registrar
+  // movimientos; el servidor (RLS) le permite update/insert pero no delete de cuentas.
+  const [accounts, setAccounts, rAcc] = useCollection("fin:accounts", TABLES.accounts, session, canWriteData, refreshTick);
   const [txns, setTxns, rTxn] = useCollection("fin:txns", TABLES.txns, session, canWriteData, refreshTick);
   const [settings, setSettings, rSet] = useSettings(session, canEditAll, { currency: "usd", theme: "dark", layout: "auto" }, refreshTick);
 
