@@ -1085,9 +1085,28 @@ function AppMain({ session, role, signOut }) {
     [txns]
   );
 
+  // Saldo DERIVADO: el saldo de cada cuenta fiat se calcula desde sus movimientos
+  // (saldo inicial de la cuenta + suma de sus movimientos). De esta forma el saldo
+  // mostrado NUNCA se desincroniza de los movimientos, que son la fuente de verdad.
+  const acctBalance = useMemo(() => {
+    const m = {};
+    accounts.forEach((a) => { if (a.type !== "crypto") m[a.id] = a.opening || 0; });
+    txns.forEach((t) => {
+      if (m[t.accountId] == null) return;
+      m[t.accountId] += (t.kind === "income" ? (t.amount || 0) : -(t.amount || 0)) - (t.commission || 0);
+    });
+    return m;
+  }, [accounts, txns]);
+
+  // Cuentas con su saldo ya derivado. Se usa en toda la UI de lectura y reportes.
+  const accountsView = useMemo(
+    () => accounts.map((a) => (a.type === "crypto" ? a : { ...a, balance: acctBalance[a.id] || 0 })),
+    [accounts, acctBalance]
+  );
+
   const totals = useMemo(() => {
     let bank = 0, cash = 0, crypto = 0, sinConvertir = 0;
-    accounts.forEach((a) => {
+    accountsView.forEach((a) => {
       if (a.type === "crypto") {
         const p = prices[a.coinId]?.price ?? a.manualPrice;
         if (p != null) crypto += (a.amount || 0) * (p || 0);
@@ -1099,7 +1118,7 @@ function AppMain({ session, role, signOut }) {
       else if (a.type === "cash") cash += conv;
     });
     return { bank, cash, crypto, sinConvertir, net: bank + cash + crypto };
-  }, [accounts, prices, cur, vesRate]);
+  }, [accountsView, prices, cur, vesRate]);
 
 
   const [winW, setWinW] = useState(typeof window !== "undefined" ? window.innerWidth : 1024);
@@ -1138,19 +1157,8 @@ function AppMain({ session, role, signOut }) {
   /* Acciones movimientos */
   const txnDelta = (t) => (t.kind === "income" ? t.amount : -t.amount) - (t.commission || 0);
   function saveTxn(data) {
-    setAccounts((prev) => {
-      let accs = prev;
-      if (data.id) {
-        const old = txns.find((x) => x.id === data.id);
-        if (old) {
-          const rev = -txnDelta(old);
-          accs = accs.map((a) => (a.id === old.accountId ? { ...a, balance: (a.balance || 0) + rev } : a));
-        }
-      }
-      const d = txnDelta(data);
-      accs = accs.map((a) => (a.id === data.accountId ? { ...a, balance: (a.balance || 0) + d } : a));
-      return accs;
-    });
+    // El saldo de la cuenta se deriva de los movimientos (ver acctBalance/accountsView),
+    // por eso acá sólo se guarda el movimiento. No se toca ningún saldo de cuenta.
     setTxns((prev) => {
       if (data.id) return prev.map((x) => (x.id === data.id ? { ...x, ...data } : x));
       return [{ ...data, id: uid(), createdAt: Date.now() }, ...prev];
@@ -1158,12 +1166,7 @@ function AppMain({ session, role, signOut }) {
     setTxnSheet(false);
   }
   function deleteTxn(t) {
-    const delta = -txnDelta(t);
-    setAccounts((prev) =>
-      prev.map((a) =>
-        a.id === t.accountId ? { ...a, balance: (a.balance || 0) + delta } : a
-      )
-    );
+    // Al borrar el movimiento, el saldo de la cuenta se recalcula solo.
     setTxns((prev) => prev.filter((x) => x.id !== t.id));
     setTxnSheet(false);
   }
@@ -1211,7 +1214,7 @@ function AppMain({ session, role, signOut }) {
       }
     }
     setTxns((prev) => [...newTxns, ...prev.map((t) => (updates[t.id] ? { ...t, ...updates[t.id] } : t))]);
-    setAccounts((prev) => prev.map((a) => (balDelta[a.id] ? { ...a, balance: (a.balance || 0) + balDelta[a.id] } : a)));
+    // No se ajustan saldos: se derivan automáticamente de los movimientos.
     return { updated, added, skipped };
   }
 
@@ -1404,7 +1407,7 @@ function AppMain({ session, role, signOut }) {
         )}
         {tab === "accounts" && (
           <AccountsTab
-            accounts={accounts}
+            accounts={accountsView}
             prices={prices}
             cur={cur}
             settings={settings}
@@ -1435,7 +1438,7 @@ function AppMain({ session, role, signOut }) {
             {txnView === "mov" ? (
               <TxnsTab
                 txns={txns}
-                accounts={accounts}
+                accounts={accountsView}
                 cur={cur}
                 canWrite={canWriteData}
                 onAdd={() => setTxnSheet(true)}
@@ -1568,7 +1571,7 @@ function AppMain({ session, role, signOut }) {
       />
       <TxnSheet
         state={txnSheet}
-        accounts={accounts}
+        accounts={accountsView}
         cur={cur}
         vesRate={vesRate}
         projects={projects}
@@ -2419,12 +2422,14 @@ function AccountSheet({ state, cur, onClose, onSave, onDelete }) {
   useEffect(() => {
     if (state) {
       setName(state.name || "");
-      setBalance(state.id != null && state.balance != null ? String(state.balance) : "");
+      setBalance(state.id != null && state.opening != null ? String(state.opening) : "");
       setCurrency(state.currency || cur);
     }
   }, [state]);
   if (!state || type === "crypto") return null;
-  const valid = name.trim() && balance !== "" && !isNaN(numVE(balance));
+  // El saldo inicial es opcional: si se deja vacío, se toma 0 y el saldo saldrá
+  // enteramente de los movimientos.
+  const valid = name.trim() && (balance === "" || !isNaN(numVE(balance)));
   return (
     <Sheet open={!!state} onClose={onClose} title={editing ? "Editar cuenta" : `Nueva cuenta · ${TYPE_LABEL[type]}`}>
       <Field label="Nombre">
@@ -2437,10 +2442,14 @@ function AccountSheet({ state, cur, onClose, onSave, onDelete }) {
           ))}
         </select>
       </Field>
-      <Field label={`Saldo actual (${currency.toUpperCase()})`}>
+      <Field label={`Saldo inicial (${currency.toUpperCase()})`}>
         <input style={{ ...inputStyle, fontFamily: MONO }} value={balance} onChange={(e) => setBalance(e.target.value)} inputMode="decimal" placeholder="0.00" />
       </Field>
-      <PrimaryBtn color={ACCENT[type]} disabled={!valid} onClick={() => onSave({ id: state.id, type, name: name.trim(), currency, balance: numVE(balance) })}>
+      <div style={{ fontSize: 12.5, color: T.mut, margin: "-6px 0 14px", lineHeight: 1.5 }}>
+        Normalmente <b>0</b>. Es el saldo con el que arranca la cuenta, antes de sus movimientos.
+        El saldo actual se calcula solo sumando los movimientos.
+      </div>
+      <PrimaryBtn color={ACCENT[type]} disabled={!valid} onClick={() => onSave({ id: state.id, type, name: name.trim(), currency, opening: balance === "" ? 0 : numVE(balance) })}>
         {editing ? "Guardar cambios" : "Crear cuenta"}
       </PrimaryBtn>
       {editing && (
@@ -2951,7 +2960,8 @@ function AjustesTab({ settings, setSettings, accounts, txns, prices, cur, divisa
       const XLSX = await ensureXLSX();
       const CUR = cur.toUpperCase();
       const inRange = (t) => t.date >= from && t.date <= to;
-      const delta = (t) => (t.kind === "income" ? t.amount : -t.amount);
+      // Mismo criterio que el saldo real de la cuenta: la comisión siempre resta.
+      const delta = (t) => (t.kind === "income" ? (t.amount || 0) : -(t.amount || 0)) - (t.commission || 0);
       const round2 = (x) => Math.round((x + Number.EPSILON) * 100) / 100;
 
       const fiat = accounts.filter((a) => a.type === "bank" || a.type === "cash");
@@ -2963,7 +2973,8 @@ function AjustesTab({ settings, setSettings, accounts, txns, prices, cur, divisa
       let tIni = 0, tFin = 0, tIng = 0, tEgr = 0, sinConv = 0;
       const resumen = fiat.map((a) => {
         const aCur = a.currency || cur;
-        const bal = a.balance || 0;
+        // Saldo actual derivado: saldo inicial de la cuenta + suma de TODOS sus movimientos.
+        const bal = (a.opening || 0) + txns.filter((t) => t.accountId === a.id).reduce((s, t) => s + delta(t), 0);
         const after = txns.filter((t) => t.accountId === a.id && t.date > to).reduce((s, t) => s + delta(t), 0);
         const fromOn = txns.filter((t) => t.accountId === a.id && t.date >= from).reduce((s, t) => s + delta(t), 0);
         const fin = bal - after;
