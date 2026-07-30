@@ -1,4 +1,4 @@
-const CACHE = "patrimonio-v3";
+const CACHE = "patrimonio-v4";
 
 self.addEventListener("install", () => self.skipWaiting());
 

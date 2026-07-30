@@ -33,7 +33,7 @@ const { useState, useEffect, useRef, useMemo } = React;
 
 /* Versión de compilación. Sirve para confirmar de un vistazo qué build está
    corriendo en pantalla (útil para detectar caché vieja de la PWA). */
-const BUILD = "v3 · saldos derivados · 2026-07-17";
+const BUILD = "v4 · usuarios + reset · 2026-07-30";
 try { console.log("[Patrimonio] build:", BUILD); } catch (e) {}
 
 /* ─────────────────────────────  Tokens de diseño  ───────────────────────────── */
@@ -127,7 +127,7 @@ const SUPABASE_URL = "https://isrvenwebojpuqvbfffp.supabase.co";
 const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImlzcnZlbndlYm9qcHVxdmJmZmZwIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQwNDkwMDksImV4cCI6MjA5OTYyNTAwOX0.C2453daC4rHnzeKHHWpDqK68qYOJgVAnbPBcrUEtIYI";
 const CLOUD = !!(SUPABASE_URL && SUPABASE_ANON_KEY);
 
-const ROLE_LABEL = { viewer: "Consulta", loader: "Carga de datos", editor: "Editor (todo)" };
+const ROLE_LABEL = { none: "Sin acceso", viewer: "Consulta", loader: "Carga de datos", editor: "Editor (todo)" };
 const TABLES = { accounts: "accounts", txns: "txns", divisas: "divisas", projectsMeta: "projects" };
 
 // Comparación estable (ignora el orden de las claves y los undefined)
@@ -1618,6 +1618,7 @@ function App() {
   const [role, setRole] = useState(null);
   const [checking, setChecking] = useState(CLOUD);
   const [authErr, setAuthErr] = useState("");
+  const [recovery, setRecovery] = useState(false);
 
   useEffect(() => {
     if (!CLOUD) return;
@@ -1629,7 +1630,12 @@ function App() {
         if (!alive) return;
         setSession(data.session || null);
         setChecking(false);
-        sub = sb.auth.onAuthStateChange((_e, s) => { setSession(s || null); }).data.subscription;
+        sub = sb.auth.onAuthStateChange((ev, s) => {
+          setSession(s || null);
+          // Cuando la persona abre el enlace de restablecimiento del email,
+          // Supabase dispara este evento con una sesión temporal de recuperación.
+          if (ev === "PASSWORD_RECOVERY") setRecovery(true);
+        }).data.subscription;
       } catch (e) {
         if (alive) { setAuthErr(e.message || "No se pudo conectar."); setChecking(false); }
       }
@@ -1657,9 +1663,11 @@ function App() {
 
   if (!CLOUD) return <AppMain session={null} role={null} signOut={null} />;
   if (checking) return <Splash msg="Conectando…" />;
+  if (recovery) return <ResetPasswordScreen onDone={() => setRecovery(false)} />;
   if (authErr) return <Splash msg={authErr} />;
   if (!session) return <LoginScreen onDone={setSession} />;
   if (!role) return <Splash msg="Cargando permisos…" />;
+  if (role === "none") return <RevokedScreen email={session.user.email} signOut={signOut} />;
   return <AppMain session={session} role={role} signOut={signOut} />;
 }
 
@@ -1668,6 +1676,73 @@ function Splash({ msg }) {
     <div style={{ ...shell, alignItems: "center", justifyContent: "center" }}>
       <style>{css}</style>
       <div style={{ color: T.mut, fontFamily: FONT, padding: 24, textAlign: "center" }}>{msg}</div>
+    </div>
+  );
+}
+
+/* Pantalla para fijar una contraseña nueva tras abrir el enlace del email. */
+function ResetPasswordScreen({ onDone }) {
+  const [pass, setPass] = useState("");
+  const [pass2, setPass2] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState("");
+  const [ok, setOk] = useState(false);
+
+  async function save() {
+    if (pass.length < 6) { setMsg("La contraseña debe tener al menos 6 caracteres."); return; }
+    if (pass !== pass2) { setMsg("Las contraseñas no coinciden."); return; }
+    setBusy(true); setMsg("");
+    try {
+      const sb = await getSB();
+      const { error } = await sb.auth.updateUser({ password: pass });
+      if (error) throw error;
+      setOk(true);
+      setMsg("Contraseña actualizada. Ya podés entrar a la app.");
+    } catch (e) {
+      setMsg(e.message || "No se pudo actualizar la contraseña. Puede que el enlace haya expirado; pedí uno nuevo.");
+    } finally { setBusy(false); }
+  }
+
+  return (
+    <div style={{ ...shell, justifyContent: "center", padding: "0 24px" }}>
+      <style>{css}</style>
+      <div style={{ marginBottom: 24, textAlign: "center" }}>
+        <div style={{ fontSize: 22, fontWeight: 700, color: T.text, letterSpacing: -0.4 }}>Nueva contraseña</div>
+        <div style={{ fontSize: 13.5, color: T.mut, marginTop: 4 }}>Elegí una contraseña para tu cuenta.</div>
+      </div>
+      {!ok ? (
+        <>
+          <Field label="Nueva contraseña">
+            <input style={inputStyle} value={pass} onChange={(e) => setPass(e.target.value)} type="password" placeholder="••••••••" />
+          </Field>
+          <Field label="Repetir contraseña">
+            <input style={inputStyle} value={pass2} onChange={(e) => setPass2(e.target.value)} type="password" placeholder="••••••••" />
+          </Field>
+          <PrimaryBtn color={T.gold} disabled={busy || pass.length < 6} onClick={save}>
+            {busy ? "…" : "Guardar contraseña"}
+          </PrimaryBtn>
+        </>
+      ) : (
+        <PrimaryBtn color={T.gold} onClick={onDone}>Continuar</PrimaryBtn>
+      )}
+      {msg && <div style={{ fontSize: 13, color: ok ? T.green : T.mut, marginTop: 14, textAlign: "center", lineHeight: 1.5 }}>{msg}</div>}
+    </div>
+  );
+}
+
+/* Pantalla que ve una persona cuyo acceso fue revocado (rol "Sin acceso"). */
+function RevokedScreen({ email, signOut }) {
+  return (
+    <div style={{ ...shell, alignItems: "center", justifyContent: "center", padding: "0 24px" }}>
+      <style>{css}</style>
+      <div style={{ textAlign: "center", maxWidth: 340 }}>
+        <div style={{ width: 56, height: 56, borderRadius: 14, background: T.redSoft, display: "inline-flex", alignItems: "center", justifyContent: "center", marginBottom: 16, fontSize: 26 }}>🔒</div>
+        <div style={{ fontSize: 20, fontWeight: 700, color: T.text }}>Acceso revocado</div>
+        <div style={{ fontSize: 14, color: T.mut, marginTop: 8, lineHeight: 1.55 }}>
+          Tu cuenta{email ? ` (${email})` : ""} no tiene acceso a esta aplicación. Si creés que es un error, pedile a un editor que te reactive.
+        </div>
+        <button onClick={signOut} style={{ ...btnGhost, marginTop: 22, color: T.red }}>Cerrar sesión</button>
+      </div>
     </div>
   );
 }
@@ -1698,6 +1773,20 @@ function LoginScreen({ onDone }) {
     } finally { setBusy(false); }
   }
 
+  async function sendReset() {
+    if (!email.trim()) { setMsg("Escribí tu email arriba y volvé a tocar “¿Olvidaste tu contraseña?”."); return; }
+    setBusy(true); setMsg("");
+    try {
+      const sb = await getSB();
+      const redirectTo = window.location.origin + window.location.pathname;
+      const { error } = await sb.auth.resetPasswordForEmail(email.trim(), { redirectTo });
+      if (error) throw error;
+      setMsg("Te enviamos un email con un enlace para restablecer tu contraseña. Revisá tu bandeja (y la carpeta de spam).");
+    } catch (e) {
+      setMsg(e.message || "No se pudo enviar el email de restablecimiento.");
+    } finally { setBusy(false); }
+  }
+
   return (
     <div style={{ ...shell, justifyContent: "center", padding: "0 24px" }}>
       <style>{css}</style>
@@ -1722,6 +1811,11 @@ function LoginScreen({ onDone }) {
       <button onClick={() => { setMode(mode === "in" ? "up" : "in"); setMsg(""); }} style={{ ...btnGhost, width: "100%", marginTop: 14, color: T.mut }}>
         {mode === "in" ? "No tengo cuenta — registrarme" : "Ya tengo cuenta — iniciar sesión"}
       </button>
+      {mode === "in" && (
+        <button onClick={sendReset} disabled={busy} style={{ ...btnGhost, width: "100%", marginTop: 4, color: T.mut, fontSize: 13 }}>
+          ¿Olvidaste tu contraseña?
+        </button>
+      )}
       {msg && <div style={{ fontSize: 13, color: T.mut, marginTop: 14, textAlign: "center", lineHeight: 1.5 }}>{msg}</div>}
       <div style={{ fontSize: 11.5, color: T.mut2, marginTop: 26, textAlign: "center", lineHeight: 1.6 }}>
         Las cuentas nuevas entran como <b>Consulta</b>. Un editor puede cambiar tu rol desde Ajustes.
@@ -1756,6 +1850,23 @@ function UsersPanel({ session, role, signOut }) {
     finally { setBusy(false); }
   }
 
+  async function sendReset(email) {
+    setBusy(true); setMsg("");
+    try {
+      const sb = await getSB();
+      const redirectTo = window.location.origin + window.location.pathname;
+      const { error } = await sb.auth.resetPasswordForEmail(email, { redirectTo });
+      if (error) throw error;
+      setMsg("Enlace de restablecimiento enviado a " + email + ". La persona debe abrirlo desde su email.");
+    } catch (e) { setMsg(e.message || "No se pudo enviar el email de restablecimiento."); }
+    finally { setBusy(false); }
+  }
+
+  function expel(u) {
+    if (!window.confirm("¿Expulsar a " + u.email + "?\n\nPerderá el acceso a la app hasta que le asignes un rol de nuevo. (No se borra su cuenta.)")) return;
+    changeRole(u.id, "none");
+  }
+
   return (
     <div>
       <div style={{ ...sectionTitle, marginBottom: 10 }}>Mi cuenta</div>
@@ -1773,7 +1884,7 @@ function UsersPanel({ session, role, signOut }) {
         <>
           <div style={{ ...sectionTitle, margin: "24px 0 10px" }}>Usuarios</div>
           <div style={{ fontSize: 12.5, color: T.mut, marginBottom: 12, lineHeight: 1.5 }}>
-            Consulta: solo ve. Carga de datos: agrega movimientos y divisas. Editor: acceso total.
+            Sin acceso: expulsado, no entra. Consulta: solo ve. Carga de datos: agrega movimientos y divisas. Editor: acceso total.
           </div>
           <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
             {users.map((u) => (
@@ -1787,10 +1898,21 @@ function UsersPanel({ session, role, signOut }) {
                   disabled={busy || u.id === session.user.id}
                   onChange={(e) => changeRole(u.id, e.target.value)}
                 >
+                  <option value="none">{ROLE_LABEL.none}</option>
                   <option value="viewer">{ROLE_LABEL.viewer}</option>
                   <option value="loader">{ROLE_LABEL.loader}</option>
                   <option value="editor">{ROLE_LABEL.editor}</option>
                 </select>
+                {u.id !== session.user.id && (
+                  <div style={{ display: "flex", gap: 8 }}>
+                    <button onClick={() => sendReset(u.email)} disabled={busy} style={{ ...btnGhost, flex: 1, fontSize: 12.5, color: T.mut, textAlign: "center" }}>
+                      Restablecer contraseña
+                    </button>
+                    <button onClick={() => expel(u)} disabled={busy || u.role === "none"} style={{ ...btnGhost, flex: 1, fontSize: 12.5, color: u.role === "none" ? T.mut2 : T.red, textAlign: "center" }}>
+                      {u.role === "none" ? "Expulsado" : "Expulsar"}
+                    </button>
+                  </div>
+                )}
               </div>
             ))}
           </div>
