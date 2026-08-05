@@ -33,7 +33,7 @@ const { useState, useEffect, useRef, useMemo } = React;
 
 /* Versión de compilación. Sirve para confirmar de un vistazo qué build está
    corriendo en pantalla (útil para detectar caché vieja de la PWA). */
-const BUILD = "v4.5 · divisas desde movimientos · 2026-08-03";
+const BUILD = "v4.7 · Banesco, Mercantil empresa y personas · 2026-08-05";
 try { console.log("[Patrimonio] build:", BUILD); } catch (e) {}
 
 /* ─────────────────────────────  Tokens de diseño  ───────────────────────────── */
@@ -1733,6 +1733,7 @@ function AppMain({ session, role, signOut }) {
         onClose={() => setStmtSheet(false)}
         onImport={importStatement}
         onCreateAccount={canEditAll ? createAccountInline : undefined}
+        onSetOpening={canEditAll ? ((id, valor) => setAccounts((prev) => prev.map((a) => (a.id === id ? { ...a, opening: valor } : a)))) : undefined}
       />
       <JustifySheet
         state={justifySheet}
@@ -2765,7 +2766,9 @@ function CierreDiarioTab({ txns, accounts, cur, onVerDia }) {
         </div>
         <div style={{ fontSize: 12, color: T.mut2, lineHeight: 1.5 }}>
           {conDato.length === 0
-            ? "Importá un estado de cuenta para poder cuadrar: el saldo del banco sale de ahí."
+            ? (dias.length === 0
+                ? "Importá un estado de cuenta para poder cuadrar: el saldo del banco sale de ahí."
+                : "El estado de cuenta de este banco no trae la columna de saldo, así que no se puede cuadrar día por día. El saldo total sí se verifica al importar, contra el saldo final del archivo.")
             : descuadrados.length === 0
               ? "Todos los días con dato del banco cuadran al céntimo."
               : `${descuadrados.length} día(s) con diferencia. Suele ser un movimiento sin cargar.`}
@@ -2858,7 +2861,7 @@ function CierreDiarioTab({ txns, accounts, cur, onVerDia }) {
 }
 
 /* ─────────────────────────────  Importar estado de cuenta  ───────────────────────────── */
-function StatementImportSheet({ open, onClose, accounts, cur, txns, onImport, onCreateAccount }) {
+function StatementImportSheet({ open, onClose, accounts, cur, txns, onImport, onCreateAccount, onSetOpening }) {
   const usable = accounts.filter((a) => a.type === "bank" || a.type === "cash");
   const [creando, setCreando] = useState(false);
   const [nuevoNombre, setNuevoNombre] = useState("");
@@ -2898,6 +2901,10 @@ function StatementImportSheet({ open, onClose, accounts, cur, txns, onImport, on
       setMap(layout.map);
       setSignMode(layout.map.credito >= 0 || layout.map.debito >= 0 ? "cols" : "signed");
       setMsg(`Encabezado detectado en la fila ${layout.headerIdx + 1}. Revisá el mapeo antes de importar.`);
+      // Si el archivo trae el saldo de apertura y se está creando la cuenta,
+      // se propone como saldo inicial: es justo el dato que hace falta.
+      const si = detectSaldoInicial(r, layout.headerIdx, layout.map);
+      if (si && !nuevoSaldo) setNuevoSaldo(String(si.saldo).replace(".", ","));
     } else {
       setHeaderIdx(0);
       setMap({ fecha: -1, ref: -1, desc: -1, credito: -1, debito: -1, monto: -1, saldo: -1 });
@@ -2913,11 +2920,14 @@ function StatementImportSheet({ open, onClose, accounts, cur, txns, onImport, on
     setBusy(true); setErr(""); setMsg("Leyendo archivo…"); setDone(null);
     try {
       const buf = await f.arrayBuffer();
-      const texto = decodeText(buf);
+      // Solo se decodifica el arranque para saber de qué tipo es el archivo:
+      // convertir un xlsx grande entero a texto sería tirar trabajo a la basura.
+      const cabecera = decodeText(buf.slice(0, 1024));
 
       // Banesco (y otros bancos) entregan el estado de cuenta como una tabla
       // HTML con extensión .xls. Se detecta por el contenido, no por el nombre.
-      if (looksLikeHtml(texto)) {
+      if (looksLikeHtml(cabecera)) {
+        const texto = decodeText(buf);
         const r = htmlTableToRows(texto);
         if (!r.length) throw new Error("El archivo es una página web pero no trae ninguna tabla.");
         setWbRef(null);
@@ -3001,6 +3011,29 @@ function StatementImportSheet({ open, onClose, accounts, cur, txns, onImport, on
     return { archivo: f(ops), nuevas: f(analysis.nuevas) };
   }, [ops, analysis.nuevas]);
 
+  // Saldos de apertura y cierre que trae el propio archivo (Mercantil los
+  // incluye como líneas; Banesco no trae ninguno)
+  const saldoIni = useMemo(
+    () => (rows && map ? detectSaldoInicial(rows, headerIdx, map) : null),
+    [rows, map, headerIdx]
+  );
+  const saldoFin = useMemo(
+    () => (rows && map ? detectSaldoFinal(rows, headerIdx, map) : null),
+    [rows, map, headerIdx]
+  );
+
+  // Cuántas líneas se descartaron por ser saldo o subtotal, para que quede claro
+  // que no se perdió nada por error
+  const lineasDeSaldo = useMemo(() => {
+    if (!rows || !map || map.desc < 0) return 0;
+    let n = 0;
+    for (let i = headerIdx + 1; i < rows.length; i++) {
+      const r = rows[i];
+      if (r && esLineaDeSaldo(r[map.desc])) n++;
+    }
+    return n;
+  }, [rows, map, headerIdx]);
+
   function setCol(field, value) {
     setMap((m) => ({ ...m, [field]: value }));
   }
@@ -3008,7 +3041,18 @@ function StatementImportSheet({ open, onClose, accounts, cur, txns, onImport, on
   function doImport() {
     if (!accountId || analysis.nuevas.length === 0) return;
     const res = onImport(accountId, analysis.nuevas, { fileName });
-    setDone(res);
+
+    /* Comprobación contra el saldo de cierre del archivo. Es la única forma de
+       validar bancos que no traen columna de saldo corrido: si el resultado no
+       coincide, falta cargar algo (casi siempre el saldo inicial de la cuenta). */
+    const delta = (t) => (t.kind === "income" ? (t.amount || 0) : -(t.amount || 0)) - (t.commission || 0);
+    const previos = (txns || []).filter((t) => t.accountId === accountId).reduce((s, t) => s + delta(t), 0);
+    const entrantes = analysis.nuevas.reduce((s, o) => s + delta(o), 0);
+    setDone({
+      ...res,
+      saldoResultante: ((acct && acct.opening) || 0) + previos + entrantes,
+      saldoBanco: saldoFin ? saldoFin.saldo : null,
+    });
     setMsg("");
   }
 
@@ -3038,11 +3082,11 @@ function StatementImportSheet({ open, onClose, accounts, cur, txns, onImport, on
   /* Selector de cuenta destino. Se muestra dos veces: al principio y otra vez
      justo antes de importar, para que nunca se cargue un estado de cuenta en la
      cuenta equivocada por descuido. */
-  const selectorCuenta = (label) => (
+  const selectorCuenta = (label, permitirCrear) => (
     <Field label={label}>
       <select
         style={selStyle}
-        value={creando ? "__new" : accountId}
+        value={creando && permitirCrear ? "__new" : accountId}
         onChange={(e) => {
           if (e.target.value === "__new") { setCreando(true); return; }
           setCreando(false); setAccountId(e.target.value);
@@ -3052,7 +3096,9 @@ function StatementImportSheet({ open, onClose, accounts, cur, txns, onImport, on
         {usable.map((a) => (
           <option key={a.id} value={a.id}>{a.name} · {(a.currency || cur).toUpperCase()}</option>
         ))}
-        {onCreateAccount && <option value="__new">+ Crear cuenta nueva…</option>}
+        {/* Crear cuenta se ofrece solo arriba: el formulario vive ahí y
+            duplicarlo dejaba dos veces los mismos campos en pantalla. */}
+        {onCreateAccount && permitirCrear && <option value="__new">+ Crear cuenta nueva…</option>}
       </select>
     </Field>
   );
@@ -3106,6 +3152,34 @@ function StatementImportSheet({ open, onClose, accounts, cur, txns, onImport, on
               Quedaron marcados como <b>por justificar</b>: asignales el motivo desde la lista de movimientos.
             </div>
           </div>
+
+          {done.saldoBanco != null && (() => {
+            const dif = (done.saldoResultante || 0) - done.saldoBanco;
+            const cuadra = Math.abs(dif) <= 0.01;
+            return (
+              <div style={{ background: cuadra ? T.bg2 : T.redSoft, border: `1px solid ${cuadra ? T.lineSoft : T.red}`, borderRadius: 14, padding: "14px 15px", marginBottom: 14 }}>
+                <div style={{ fontSize: 13, fontWeight: 600, color: cuadra ? T.green : T.red, marginBottom: 8 }}>
+                  {cuadra ? "La cuenta cierra igual que el banco" : "La cuenta no cierra igual que el banco"}
+                </div>
+                <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5, color: T.mut }}>
+                  <span>Saldo de la cuenta</span>
+                  <span style={{ fontFamily: MONO, color: T.text }}>{money(done.saldoResultante, acctCur)}</span>
+                </div>
+                <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5, color: T.mut }}>
+                  <span>Saldo final del archivo</span>
+                  <span style={{ fontFamily: MONO, color: T.text }}>{money(done.saldoBanco, acctCur)}</span>
+                </div>
+                {!cuadra && (
+                  <div style={{ fontSize: 12, color: T.red, lineHeight: 1.5, marginTop: 8 }}>
+                    Diferencia de {money(Math.abs(dif), acctCur)}. Si es la primera carga, casi
+                    siempre falta poner el saldo inicial de la cuenta
+                    {saldoIni ? ` (el archivo abre con ${money(saldoIni.saldo, acctCur)})` : ""}.
+                  </div>
+                )}
+              </div>
+            );
+          })()}
+
           <PrimaryBtn color={T.gold} onClick={onClose}>Ir a justificarlos</PrimaryBtn>
         </div>
       ) : (
@@ -3117,7 +3191,7 @@ function StatementImportSheet({ open, onClose, accounts, cur, txns, onImport, on
             el mismo archivo.
           </div>
 
-          {selectorCuenta("¿A qué cuenta corresponden estos movimientos?")}
+          {selectorCuenta("¿A qué cuenta corresponden estos movimientos?", true)}
           {formCuentaNueva}
 
           <label style={{ display: "block", background: "transparent", color: T.blue, border: `1px solid ${T.blue}`, borderRadius: 12, padding: "13px", fontSize: 14, fontWeight: 600, fontFamily: FONT, cursor: "pointer", textAlign: "center", marginBottom: 12 }}>
@@ -3205,10 +3279,16 @@ function StatementImportSheet({ open, onClose, accounts, cur, txns, onImport, on
                     {rango.nuevas
                       ? <>Hay novedades desde el <b style={{ color: T.green }}>{fmtDate(rango.nuevas.desde)}</b> ({rango.nuevas.dias} día(s) con movimientos nuevos).</>
                       : <b style={{ color: T.mut2 }}>Todo lo del archivo ya está cargado.</b>}
+                    {saldoFin && (
+                      <><br />Según el archivo, la cuenta cierra en <b style={{ color: T.text }}>{money(saldoFin.saldo, acctCur)}</b>.</>
+                    )}
                   </div>
                 )}
                 <div style={{ fontSize: 12.5, color: T.mut, lineHeight: 1.8 }}>
-                  Líneas leídas del archivo: <b style={{ color: T.text }}>{rawOps.length}</b><br />
+                  Líneas de movimiento en el archivo: <b style={{ color: T.text }}>{rawOps.length}</b><br />
+                  {lineasDeSaldo > 0 && (
+                    <>Líneas de saldo o subtotal ignoradas: <b style={{ color: T.mut2 }}>{lineasDeSaldo}</b><br /></>
+                  )}
                   {comUnidas > 0 && (<>Comisiones unidas a su movimiento: <b style={{ color: T.gold }}>{comUnidas}</b><br /></>)}
                   Movimientos resultantes: <b style={{ color: T.text }}>{ops.length}</b><br />
                   Nuevos a importar: <b style={{ color: T.green }}>{analysis.nuevas.length}</b><br />
@@ -3263,13 +3343,24 @@ function StatementImportSheet({ open, onClose, accounts, cur, txns, onImport, on
                     ? `Se van a cargar ${analysis.nuevas.length} movimiento(s) en:`
                     : "Cuenta destino:"}
                 </div>
-                {selectorCuenta("Cuenta destino")}
-                {formCuentaNueva}
+                {selectorCuenta("Cuenta destino", false)}
                 {acct ? (
-                  <div style={{ fontSize: 12, color: T.mut2, lineHeight: 1.5 }}>
-                    Los montos se guardan en <b style={{ color: T.text }}>{acctCur.toUpperCase()}</b>, la
-                    moneda de esta cuenta. Verificá que sea la del estado de cuenta.
-                  </div>
+                  <>
+                    <div style={{ fontSize: 12, color: T.mut2, lineHeight: 1.5 }}>
+                      Los montos se guardan en <b style={{ color: T.text }}>{acctCur.toUpperCase()}</b>, la
+                      moneda de esta cuenta. Verificá que sea la del estado de cuenta.
+                    </div>
+                    {saldoIni && onSetOpening && Math.abs((acct.opening || 0) - saldoIni.saldo) > 0.01 && (
+                      <button
+                        onClick={() => onSetOpening(acct.id, saldoIni.saldo)}
+                        style={{ width: "100%", marginTop: 10, background: "transparent", color: T.blue, border: `1px solid ${T.blue}`, borderRadius: 11, padding: "10px", fontSize: 12.5, fontWeight: 600, fontFamily: FONT, cursor: "pointer", lineHeight: 1.4 }}
+                      >
+                        El archivo abre con {money(saldoIni.saldo, acctCur)}
+                        {saldoIni.date ? ` al ${fmtDate(saldoIni.date)}` : ""}.<br />
+                        Usarlo como saldo inicial de la cuenta
+                      </button>
+                    )}
+                  </>
                 ) : (
                   <div style={{ fontSize: 12.5, color: T.red, lineHeight: 1.5 }}>
                     Elegí una cuenta antes de importar.
@@ -5377,6 +5468,54 @@ function stmtNorm(s) {
   return String(s == null ? "" : s).toLowerCase().trim();
 }
 
+/* Líneas que el banco incluye en la tabla pero que NO son movimientos: el saldo
+   con el que abre el período, el de cierre, subtotales. Mercantil abre con
+   "SALDO INICIAL" y cierra con "SALDO FINAL"; importarlas sumaría dos veces el
+   saldo y el cuadre nunca daría. */
+const STMT_NO_MOVIMIENTO = [
+  /^saldo\s+(inicial|anterior|final|actual|disponible|al\b)/,
+  /^saldo$/,
+  /^totales?$/,
+  /^total\s+(general|del|de)\b/,
+  /^sub\s*total/,
+];
+function esLineaDeSaldo(desc) {
+  const d = stmtNorm(desc).replace(/\s+/g, " ");
+  if (!d) return false;
+  return STMT_NO_MOVIMIENTO.some((re) => re.test(d));
+}
+
+/* Saldo con el que abre el estado de cuenta, si el banco lo trae como línea.
+   Sirve para proponerlo como saldo inicial de la cuenta: sin ese número, el
+   cuadre diario compara contra un saldo corrido que arranca en cero. */
+function detectSaldoInicial(rows, headerIdx, map) {
+  return buscarLineaDeSaldo(rows, headerIdx, map, /^saldo\s+(inicial|anterior)/);
+}
+
+/* Saldo de cierre del período, si el banco lo trae como línea. Sirve para
+   comprobar después de importar que la cuenta quedó donde el banco dice. */
+function detectSaldoFinal(rows, headerIdx, map) {
+  return buscarLineaDeSaldo(rows, headerIdx, map, /^saldo\s+(final|actual)/);
+}
+
+function buscarLineaDeSaldo(rows, headerIdx, map, patron) {
+  if (!rows || !map || map.desc < 0) return null;
+  for (let i = headerIdx + 1; i < rows.length; i++) {
+    const row = rows[i];
+    if (!row) continue;
+    const desc = stmtNorm(row[map.desc]).replace(/\s+/g, " ");
+    if (!patron.test(desc)) continue;
+    const candidatos = [map.saldo, map.credito, map.monto, map.debito];
+    for (const idx of candidatos) {
+      if (idx < 0) continue;
+      const v = numVE(row[idx]);
+      if (!isNaN(v)) return { saldo: v, date: stmtDate(map.fecha >= 0 ? row[map.fecha] : "") || "" };
+    }
+    return null;
+  }
+  return null;
+}
+
 /* Fecha de estado de cuenta. Devuelve "" si la celda no es una fecha de verdad,
    para que los pies de página ("TOTALES", "SALDO ANTERIOR") no entren como
    movimientos. También entiende el número serial de Excel. */
@@ -5496,6 +5635,8 @@ function rowsToStatementOps(rows, headerIdx, map, signMode) {
     if (!date) continue;
     const ref = String(at(map.ref) == null ? "" : at(map.ref)).trim();
     const desc = String(at(map.desc) == null ? "" : at(map.desc)).trim();
+    // "SALDO INICIAL", "SALDO FINAL" y subtotales no son movimientos
+    if (esLineaDeSaldo(desc)) continue;
 
     let amount = NaN;
     let kind = null;
@@ -5527,6 +5668,15 @@ function rowsToStatementOps(rows, headerIdx, map, signMode) {
       rowNum: i + 1,
       bankBalance: isNaN(bankBalance) ? undefined : bankBalance,
     });
+  }
+
+  /* Hay bancos que listan del movimiento más nuevo al más viejo (Mercantil
+     personas lo hace). Se normaliza a orden cronológico y se renumeran las
+     filas, porque el número de fila se usa para saber cuál es la última línea
+     de un día —el saldo que vale— y para ordenar el cierre diario. */
+  if (out.length > 1 && out[0].date > out[out.length - 1].date) {
+    out.reverse();
+    out.forEach((op, k) => { op.rowNum = k + 1; });
   }
   return out;
 }
