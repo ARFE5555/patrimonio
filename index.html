@@ -33,7 +33,7 @@ const { useState, useEffect, useRef, useMemo } = React;
 
 /* Versión de compilación. Sirve para confirmar de un vistazo qué build está
    corriendo en pantalla (útil para detectar caché vieja de la PWA). */
-const BUILD = "v4 · usuarios + reset · 2026-07-30";
+const BUILD = "v4.5 · divisas desde movimientos · 2026-08-03";
 try { console.log("[Patrimonio] build:", BUILD); } catch (e) {}
 
 /* ─────────────────────────────  Tokens de diseño  ───────────────────────────── */
@@ -127,7 +127,7 @@ const SUPABASE_URL = "https://isrvenwebojpuqvbfffp.supabase.co";
 const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImlzcnZlbndlYm9qcHVxdmJmZmZwIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQwNDkwMDksImV4cCI6MjA5OTYyNTAwOX0.C2453daC4rHnzeKHHWpDqK68qYOJgVAnbPBcrUEtIYI";
 const CLOUD = !!(SUPABASE_URL && SUPABASE_ANON_KEY);
 
-const ROLE_LABEL = { none: "Sin acceso", viewer: "Consulta", loader: "Carga de datos", editor: "Editor (todo)" };
+const ROLE_LABEL = { viewer: "Consulta", loader: "Carga de datos", editor: "Editor (todo)" };
 const TABLES = { accounts: "accounts", txns: "txns", divisas: "divisas", projectsMeta: "projects" };
 
 // Comparación estable (ignora el orden de las claves y los undefined)
@@ -590,6 +590,11 @@ function fechaISO(s) {
   s = String(s || "").trim();
   let m = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
   if (m) return `${m[1]}-${m[2]}-${m[3]}`;
+  // Año primero con barras o puntos: "2026/07/01" (formato de Banesco).
+  // Antes caía en new Date(), que interpreta la fecha en la zona horaria del
+  // equipo y podía correrla un día en husos al este de Greenwich.
+  m = s.match(/^(\d{4})[\/.](\d{1,2})[\/.](\d{1,2})/);
+  if (m) return `${m[1]}-${m[2].padStart(2, "0")}-${m[3].padStart(2, "0")}`;
   m = s.match(/^(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{2,4})/);
   if (m) {
     let d = m[1].padStart(2, "0"), mo = m[2].padStart(2, "0"), y = m[3];
@@ -969,8 +974,11 @@ function AppMain({ session, role, signOut }) {
   const [divisas, setDivisas, rDiv] = useCollection("fin:divisas", TABLES.divisas, session, canWriteData, refreshTick);
   const [projectsMeta, setProjectsMeta, rPrj] = useCollection("fin:projectsMeta", TABLES.projectsMeta, session, canEditAll, refreshTick);
   const [txnView, setTxnView] = useState("mov");
+  const [diaFijado, setDiaFijado] = useState(""); // día que se vino a mirar desde el cierre diario
   const [divView, setDivView] = useState("ops");
   const [projectSheet, setProjectSheet] = useState(null);
+  const [stmtSheet, setStmtSheet] = useState(false);       // importador de estado de cuenta
+  const [justifySheet, setJustifySheet] = useState(null);  // { list: [txn, …] }
   const [divisaSheet, setDivisaSheet] = useState(null); // null | {kind,mode} | operacion
 
   /* Carga: las colecciones se sincronizan solas (local o nube) */
@@ -1164,15 +1172,23 @@ function AppMain({ session, role, signOut }) {
   function saveTxn(data) {
     // El saldo de la cuenta se deriva de los movimientos (ver acctBalance/accountsView),
     // por eso acá sólo se guarda el movimiento. No se toca ningún saldo de cuenta.
+    // Si se le puso motivo a un movimiento importado, deja de estar "por justificar".
+    const patch = data.motivo && data.motivo.trim() ? { ...data, pending: false } : data;
     setTxns((prev) => {
-      if (data.id) return prev.map((x) => (x.id === data.id ? { ...x, ...data } : x));
-      return [{ ...data, id: uid(), createdAt: Date.now() }, ...prev];
+      if (data.id) return prev.map((x) => (x.id === data.id ? { ...x, ...patch } : x));
+      return [{ ...patch, id: uid(), createdAt: Date.now() }, ...prev];
     });
     setTxnSheet(false);
   }
   function deleteTxn(t) {
     // Al borrar el movimiento, el saldo de la cuenta se recalcula solo.
     setTxns((prev) => prev.filter((x) => x.id !== t.id));
+    // Si el movimiento había generado una operación de divisas, se va con él:
+    // dejarla suelta descuadraría Divisas y Cuentas por Cobrar.
+    if (t && t.divisaId) {
+      setDivisas((prev) => prev.filter((d) => d.id !== t.divisaId));
+      receiptDel(t.divisaId);
+    }
     setTxnSheet(false);
   }
   function bulkImportTxns(rows) {
@@ -1181,7 +1197,8 @@ function AppMain({ session, role, signOut }) {
     const header = rows[0].map(norm);
     const col = (...keys) => header.findIndex((h) => keys.some((k) => h === k || h.includes(k)));
     const iId = col("id"), iFecha = col("fecha"), iTipo = col("tipo"), iMotivo = col("motivo"),
-      iCuenta = col("cuenta"), iMonto = col("monto"), iCom = col("comis"), iProj = col("proyecto");
+      iCuenta = col("cuenta"), iMonto = col("monto"), iCom = col("comis"), iProj = col("proyecto"),
+      iRef = col("referencia");
     if (iFecha < 0 || iMonto < 0 || iCuenta < 0) return { error: "Faltan columnas (Fecha, Cuenta, Monto)." };
     const acctByName = {};
     accounts.forEach((a) => { if (a.type === "bank" || a.type === "cash") acctByName[norm(a.name)] = a; });
@@ -1207,6 +1224,11 @@ function AppMain({ session, role, signOut }) {
         commission, comMode: commission > 0 ? "manual" : "none",
         project: iProj >= 0 && String(row[iProj] || "").trim() ? String(row[iProj]).trim() : undefined,
       };
+      if (data.motivo) data.pending = false;
+      if (iRef >= 0) {
+        const ref = String(row[iRef] || "").trim();
+        if (ref) { data.ref = ref; data.refKey = stmtRefKey(ref); }
+      }
       const id = iId >= 0 ? String(row[iId] || "").trim() : "";
       const old = id ? txns.find((t) => t.id === id) : null;
       if (old) {
@@ -1221,6 +1243,112 @@ function AppMain({ session, role, signOut }) {
     setTxns((prev) => [...newTxns, ...prev.map((t) => (updates[t.id] ? { ...t, ...updates[t.id] } : t))]);
     // No se ajustan saldos: se derivan automáticamente de los movimientos.
     return { updated, added, skipped };
+  }
+
+  /* Crea una cuenta desde el importador y devuelve su id, para poder cargarle
+     el estado de cuenta sin salir del flujo. Solo para el rol editor, igual
+     que la creación de cuentas en la pestaña Cuentas. */
+  function createAccountInline(data) {
+    if (!canEditAll) return null;
+    const id = uid();
+    setAccounts((prev) => [...prev, { ...data, id }]);
+    return id;
+  }
+
+  /* Importa las líneas de un estado de cuenta como movimientos por justificar.
+     Se guardan la referencia del banco (código validador) y su descripción tal cual,
+     y quedan con pending:true hasta que se les asigne un motivo. El saldo de la
+     cuenta se recalcula solo, porque se deriva de los movimientos. */
+  function importStatement(accountId, ops, meta) {
+    if (!accountId || !ops || ops.length === 0) return { added: 0 };
+    // Si la cuenta se acaba de crear puede no estar todavía en este render:
+    // se usa la moneda general como respaldo en lugar de abortar la carga.
+    const acc = accounts.find((a) => a.id === accountId) || { currency: cur };
+    const importedAt = Date.now();
+    const nuevos = ops.map((op, i) => ({
+      id: uid(),
+      createdAt: importedAt - i,
+      kind: op.kind,
+      amount: op.amount,
+      motivo: "",
+      accountId,
+      date: op.date,
+      currency: acc.currency || cur,
+      // Comisión venida del propio estado de cuenta (líneas con la referencia
+      // repetida). El saldo derivado ya la resta, igual que hace el banco.
+      commission: op.commission || 0,
+      comMode: op.commission > 0 ? "manual" : "none",
+      ref: op.ref || "",
+      refKey: op.refKey || "",
+      bankDesc: op.desc || "",
+      // Saldo del banco y posición en el archivo: se usan para el cuadre diario
+      bankBalance: op.bankBalance,
+      stmtRow: op.rowNum,
+      pending: true,
+      source: "bank",
+      importedAt,
+      importFile: (meta && meta.fileName) || undefined,
+    }));
+    setTxns((prev) => [...nuevos, ...prev]);
+    return { added: nuevos.length };
+  }
+
+  /* Justificar: asigna motivo (y proyecto) y saca el movimiento de la bandeja.
+     Si además se marcó como operación de divisas, crea (o actualiza, o borra)
+     la operación correspondiente en Divisas, que es la que alimenta CxC.
+
+     Los USD salen del propio movimiento: usd = monto ÷ tasa. La comisión del
+     banco se traslada como comisión en bolívares de la operación, así los VES
+     que consume la compra coinciden con lo que realmente salió de la cuenta. */
+  function justifyTxns(ids, patch, divisa) {
+    const set = new Set(ids || []);
+    if (set.size === 0) return;
+
+    const t = divisa ? txns.find((x) => x.id === divisa.txnId) : null;
+    let nuevoDivisaId;
+
+    if (t) {
+      const anterior = t.divisaId;
+      if (!divisa.kind) {
+        // Se desmarcó: se elimina la operación de divisas que se había creado
+        if (anterior) { setDivisas((prev) => prev.filter((d) => d.id !== anterior)); receiptDel(anterior); }
+        nuevoDivisaId = null;
+      } else if (divisa.tasa > 0 && divisa.persona) {
+        const datos = {
+          kind: divisa.kind,
+          date: t.date,
+          persona: divisa.persona,
+          usd: (t.amount || 0) / divisa.tasa,
+          tasa: divisa.tasa,
+          referencia: t.ref || "",
+          refKey: t.ref ? normRef(t.ref) : undefined,
+          // La comisión del banco se expresa en bolívares dentro de la operación
+          comisionBs: t.commission || 0,
+          source: "movimiento",
+          txnId: t.id,
+        };
+        if (anterior && divisas.some((d) => d.id === anterior)) {
+          nuevoDivisaId = anterior;
+          setDivisas((prev) => prev.map((d) => (d.id === anterior ? { ...d, ...datos } : d)));
+        } else {
+          nuevoDivisaId = uid();
+          const id = nuevoDivisaId;
+          setDivisas((prev) => [{ ...datos, id, createdAt: Date.now() }, ...prev]);
+        }
+      }
+    }
+
+    setTxns((prev) =>
+      prev.map((x) => {
+        if (!set.has(x.id)) return x;
+        const base = { ...x, motivo: patch.motivo, project: patch.project || x.project, pending: false };
+        if (t && x.id === t.id && nuevoDivisaId !== undefined) {
+          base.divisaId = nuevoDivisaId || undefined;
+          base.divisaKind = nuevoDivisaId ? divisa.kind : undefined;
+        }
+        return base;
+      })
+    );
   }
 
   /* Acciones divisas */
@@ -1432,7 +1560,7 @@ function AppMain({ session, role, signOut }) {
         {tab === "txns" && (
           <div style={{ paddingTop: 8 }}>
             <div style={{ display: "flex", background: T.card, borderRadius: 12, padding: 4, marginBottom: 4, border: `1px solid ${T.lineSoft}` }}>
-              {[["mov", "Movimientos"], ["proj", "Proyectos"]].map(([v, label]) => (
+              {[["mov", "Movimientos"], ["cierre", "Cierre diario"], ["proj", "Proyectos"]].map(([v, label]) => (
                 <button
                   key={v}
                   onClick={() => setTxnView(v)}
@@ -1452,6 +1580,17 @@ function AppMain({ session, role, signOut }) {
                 onEdit={(t) => setTxnSheet(t)}
                 onDelete={deleteTxn}
                 onBulkImport={bulkImportTxns}
+                onImportStatement={() => setStmtSheet(true)}
+                onJustify={(list) => setJustifySheet({ list })}
+                diaFijado={diaFijado}
+                onLimpiarDia={() => setDiaFijado("")}
+              />
+            ) : txnView === "cierre" ? (
+              <CierreDiarioTab
+                txns={txns}
+                accounts={accountsView}
+                cur={cur}
+                onVerDia={(fecha) => { setDiaFijado(fecha); setTxnView("mov"); }}
               />
             ) : (
               <ProjectsTab
@@ -1586,6 +1725,26 @@ function AppMain({ session, role, signOut }) {
         onSave={saveTxn}
         onDelete={deleteTxn}
       />
+      <StatementImportSheet
+        open={stmtSheet}
+        accounts={accountsView}
+        cur={cur}
+        txns={txns}
+        onClose={() => setStmtSheet(false)}
+        onImport={importStatement}
+        onCreateAccount={canEditAll ? createAccountInline : undefined}
+      />
+      <JustifySheet
+        state={justifySheet}
+        projects={projects}
+        txns={txns}
+        cur={cur}
+        accounts={accountsView}
+        divisas={divisas}
+        onClose={() => setJustifySheet(null)}
+        onEdit={(t) => setTxnSheet(t)}
+        onSave={(ids, patch, divisa) => { justifyTxns(ids, patch, divisa); setJustifySheet(null); }}
+      />
       <ProjectSheet
         state={projectSheet}
         projectsMeta={projectsMeta}
@@ -1618,7 +1777,6 @@ function App() {
   const [role, setRole] = useState(null);
   const [checking, setChecking] = useState(CLOUD);
   const [authErr, setAuthErr] = useState("");
-  const [recovery, setRecovery] = useState(false);
 
   useEffect(() => {
     if (!CLOUD) return;
@@ -1630,12 +1788,7 @@ function App() {
         if (!alive) return;
         setSession(data.session || null);
         setChecking(false);
-        sub = sb.auth.onAuthStateChange((ev, s) => {
-          setSession(s || null);
-          // Cuando la persona abre el enlace de restablecimiento del email,
-          // Supabase dispara este evento con una sesión temporal de recuperación.
-          if (ev === "PASSWORD_RECOVERY") setRecovery(true);
-        }).data.subscription;
+        sub = sb.auth.onAuthStateChange((_e, s) => { setSession(s || null); }).data.subscription;
       } catch (e) {
         if (alive) { setAuthErr(e.message || "No se pudo conectar."); setChecking(false); }
       }
@@ -1663,11 +1816,9 @@ function App() {
 
   if (!CLOUD) return <AppMain session={null} role={null} signOut={null} />;
   if (checking) return <Splash msg="Conectando…" />;
-  if (recovery) return <ResetPasswordScreen onDone={() => setRecovery(false)} />;
   if (authErr) return <Splash msg={authErr} />;
   if (!session) return <LoginScreen onDone={setSession} />;
   if (!role) return <Splash msg="Cargando permisos…" />;
-  if (role === "none") return <RevokedScreen email={session.user.email} signOut={signOut} />;
   return <AppMain session={session} role={role} signOut={signOut} />;
 }
 
@@ -1676,73 +1827,6 @@ function Splash({ msg }) {
     <div style={{ ...shell, alignItems: "center", justifyContent: "center" }}>
       <style>{css}</style>
       <div style={{ color: T.mut, fontFamily: FONT, padding: 24, textAlign: "center" }}>{msg}</div>
-    </div>
-  );
-}
-
-/* Pantalla para fijar una contraseña nueva tras abrir el enlace del email. */
-function ResetPasswordScreen({ onDone }) {
-  const [pass, setPass] = useState("");
-  const [pass2, setPass2] = useState("");
-  const [busy, setBusy] = useState(false);
-  const [msg, setMsg] = useState("");
-  const [ok, setOk] = useState(false);
-
-  async function save() {
-    if (pass.length < 6) { setMsg("La contraseña debe tener al menos 6 caracteres."); return; }
-    if (pass !== pass2) { setMsg("Las contraseñas no coinciden."); return; }
-    setBusy(true); setMsg("");
-    try {
-      const sb = await getSB();
-      const { error } = await sb.auth.updateUser({ password: pass });
-      if (error) throw error;
-      setOk(true);
-      setMsg("Contraseña actualizada. Ya podés entrar a la app.");
-    } catch (e) {
-      setMsg(e.message || "No se pudo actualizar la contraseña. Puede que el enlace haya expirado; pedí uno nuevo.");
-    } finally { setBusy(false); }
-  }
-
-  return (
-    <div style={{ ...shell, justifyContent: "center", padding: "0 24px" }}>
-      <style>{css}</style>
-      <div style={{ marginBottom: 24, textAlign: "center" }}>
-        <div style={{ fontSize: 22, fontWeight: 700, color: T.text, letterSpacing: -0.4 }}>Nueva contraseña</div>
-        <div style={{ fontSize: 13.5, color: T.mut, marginTop: 4 }}>Elegí una contraseña para tu cuenta.</div>
-      </div>
-      {!ok ? (
-        <>
-          <Field label="Nueva contraseña">
-            <input style={inputStyle} value={pass} onChange={(e) => setPass(e.target.value)} type="password" placeholder="••••••••" />
-          </Field>
-          <Field label="Repetir contraseña">
-            <input style={inputStyle} value={pass2} onChange={(e) => setPass2(e.target.value)} type="password" placeholder="••••••••" />
-          </Field>
-          <PrimaryBtn color={T.gold} disabled={busy || pass.length < 6} onClick={save}>
-            {busy ? "…" : "Guardar contraseña"}
-          </PrimaryBtn>
-        </>
-      ) : (
-        <PrimaryBtn color={T.gold} onClick={onDone}>Continuar</PrimaryBtn>
-      )}
-      {msg && <div style={{ fontSize: 13, color: ok ? T.green : T.mut, marginTop: 14, textAlign: "center", lineHeight: 1.5 }}>{msg}</div>}
-    </div>
-  );
-}
-
-/* Pantalla que ve una persona cuyo acceso fue revocado (rol "Sin acceso"). */
-function RevokedScreen({ email, signOut }) {
-  return (
-    <div style={{ ...shell, alignItems: "center", justifyContent: "center", padding: "0 24px" }}>
-      <style>{css}</style>
-      <div style={{ textAlign: "center", maxWidth: 340 }}>
-        <div style={{ width: 56, height: 56, borderRadius: 14, background: T.redSoft, display: "inline-flex", alignItems: "center", justifyContent: "center", marginBottom: 16, fontSize: 26 }}>🔒</div>
-        <div style={{ fontSize: 20, fontWeight: 700, color: T.text }}>Acceso revocado</div>
-        <div style={{ fontSize: 14, color: T.mut, marginTop: 8, lineHeight: 1.55 }}>
-          Tu cuenta{email ? ` (${email})` : ""} no tiene acceso a esta aplicación. Si creés que es un error, pedile a un editor que te reactive.
-        </div>
-        <button onClick={signOut} style={{ ...btnGhost, marginTop: 22, color: T.red }}>Cerrar sesión</button>
-      </div>
     </div>
   );
 }
@@ -1773,20 +1857,6 @@ function LoginScreen({ onDone }) {
     } finally { setBusy(false); }
   }
 
-  async function sendReset() {
-    if (!email.trim()) { setMsg("Escribí tu email arriba y volvé a tocar “¿Olvidaste tu contraseña?”."); return; }
-    setBusy(true); setMsg("");
-    try {
-      const sb = await getSB();
-      const redirectTo = window.location.origin + window.location.pathname;
-      const { error } = await sb.auth.resetPasswordForEmail(email.trim(), { redirectTo });
-      if (error) throw error;
-      setMsg("Te enviamos un email con un enlace para restablecer tu contraseña. Revisá tu bandeja (y la carpeta de spam).");
-    } catch (e) {
-      setMsg(e.message || "No se pudo enviar el email de restablecimiento.");
-    } finally { setBusy(false); }
-  }
-
   return (
     <div style={{ ...shell, justifyContent: "center", padding: "0 24px" }}>
       <style>{css}</style>
@@ -1811,11 +1881,6 @@ function LoginScreen({ onDone }) {
       <button onClick={() => { setMode(mode === "in" ? "up" : "in"); setMsg(""); }} style={{ ...btnGhost, width: "100%", marginTop: 14, color: T.mut }}>
         {mode === "in" ? "No tengo cuenta — registrarme" : "Ya tengo cuenta — iniciar sesión"}
       </button>
-      {mode === "in" && (
-        <button onClick={sendReset} disabled={busy} style={{ ...btnGhost, width: "100%", marginTop: 4, color: T.mut, fontSize: 13 }}>
-          ¿Olvidaste tu contraseña?
-        </button>
-      )}
       {msg && <div style={{ fontSize: 13, color: T.mut, marginTop: 14, textAlign: "center", lineHeight: 1.5 }}>{msg}</div>}
       <div style={{ fontSize: 11.5, color: T.mut2, marginTop: 26, textAlign: "center", lineHeight: 1.6 }}>
         Las cuentas nuevas entran como <b>Consulta</b>. Un editor puede cambiar tu rol desde Ajustes.
@@ -1850,23 +1915,6 @@ function UsersPanel({ session, role, signOut }) {
     finally { setBusy(false); }
   }
 
-  async function sendReset(email) {
-    setBusy(true); setMsg("");
-    try {
-      const sb = await getSB();
-      const redirectTo = window.location.origin + window.location.pathname;
-      const { error } = await sb.auth.resetPasswordForEmail(email, { redirectTo });
-      if (error) throw error;
-      setMsg("Enlace de restablecimiento enviado a " + email + ". La persona debe abrirlo desde su email.");
-    } catch (e) { setMsg(e.message || "No se pudo enviar el email de restablecimiento."); }
-    finally { setBusy(false); }
-  }
-
-  function expel(u) {
-    if (!window.confirm("¿Expulsar a " + u.email + "?\n\nPerderá el acceso a la app hasta que le asignes un rol de nuevo. (No se borra su cuenta.)")) return;
-    changeRole(u.id, "none");
-  }
-
   return (
     <div>
       <div style={{ ...sectionTitle, marginBottom: 10 }}>Mi cuenta</div>
@@ -1884,7 +1932,7 @@ function UsersPanel({ session, role, signOut }) {
         <>
           <div style={{ ...sectionTitle, margin: "24px 0 10px" }}>Usuarios</div>
           <div style={{ fontSize: 12.5, color: T.mut, marginBottom: 12, lineHeight: 1.5 }}>
-            Sin acceso: expulsado, no entra. Consulta: solo ve. Carga de datos: agrega movimientos y divisas. Editor: acceso total.
+            Consulta: solo ve. Carga de datos: agrega movimientos y divisas. Editor: acceso total.
           </div>
           <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
             {users.map((u) => (
@@ -1898,21 +1946,10 @@ function UsersPanel({ session, role, signOut }) {
                   disabled={busy || u.id === session.user.id}
                   onChange={(e) => changeRole(u.id, e.target.value)}
                 >
-                  <option value="none">{ROLE_LABEL.none}</option>
                   <option value="viewer">{ROLE_LABEL.viewer}</option>
                   <option value="loader">{ROLE_LABEL.loader}</option>
                   <option value="editor">{ROLE_LABEL.editor}</option>
                 </select>
-                {u.id !== session.user.id && (
-                  <div style={{ display: "flex", gap: 8 }}>
-                    <button onClick={() => sendReset(u.email)} disabled={busy} style={{ ...btnGhost, flex: 1, fontSize: 12.5, color: T.mut, textAlign: "center" }}>
-                      Restablecer contraseña
-                    </button>
-                    <button onClick={() => expel(u)} disabled={busy || u.role === "none"} style={{ ...btnGhost, flex: 1, fontSize: 12.5, color: u.role === "none" ? T.mut2 : T.red, textAlign: "center" }}>
-                      {u.role === "none" ? "Expulsado" : "Expulsar"}
-                    </button>
-                  </div>
-                )}
               </div>
             ))}
           </div>
@@ -2226,7 +2263,7 @@ function AccountsTab({ accounts, prices, cur, settings, vesRate, onSetRate, onAd
 }
 
 /* ─────────────────────────────  Tab: Movimientos  ───────────────────────────── */
-function TxnsTab({ txns, accounts, cur, onAdd, onEdit, onDelete, onBulkImport, canWrite = true }) {
+function TxnsTab({ txns, accounts, cur, onAdd, onEdit, onDelete, onBulkImport, onImportStatement, onJustify, canWrite = true, diaFijado = "", onLimpiarDia }) {
   const acct = (id) => accounts.find((a) => a.id === id);
   const acctName = (id) => (acct(id) || {}).name || "—";
   const acctCur = (t) => t.currency || (acct(t.accountId) || {}).currency || cur;
@@ -2237,10 +2274,31 @@ function TxnsTab({ txns, accounts, cur, onAdd, onEdit, onDelete, onBulkImport, c
   const [fFrom, setFFrom] = useState("");
   const [fTo, setFTo] = useState("");
   const [showF, setShowF] = useState(false);
+  const [q, setQ] = useState("");
+  const [soloPend, setSoloPend] = useState(false);
+  const [sel, setSel] = useState({});          // id -> true (selección para justificar en lote)
+  const [selMode, setSelMode] = useState(false);
 
   const usable = accounts.filter((a) => a.type === "bank" || a.type === "cash");
   const projects = useMemo(() => Array.from(new Set(txns.map((t) => t.project).filter(Boolean))).sort(), [txns]);
   const activos = (fAcct !== "all" ? 1 : 0) + (fKind !== "all" ? 1 : 0) + (fProject !== "all" ? 1 : 0) + (fFrom ? 1 : 0) + (fTo ? 1 : 0);
+  const pendientes = useMemo(() => txns.filter((t) => t.pending), [txns]);
+
+  /* Búsqueda: referencia del banco (código validador), motivo, descripción, cuenta,
+     proyecto y monto. La referencia se compara normalizada, así da igual si la
+     escribís con espacios, guiones o ceros al principio. */
+  const qn = q.trim().toLowerCase();
+  const qRef = normRef(q);
+  const matchQ = (t) => {
+    if (!qn) return true;
+    if (qRef && normRef(t.ref).includes(qRef)) return true;
+    const hay = [t.motivo, t.bankDesc, t.ref, t.project, acctName(t.accountId)]
+      .filter(Boolean).join(" ").toLowerCase();
+    if (hay.includes(qn)) return true;
+    const nq = numVE(q);
+    if (!isNaN(nq) && nq > 0 && Math.abs((t.amount || 0) - nq) < 0.005) return true;
+    return false;
+  };
 
   const filtrados = useMemo(
     () =>
@@ -2250,10 +2308,32 @@ function TxnsTab({ txns, accounts, cur, onAdd, onEdit, onDelete, onBulkImport, c
           (fKind === "all" || t.kind === fKind) &&
           (fProject === "all" || (fProject === "__none" ? !t.project : t.project === fProject)) &&
           (!fFrom || t.date >= fFrom) &&
-          (!fTo || t.date <= fTo)
+          (!fTo || t.date <= fTo) &&
+          (!diaFijado || t.date === diaFijado) &&
+          (!soloPend || !!t.pending) &&
+          matchQ(t)
       ),
-    [txns, fAcct, fKind, fProject, fFrom, fTo]
+    [txns, fAcct, fKind, fProject, fFrom, fTo, soloPend, q, accounts, diaFijado]
   );
+
+  const selIds = Object.keys(sel).filter((k) => sel[k]);
+  const selTxns = selIds.map((id) => txns.find((t) => t.id === id)).filter(Boolean);
+  function toggleSel(id) { setSel((s) => ({ ...s, [id]: !s[id] })); }
+  function clearSel() { setSel({}); setSelMode(false); }
+  // Selecciona SOLO los pendientes visibles. Marcar todo (incluidos los ya
+  // justificados) sobreescribiría motivos correctos con un par de toques.
+  const pendVisibles = filtrados.filter((t) => t.pending);
+  function selectPendingVisible() {
+    const m = {};
+    pendVisibles.forEach((t) => { m[t.id] = true; });
+    setSel(m);
+  }
+
+  // Si se justificó el último pendiente estando en modo "solo pendientes",
+  // se sale solo: si no, la lista queda vacía y sin forma de volver.
+  useEffect(() => {
+    if (soloPend && pendientes.length === 0) setSoloPend(false);
+  }, [soloPend, pendientes.length]);
 
   // Totales del filtro, agrupados por moneda
   const totalesPorMoneda = useMemo(() => {
@@ -2287,7 +2367,7 @@ function TxnsTab({ txns, accounts, cur, onAdd, onEdit, onDelete, onBulkImport, c
     setBulkBusy(true); setBulkMsg("");
     try {
       const XLSX = await ensureXLSXStyle();
-      const header = ["id", "Fecha", "Tipo", "Motivo", "Cuenta", "Monto", "Comisión", "Proyecto"];
+      const header = ["id", "Fecha", "Tipo", "Motivo", "Cuenta", "Monto", "Comisión", "Proyecto", "Referencia", "Descripción banco"];
       const aoa = [
         header,
         ...filtrados.slice().sort((a, b) => (a.date < b.date ? 1 : -1)).map((t) => [
@@ -2299,10 +2379,12 @@ function TxnsTab({ txns, accounts, cur, onAdd, onEdit, onDelete, onBulkImport, c
           t.amount || 0,
           t.commission || 0,
           t.project || "",
+          t.ref || "",
+          t.bankDesc || "",
         ]),
       ];
       const ws = XLSX.utils.aoa_to_sheet(aoa);
-      ws["!cols"] = [{ wch: 14 }, { wch: 12 }, { wch: 9 }, { wch: 26 }, { wch: 20 }, { wch: 12 }, { wch: 10 }, { wch: 16 }];
+      ws["!cols"] = [{ wch: 14 }, { wch: 12 }, { wch: 9 }, { wch: 26 }, { wch: 20 }, { wch: 12 }, { wch: 10 }, { wch: 16 }, { wch: 18 }, { wch: 30 }];
       const wb = XLSX.utils.book_new();
       XLSX.utils.book_append_sheet(wb, ws, "Movimientos");
       if (bulkDl && bulkDl.url) URL.revokeObjectURL(bulkDl.url);
@@ -2331,9 +2413,95 @@ function TxnsTab({ txns, accounts, cur, onAdd, onEdit, onDelete, onBulkImport, c
 
   return (
     <div style={{ paddingTop: 8 }}>
+      {/* Día traído desde el cierre diario */}
+      {diaFijado && (
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, background: T.goldSoft, border: `1px solid ${T.gold}`, borderRadius: 12, padding: "11px 14px", marginBottom: 12 }}>
+          <span style={{ fontSize: 13.5, fontWeight: 600, color: T.gold }}>Solo el {fmtDate(diaFijado)}</span>
+          {onLimpiarDia && (
+            <button onClick={onLimpiarDia} style={{ ...btnGhost, color: T.gold, fontSize: 12.5, fontWeight: 600 }}>Ver todos</button>
+          )}
+        </div>
+      )}
+
+      {/* Buscador: la vía rápida para ubicar una transferencia por su referencia */}
+      <div style={{ position: "relative", marginBottom: 12 }}>
+        <input
+          style={{ ...inputStyle, paddingLeft: 38, marginBottom: 0 }}
+          value={q}
+          onChange={(e) => setQ(e.target.value)}
+          placeholder="Buscar por referencia, monto, motivo…"
+          inputMode="search"
+        />
+        <span style={{ position: "absolute", left: 13, top: "50%", transform: "translateY(-50%)", color: T.mut2, fontSize: 15 }}>⌕</span>
+        {q && (
+          <button
+            onClick={() => setQ("")}
+            style={{ position: "absolute", right: 8, top: "50%", transform: "translateY(-50%)", ...btnGhost, color: T.mut2, fontSize: 18, lineHeight: 1 }}
+            aria-label="Limpiar búsqueda"
+          >×</button>
+        )}
+      </div>
+      {q && (
+        <div style={{ fontSize: 12.5, color: T.mut, marginBottom: 12 }}>
+          {filtrados.length} resultado(s) para “{q}”
+        </div>
+      )}
+
+      {/* Bandeja: movimientos importados que faltan justificar */}
+      {canWrite && pendientes.length > 0 && (
+        <button
+          onClick={() => { setSoloPend((v) => !v); setQ(""); }}
+          style={{
+            width: "100%", display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10,
+            background: soloPend ? T.goldSoft : T.bg2, border: `1px solid ${soloPend ? T.gold : T.lineSoft}`,
+            borderRadius: 14, padding: "13px 15px", marginBottom: 12, cursor: "pointer", fontFamily: FONT, textAlign: "left",
+          }}
+        >
+          <span style={{ minWidth: 0 }}>
+            <span style={{ display: "block", fontSize: 14, fontWeight: 700, color: T.gold }}>
+              {pendientes.length} movimiento(s) por justificar
+            </span>
+            <span style={{ display: "block", fontSize: 12, color: T.mut, marginTop: 2 }}>
+              {soloPend ? "Mostrando solo estos · tocá para ver todos" : "Importados del banco, sin motivo asignado"}
+            </span>
+          </span>
+          <span style={{ color: T.gold, fontSize: 13, fontWeight: 600, flexShrink: 0 }}>{soloPend ? "Ver todos" : "Revisar →"}</span>
+        </button>
+      )}
+
       {canWrite && (
-        <button onClick={onAdd} style={{ ...rowCard, cursor: "pointer", justifyContent: "center", gap: 8, color: T.gold, fontWeight: 600, fontSize: 15, marginBottom: 12 }}>
-          <IconPlus color={T.gold} /> Nuevo movimiento
+        <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
+          <button onClick={onAdd} style={{ ...rowCard, flex: 1, cursor: "pointer", justifyContent: "center", gap: 8, color: T.gold, fontWeight: 600, fontSize: 14.5 }}>
+            <IconPlus color={T.gold} /> Nuevo
+          </button>
+          <button onClick={onImportStatement} style={{ ...rowCard, flex: 1.4, cursor: "pointer", justifyContent: "center", gap: 8, color: T.blue, fontWeight: 600, fontSize: 14.5 }}>
+            ⇩ Importar del banco
+          </button>
+        </div>
+      )}
+
+      {/* Barra de selección múltiple */}
+      {canWrite && selMode && (
+        <div style={{ background: T.card2, border: `1px solid ${T.gold}`, borderRadius: 14, padding: "12px 14px", marginBottom: 12 }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, marginBottom: 10 }}>
+            <span style={{ fontSize: 13.5, fontWeight: 600, color: T.text }}>{selIds.length} seleccionado(s)</span>
+            <div style={{ display: "flex", gap: 8 }}>
+              {pendVisibles.length > 0 && (
+                <button onClick={selectPendingVisible} style={{ ...btnGhost, color: T.blue, fontSize: 12.5, fontWeight: 600 }}>
+                  Los {pendVisibles.length} pendientes
+                </button>
+              )}
+              <button onClick={clearSel} style={{ ...btnGhost, color: T.mut2, fontSize: 12.5, fontWeight: 600 }}>Salir</button>
+            </div>
+          </div>
+          <PrimaryBtn color={T.green} disabled={selIds.length === 0} onClick={() => { onJustify(selTxns); clearSel(); }}>
+            Justificar {selIds.length || ""} en lote
+          </PrimaryBtn>
+        </div>
+      )}
+      {canWrite && !selMode && filtrados.length > 1 && (
+        <button onClick={() => setSelMode(true)} style={{ ...btnGhost, color: T.mut, fontSize: 12.5, fontWeight: 600, marginBottom: 12, padding: 0 }}>
+          Seleccionar varios…
         </button>
       )}
 
@@ -2443,9 +2611,43 @@ function TxnsTab({ txns, accounts, cur, onAdd, onEdit, onDelete, onBulkImport, c
               {items.map((t) => {
                 const inc = t.kind === "income";
                 const c = acctCur(t);
+                const pend = !!t.pending;
+                const checked = !!sel[t.id];
+                /* Los movimientos que vienen del banco se abren siempre en la ficha
+                   de clasificación: ahí se pone el motivo y, si toca, se marca como
+                   operación de divisas o se corrige la tasa ya cargada. Desde esa
+                   misma ficha se salta a editar monto, fecha o cuenta.
+                   Los cargados a mano siguen abriendo directo la edición. */
+                const clasificable = pend || t.source === "bank" || t.divisaKind;
+                const onRowClick = () => {
+                  if (!canWrite) return;
+                  if (selMode) { toggleSel(t.id); return; }
+                  if (clasificable) { onJustify([t]); return; }
+                  onEdit(t);
+                };
                 return (
-                  <div key={t.id} onClick={() => canWrite && onEdit(t)} style={{ ...rowCard, cursor: canWrite ? "pointer" : "default" }}>
+                  <div
+                    key={t.id}
+                    onClick={onRowClick}
+                    style={{
+                      ...rowCard,
+                      cursor: canWrite ? "pointer" : "default",
+                      border: pend ? `1px solid ${T.gold}` : rowCard.border,
+                      background: checked ? T.card2 : rowCard.background,
+                    }}
+                  >
                     <div style={{ display: "flex", alignItems: "center", gap: 12, minWidth: 0 }}>
+                      {canWrite && selMode && (
+                        <span
+                          style={{
+                            width: 20, height: 20, borderRadius: 6, flexShrink: 0,
+                            border: `1.5px solid ${checked ? T.gold : T.line}`,
+                            background: checked ? T.gold : "transparent",
+                            display: "flex", alignItems: "center", justifyContent: "center",
+                            color: "#0A0F1E", fontSize: 13, fontWeight: 700,
+                          }}
+                        >{checked ? "✓" : ""}</span>
+                      )}
                       <span
                         style={{
                           width: 34, height: 34, borderRadius: 10,
@@ -2457,14 +2659,23 @@ function TxnsTab({ txns, accounts, cur, onAdd, onEdit, onDelete, onBulkImport, c
                         {inc ? "↓" : "↑"}
                       </span>
                       <div style={{ minWidth: 0 }}>
-                        <div style={{ fontSize: 14.5, fontWeight: 600, color: T.text, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
-                          {t.motivo || (inc ? "Ingreso" : "Egreso")}
+                        <div style={{ fontSize: 14.5, fontWeight: 600, color: pend ? T.gold : T.text, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                          {t.motivo || t.bankDesc || (inc ? "Ingreso" : "Egreso")}
+                          {pend && <span style={{ fontSize: 11, fontWeight: 700, color: T.gold, marginLeft: 6 }}>· POR JUSTIFICAR</span>}
+                          {t.divisaKind && (
+                            <span style={{ fontSize: 10.5, fontWeight: 700, color: T.violet, marginLeft: 6, letterSpacing: 0.3 }}>
+                              · {t.divisaKind === "compra" ? "COMPRA DIVISA" : "VENTA DIVISA"}
+                            </span>
+                          )}
                         </div>
-                        <div style={{ fontSize: 12, color: T.mut }}>
+                        <div style={{ fontSize: 12, color: T.mut, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
                           {acctName(t.accountId)} · {c.toUpperCase()}
                           {t.project ? ` · ${t.project}` : ""}
                           {t.commission ? ` · com. ${t.comMode === "usd" ? fmtUsd(t.comUsd || 0) : money(t.commission, c)}` : ""}
                         </div>
+                        {t.ref && (
+                          <div style={{ fontSize: 11, color: T.mut2, fontFamily: MONO, marginTop: 2 }}>ref {t.ref}</div>
+                        )}
                       </div>
                     </div>
                     <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
@@ -2472,7 +2683,7 @@ function TxnsTab({ txns, accounts, cur, onAdd, onEdit, onDelete, onBulkImport, c
                         {inc ? "+" : "−"}
                         {money(t.amount, c)}
                       </span>
-                      {canWrite && (
+                      {canWrite && !selMode && (
                         <button onClick={(e) => { e.stopPropagation(); onDelete(t); }} style={{ ...btnGhost, color: T.mut2, fontSize: 18, lineHeight: 1 }} aria-label="Eliminar">
                           ×
                         </button>
@@ -2486,6 +2697,864 @@ function TxnsTab({ txns, accounts, cur, onAdd, onEdit, onDelete, onBulkImport, c
         ))
       )}
     </div>
+  );
+}
+
+/* ─────────────────────────────  Tab: Cierre diario  ─────────────────────────────
+   Compara, día por día, el saldo que calcula la app contra el saldo que trae el
+   propio estado de cuenta del banco. Si los dos coinciden, la caja de ese día
+   está cuadrada y no hay nada que revisar. Si no, la diferencia dice cuánto
+   falta o sobra, que suele ser un movimiento no cargado o cargado dos veces. */
+function CierreDiarioTab({ txns, accounts, cur, onVerDia }) {
+  const bancos = accounts.filter((a) => a.type === "bank" || a.type === "cash");
+  const [accountId, setAccountId] = useState(bancos[0] ? bancos[0].id : "");
+  const [abierto, setAbierto] = useState(null);
+
+  useEffect(() => {
+    if (!accountId && bancos[0]) setAccountId(bancos[0].id);
+  }, [bancos.length]);
+
+  const acct = bancos.find((a) => a.id === accountId);
+  const acctCur = (acct && acct.currency) || cur;
+  const delta = (t) => (t.kind === "income" ? (t.amount || 0) : -(t.amount || 0)) - (t.commission || 0);
+
+  const dias = useMemo(() => {
+    if (!acct) return [];
+    const propios = txns.filter((t) => t.accountId === acct.id && t.date);
+    const ordenados = propios.slice().sort((a, b) =>
+      a.date < b.date ? -1 : a.date > b.date ? 1 : (a.stmtRow || 0) - (b.stmtRow || 0)
+    );
+    const m = new Map();
+    let acumulado = acct.opening || 0;
+    ordenados.forEach((t) => {
+      acumulado += delta(t);
+      if (!m.has(t.date)) {
+        m.set(t.date, { date: t.date, items: [], ingresos: 0, egresos: 0, comisiones: 0, pendientes: 0, bank: null, bankRow: -1 });
+      }
+      const d = m.get(t.date);
+      d.items.push(t);
+      if (t.kind === "income") d.ingresos += t.amount || 0;
+      else d.egresos += t.amount || 0;
+      d.comisiones += t.commission || 0;
+      if (t.pending) d.pendientes++;
+      // El saldo del banco del día es el de la última línea del estado de cuenta
+      if (t.bankBalance != null && (t.stmtRow || 0) >= d.bankRow) { d.bank = t.bankBalance; d.bankRow = t.stmtRow || 0; }
+      d.saldoApp = acumulado;
+    });
+    return Array.from(m.values()).sort((a, b) => (a.date < b.date ? 1 : -1));
+  }, [txns, acct]);
+
+  const conDato = dias.filter((d) => d.bank != null);
+  const descuadrados = conDato.filter((d) => Math.abs(d.saldoApp - d.bank) > 0.01);
+  const selStyle = { ...inputStyle, appearance: "none", fontSize: 14, padding: "11px 12px" };
+
+  if (bancos.length === 0) return <div style={emptyRow}>Creá una cuenta de banco para ver el cierre diario.</div>;
+
+  return (
+    <div style={{ paddingTop: 8 }}>
+      <Field label="Cuenta">
+        <select style={selStyle} value={accountId} onChange={(e) => { setAccountId(e.target.value); setAbierto(null); }}>
+          {bancos.map((a) => (<option key={a.id} value={a.id}>{a.name} · {(a.currency || cur).toUpperCase()}</option>))}
+        </select>
+      </Field>
+
+      <div style={{ background: `linear-gradient(160deg, ${T.card2}, ${T.card})`, border: `1px solid ${T.line}`, borderRadius: 18, padding: 18, marginBottom: 16 }}>
+        <div style={{ fontSize: 13, color: T.mut, fontWeight: 500 }}>Días cuadrados contra el banco</div>
+        <div style={{ fontFamily: MONO, fontVariantNumeric: "tabular-nums", fontSize: 30, fontWeight: 600, letterSpacing: -0.5, color: descuadrados.length ? T.gold : T.green, margin: "4px 0 2px" }}>
+          {conDato.length - descuadrados.length} / {conDato.length}
+        </div>
+        <div style={{ fontSize: 12, color: T.mut2, lineHeight: 1.5 }}>
+          {conDato.length === 0
+            ? "Importá un estado de cuenta para poder cuadrar: el saldo del banco sale de ahí."
+            : descuadrados.length === 0
+              ? "Todos los días con dato del banco cuadran al céntimo."
+              : `${descuadrados.length} día(s) con diferencia. Suele ser un movimiento sin cargar.`}
+        </div>
+      </div>
+
+      {dias.length === 0 ? (
+        <div style={emptyRow}>Esta cuenta todavía no tiene movimientos.</div>
+      ) : (
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          {dias.map((d) => {
+            const dif = d.bank != null ? d.saldoApp - d.bank : null;
+            const cuadra = dif != null && Math.abs(dif) <= 0.01;
+            const open = abierto === d.date;
+            const color = dif == null ? T.mut2 : cuadra ? T.green : T.red;
+            return (
+              <div key={d.date} style={{ background: T.card, border: `1px solid ${cuadra ? T.lineSoft : dif == null ? T.lineSoft : T.red}`, borderRadius: 14, overflow: "hidden" }}>
+                <button
+                  onClick={() => setAbierto(open ? null : d.date)}
+                  style={{ width: "100%", background: "transparent", border: "none", padding: "13px 15px", cursor: "pointer", fontFamily: FONT, textAlign: "left" }}
+                >
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 }}>
+                    <span style={{ fontSize: 14.5, fontWeight: 600, color: T.text }}>{fmtDate(d.date)}</span>
+                    <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                      {d.pendientes > 0 && (
+                        <span style={{ fontSize: 10.5, fontWeight: 700, color: T.gold, background: T.goldSoft, borderRadius: 6, padding: "3px 6px" }}>
+                          {d.pendientes} s/justificar
+                        </span>
+                      )}
+                      <span style={{ fontSize: 11.5, fontWeight: 700, color, letterSpacing: 0.3 }}>
+                        {dif == null ? "SIN DATO" : cuadra ? "CUADRA" : "DIFERENCIA"}
+                      </span>
+                    </span>
+                  </div>
+                  <div style={{ display: "flex", gap: 12, marginTop: 6, fontSize: 12, fontFamily: MONO, fontVariantNumeric: "tabular-nums" }}>
+                    <span style={{ color: T.green }}>+{money(d.ingresos, acctCur)}</span>
+                    <span style={{ color: T.red }}>−{money(d.egresos, acctCur)}</span>
+                    {d.comisiones > 0 && <span style={{ color: T.gold }}>com. {money(d.comisiones, acctCur)}</span>}
+                  </div>
+                  {dif != null && !cuadra && (
+                    <div style={{ fontSize: 12, color: T.red, marginTop: 5 }}>
+                      Diferencia de {money(Math.abs(dif), acctCur)} · {dif > 0 ? "la app tiene de más" : "la app tiene de menos"}
+                    </div>
+                  )}
+                </button>
+
+                {open && (
+                  <div style={{ borderTop: `1px solid ${T.lineSoft}`, padding: "12px 15px", background: T.bg2 }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5, color: T.mut, marginBottom: 4 }}>
+                      <span>Saldo según la app</span>
+                      <span style={{ fontFamily: MONO, color: T.text }}>{money(d.saldoApp, acctCur)}</span>
+                    </div>
+                    <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5, color: T.mut, marginBottom: 10 }}>
+                      <span>Saldo según el banco</span>
+                      <span style={{ fontFamily: MONO, color: d.bank == null ? T.mut2 : T.text }}>
+                        {d.bank == null ? "no vino en el archivo" : money(d.bank, acctCur)}
+                      </span>
+                    </div>
+                    <div style={{ fontSize: 12, color: T.mut2, marginBottom: 10 }}>{d.items.length} movimiento(s) ese día</div>
+                    <div style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: 10 }}>
+                      {d.items.slice(0, 12).map((t) => (
+                        <div key={t.id} style={{ display: "flex", justifyContent: "space-between", gap: 10, fontSize: 12.5 }}>
+                          <span style={{ color: t.pending ? T.gold : T.text, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                            {t.motivo || t.bankDesc || "(sin motivo)"}
+                          </span>
+                          <span style={{ fontFamily: MONO, flexShrink: 0, color: t.kind === "income" ? T.green : T.red }}>
+                            {t.kind === "income" ? "+" : "−"}{money(t.amount, acctCur)}
+                          </span>
+                        </div>
+                      ))}
+                      {d.items.length > 12 && <div style={{ fontSize: 12, color: T.mut2 }}>y {d.items.length - 12} más…</div>}
+                    </div>
+                    {onVerDia && (
+                      <button
+                        onClick={() => onVerDia(d.date)}
+                        style={{ width: "100%", background: "transparent", color: T.blue, border: `1px solid ${T.blue}`, borderRadius: 11, padding: "10px", fontSize: 13, fontWeight: 600, fontFamily: FONT, cursor: "pointer" }}
+                      >
+                        Ver este día en Movimientos
+                      </button>
+                    )}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ─────────────────────────────  Importar estado de cuenta  ───────────────────────────── */
+function StatementImportSheet({ open, onClose, accounts, cur, txns, onImport, onCreateAccount }) {
+  const usable = accounts.filter((a) => a.type === "bank" || a.type === "cash");
+  const [creando, setCreando] = useState(false);
+  const [nuevoNombre, setNuevoNombre] = useState("");
+  const [nuevaMoneda, setNuevaMoneda] = useState("ves");
+  const [nuevoSaldo, setNuevoSaldo] = useState("");
+  const [fileName, setFileName] = useState("");
+  const [rows, setRows] = useState(null);
+  const [sheetNames, setSheetNames] = useState([]);
+  const [wbRef, setWbRef] = useState(null);
+  const [headerIdx, setHeaderIdx] = useState(0);
+  const [map, setMap] = useState(null);
+  const [signMode, setSignMode] = useState("cols");
+  const [mergeCom, setMergeCom] = useState(true);
+  const [accountId, setAccountId] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState("");
+  const [err, setErr] = useState("");
+  const [done, setDone] = useState(null);
+
+  useEffect(() => {
+    if (open) {
+      setFileName(""); setRows(null); setSheetNames([]); setWbRef(null);
+      setHeaderIdx(0); setMap(null); setSignMode("cols"); setMergeCom(true);
+      setAccountId(usable[0] ? usable[0].id : "");
+      setBusy(false); setMsg(""); setErr(""); setDone(null);
+      // Si todavía no hay ninguna cuenta, se abre directo el formulario para crearla.
+      setCreando(usable.length === 0);
+      setNuevoNombre(""); setNuevaMoneda("ves"); setNuevoSaldo("");
+    }
+  }, [open]);
+
+  function applyRows(r) {
+    setRows(r);
+    const layout = detectStatementLayout(r);
+    if (layout) {
+      setHeaderIdx(layout.headerIdx);
+      setMap(layout.map);
+      setSignMode(layout.map.credito >= 0 || layout.map.debito >= 0 ? "cols" : "signed");
+      setMsg(`Encabezado detectado en la fila ${layout.headerIdx + 1}. Revisá el mapeo antes de importar.`);
+    } else {
+      setHeaderIdx(0);
+      setMap({ fecha: -1, ref: -1, desc: -1, credito: -1, debito: -1, monto: -1, saldo: -1 });
+      setSignMode("cols");
+      setMsg("No pude reconocer el encabezado. Indicá a mano qué columna es cada cosa.");
+    }
+  }
+
+  async function onFile(e) {
+    const f = e.target.files && e.target.files[0];
+    e.target.value = "";
+    if (!f) return;
+    setBusy(true); setErr(""); setMsg("Leyendo archivo…"); setDone(null);
+    try {
+      const buf = await f.arrayBuffer();
+      const texto = decodeText(buf);
+
+      // Banesco (y otros bancos) entregan el estado de cuenta como una tabla
+      // HTML con extensión .xls. Se detecta por el contenido, no por el nombre.
+      if (looksLikeHtml(texto)) {
+        const r = htmlTableToRows(texto);
+        if (!r.length) throw new Error("El archivo es una página web pero no trae ninguna tabla.");
+        setWbRef(null);
+        setSheetNames([]);
+        setFileName(f.name);
+        applyRows(r);
+        return;
+      }
+
+      const XLSX = await ensureXLSXStyle();
+      const wb = XLSX.read(buf, { type: "array", cellDates: false });
+      setWbRef(wb);
+      setSheetNames(wb.SheetNames || []);
+      const ws = wb.Sheets[wb.SheetNames[0]];
+      const r = XLSX.utils.sheet_to_json(ws, { header: 1, raw: false, defval: "" });
+      setFileName(f.name);
+      applyRows(r);
+    } catch (ex) {
+      setErr((ex && ex.message) || "No se pudo leer el archivo.");
+      setMsg("");
+    } finally { setBusy(false); }
+  }
+
+  function pickSheet(name) {
+    if (!wbRef) return;
+    try {
+      const XLSX = window.XLSX;
+      const r = XLSX.utils.sheet_to_json(wbRef.Sheets[name], { header: 1, raw: false, defval: "" });
+      applyRows(r);
+    } catch (ex) { setErr("No se pudo leer esa hoja."); }
+  }
+
+  const header = rows && rows[headerIdx] ? rows[headerIdx] : [];
+  const colOptions = useMemo(() => {
+    const n = rows ? rows.reduce((m, r) => Math.max(m, (r || []).length), 0) : 0;
+    return Array.from({ length: n }, (_, i) => ({
+      idx: i,
+      label: String(header[i] || "").trim() || `Columna ${i + 1}`,
+    }));
+  }, [rows, headerIdx]);
+
+  const rawOps = useMemo(() => {
+    if (!rows || !map) return [];
+    try { return rowsToStatementOps(rows, headerIdx, map, signMode); } catch (e) { return []; }
+  }, [rows, map, headerIdx, signMode]);
+
+  // Referencia repetida = comisión de esa misma transferencia (ver mergeStatementCommissions)
+  const ops = useMemo(() => (mergeCom ? mergeStatementCommissions(rawOps) : rawOps), [rawOps, mergeCom]);
+  const comUnidas = useMemo(() => ops.reduce((s, o) => s + (o.comLines || 0), 0), [ops]);
+  const refCompartidas = useMemo(() => ops.filter((o) => o.refCompartida).length, [ops]);
+
+  const existing = useMemo(() => buildTxnIndex(txns), [txns]);
+  const analysis = useMemo(() => {
+    if (!accountId) return { nuevas: [], repetidas: 0, sinRef: 0 };
+    // Presupuesto por clave: cuántas veces ya está registrada. Cada línea del
+    // archivo consume una; cuando se agota, la línea es genuinamente nueva.
+    const budget = new Map(existing);
+    const nuevas = [];
+    let repetidas = 0;
+    const sinRef = ops.filter((o) => !o.refKey).length;
+    ops.forEach((op) => {
+      const k = stmtKeyOf(accountId, op);
+      const left = budget.get(k) || 0;
+      if (left > 0) { budget.set(k, left - 1); repetidas++; return; }
+      nuevas.push(op);
+    });
+    return { nuevas, repetidas, sinRef };
+  }, [ops, accountId, existing]);
+
+  const acct = usable.find((a) => a.id === accountId);
+  const acctCur = (acct && acct.currency) || cur;
+
+  /* Rango de fechas del archivo y de lo que realmente entra. En una carga
+     diaria esto es lo que se mira: qué días trae el archivo y desde cuándo
+     hay algo nuevo. */
+  const rango = useMemo(() => {
+    const f = (lista) => {
+      const ds = lista.map((o) => o.date).filter(Boolean).sort();
+      return ds.length ? { desde: ds[0], hasta: ds[ds.length - 1], dias: new Set(ds).size } : null;
+    };
+    return { archivo: f(ops), nuevas: f(analysis.nuevas) };
+  }, [ops, analysis.nuevas]);
+
+  function setCol(field, value) {
+    setMap((m) => ({ ...m, [field]: value }));
+  }
+
+  function doImport() {
+    if (!accountId || analysis.nuevas.length === 0) return;
+    const res = onImport(accountId, analysis.nuevas, { fileName });
+    setDone(res);
+    setMsg("");
+  }
+
+  const selStyle = { ...inputStyle, appearance: "none", fontSize: 14, padding: "10px 12px" };
+  const colSel = (field, label) => (
+    <div style={{ flex: 1, minWidth: 0 }}>
+      <label style={labelStyle}>{label}</label>
+      <select style={selStyle} value={map ? map[field] : -1} onChange={(e) => setCol(field, Number(e.target.value))}>
+        <option value={-1}>— sin usar —</option>
+        {colOptions.map((c) => (<option key={c.idx} value={c.idx}>{c.label}</option>))}
+      </select>
+    </div>
+  );
+
+  function crearCuenta() {
+    const nombre = nuevoNombre.trim();
+    if (!nombre || !onCreateAccount) return;
+    const id = onCreateAccount({
+      type: "bank",
+      name: nombre,
+      currency: nuevaMoneda,
+      opening: nuevoSaldo.trim() === "" ? 0 : (numVE(nuevoSaldo) || 0),
+    });
+    if (id) { setAccountId(id); setCreando(false); setNuevoNombre(""); setNuevoSaldo(""); }
+  }
+
+  /* Selector de cuenta destino. Se muestra dos veces: al principio y otra vez
+     justo antes de importar, para que nunca se cargue un estado de cuenta en la
+     cuenta equivocada por descuido. */
+  const selectorCuenta = (label) => (
+    <Field label={label}>
+      <select
+        style={selStyle}
+        value={creando ? "__new" : accountId}
+        onChange={(e) => {
+          if (e.target.value === "__new") { setCreando(true); return; }
+          setCreando(false); setAccountId(e.target.value);
+        }}
+      >
+        {usable.length === 0 && <option value="">— todavía no hay cuentas —</option>}
+        {usable.map((a) => (
+          <option key={a.id} value={a.id}>{a.name} · {(a.currency || cur).toUpperCase()}</option>
+        ))}
+        {onCreateAccount && <option value="__new">+ Crear cuenta nueva…</option>}
+      </select>
+    </Field>
+  );
+
+  const formCuentaNueva = creando && onCreateAccount && (
+    <div style={{ background: T.bg2, border: `1px solid ${T.lineSoft}`, borderRadius: 14, padding: "14px 15px", marginBottom: 14 }}>
+      <div style={{ fontSize: 13, color: T.text, fontWeight: 600, marginBottom: 10 }}>Cuenta nueva</div>
+      <Field label="Nombre del banco o cuenta">
+        <input style={inputStyle} value={nuevoNombre} onChange={(e) => setNuevoNombre(e.target.value)} placeholder="Ej. Banesco Corriente" />
+      </Field>
+      <div style={{ display: "flex", gap: 10 }}>
+        <div style={{ flex: 1 }}>
+          <label style={labelStyle}>Moneda</label>
+          <select style={selStyle} value={nuevaMoneda} onChange={(e) => setNuevaMoneda(e.target.value)}>
+            <option value="ves">VES (Bs)</option>
+            <option value="usd">USD ($)</option>
+          </select>
+        </div>
+        <div style={{ flex: 1 }}>
+          <label style={labelStyle}>Saldo inicial</label>
+          <input style={{ ...inputStyle, fontFamily: MONO }} value={nuevoSaldo} onChange={(e) => setNuevoSaldo(e.target.value)} inputMode="decimal" placeholder="0,00" />
+        </div>
+      </div>
+      <div style={{ fontSize: 11.5, color: T.mut2, lineHeight: 1.5, margin: "2px 0 12px" }}>
+        El saldo inicial es el que tenía la cuenta ANTES de la primera línea del estado de
+        cuenta. Si lo dejás en cero, el saldo mostrado será solo el movimiento del período.
+      </div>
+      <div style={{ display: "flex", gap: 8 }}>
+        {usable.length > 0 && (
+          <button onClick={() => setCreando(false)} style={{ flex: 1, background: "transparent", color: T.mut, border: `1px solid ${T.line}`, borderRadius: 11, padding: "11px", fontSize: 13.5, fontWeight: 600, fontFamily: FONT, cursor: "pointer" }}>
+            Cancelar
+          </button>
+        )}
+        <div style={{ flex: 1.4 }}>
+          <PrimaryBtn color={T.gold} disabled={!nuevoNombre.trim()} onClick={crearCuenta}>Crear cuenta</PrimaryBtn>
+        </div>
+      </div>
+    </div>
+  );
+
+  return (
+    <Sheet open={open} onClose={onClose} title="Importar estado de cuenta">
+      {usable.length === 0 && !onCreateAccount ? (
+        <div style={emptyRow}>Primero creá una cuenta de banco en la pestaña Cuentas.</div>
+      ) : done ? (
+        <div>
+          <div style={{ background: T.greenSoft, border: `1px solid ${T.green}`, borderRadius: 14, padding: "16px 18px", marginBottom: 14 }}>
+            <div style={{ fontSize: 16, fontWeight: 700, color: T.green, marginBottom: 6 }}>Importación lista</div>
+            <div style={{ fontSize: 13.5, color: T.text, lineHeight: 1.6 }}>
+              {done.added} movimiento(s) cargado(s) en <b>{(acct || {}).name}</b>.<br />
+              Quedaron marcados como <b>por justificar</b>: asignales el motivo desde la lista de movimientos.
+            </div>
+          </div>
+          <PrimaryBtn color={T.gold} onClick={onClose}>Ir a justificarlos</PrimaryBtn>
+        </div>
+      ) : (
+        <>
+          <div style={{ fontSize: 12.5, color: T.mut, lineHeight: 1.6, marginBottom: 14 }}>
+            Subí el estado de cuenta tal como lo emite el banco, sin reformatearlo. Reconoce el
+            .xls de Banesco (que en realidad es una tabla web). La <b>referencia</b> de cada línea
+            se guarda como código validador y evita que se dupliquen movimientos si volvés a subir
+            el mismo archivo.
+          </div>
+
+          {selectorCuenta("¿A qué cuenta corresponden estos movimientos?")}
+          {formCuentaNueva}
+
+          <label style={{ display: "block", background: "transparent", color: T.blue, border: `1px solid ${T.blue}`, borderRadius: 12, padding: "13px", fontSize: 14, fontWeight: 600, fontFamily: FONT, cursor: "pointer", textAlign: "center", marginBottom: 12 }}>
+            {busy ? "Leyendo…" : fileName ? `Archivo: ${fileName} · cambiar` : "Elegir archivo del banco (.xls, .xlsx o .csv)"}
+            <input type="file" accept=".xlsx,.xls,.csv,.htm,.html" style={{ display: "none" }} onChange={onFile} />
+          </label>
+
+          {sheetNames.length > 1 && (
+            <Field label="Hoja del archivo">
+              <select style={selStyle} onChange={(e) => pickSheet(e.target.value)}>
+                {sheetNames.map((n) => (<option key={n} value={n}>{n}</option>))}
+              </select>
+            </Field>
+          )}
+
+          {msg && <div style={{ fontSize: 12.5, color: T.mut, lineHeight: 1.5, marginBottom: 12 }}>{msg}</div>}
+          {err && <div style={{ fontSize: 12.5, color: T.red, lineHeight: 1.5, marginBottom: 12 }}>{err}</div>}
+
+          {rows && map && (
+            <>
+              <div style={{ ...sectionTitle, marginTop: 6, marginBottom: 8 }}>Mapeo de columnas</div>
+
+              <Field label="Fila del encabezado">
+                <select style={selStyle} value={headerIdx} onChange={(e) => { const i = Number(e.target.value); setHeaderIdx(i); }}>
+                  {rows.slice(0, 40).map((r, i) => (
+                    <option key={i} value={i}>
+                      {`Fila ${i + 1}: ${(r || []).filter(Boolean).slice(0, 4).join(" | ").slice(0, 48)}`}
+                    </option>
+                  ))}
+                </select>
+              </Field>
+
+              <div style={{ display: "flex", gap: 10, marginBottom: 2 }}>
+                {colSel("fecha", "Fecha")}
+                {colSel("ref", "Referencia")}
+              </div>
+              <Field label="Descripción / concepto del banco">
+                <select style={selStyle} value={map.desc} onChange={(e) => setCol("desc", Number(e.target.value))}>
+                  <option value={-1}>— sin usar —</option>
+                  {colOptions.map((c) => (<option key={c.idx} value={c.idx}>{c.label}</option>))}
+                </select>
+              </Field>
+
+              <Field label="¿Cómo vienen los montos?">
+                <select style={selStyle} value={signMode} onChange={(e) => setSignMode(e.target.value)}>
+                  <option value="cols">Columnas separadas de débito y crédito</option>
+                  <option value="signed">Una sola columna con signo (negativo = egreso)</option>
+                  <option value="income">Una sola columna · todo son ingresos</option>
+                  <option value="expense">Una sola columna · todo son egresos</option>
+                </select>
+              </Field>
+
+              {signMode === "cols" ? (
+                <div style={{ display: "flex", gap: 10 }}>
+                  {colSel("credito", "Crédito (entra)")}
+                  {colSel("debito", "Débito (sale)")}
+                </div>
+              ) : (
+                colSel("monto", "Monto")
+              )}
+
+              <button
+                onClick={() => setMergeCom((v) => !v)}
+                style={{
+                  width: "100%", textAlign: "left", background: mergeCom ? T.goldSoft : T.bg2,
+                  border: `1px solid ${mergeCom ? T.gold : T.lineSoft}`, borderRadius: 12,
+                  padding: "12px 14px", margin: "6px 0 14px", cursor: "pointer", fontFamily: FONT,
+                }}
+              >
+                <div style={{ fontSize: 13.5, fontWeight: 600, color: mergeCom ? T.gold : T.text }}>
+                  {mergeCom ? "✓ " : ""}La referencia repetida es la comisión
+                </div>
+                <div style={{ fontSize: 12, color: T.mut, marginTop: 3, lineHeight: 1.5 }}>
+                  Cuando una referencia sale más de una vez, la línea menor se suma como comisión
+                  del movimiento en lugar de cargarse aparte.
+                </div>
+              </button>
+
+              <div style={{ background: T.bg2, border: `1px solid ${T.lineSoft}`, borderRadius: 14, padding: "14px 15px", margin: "14px 0" }}>
+                <div style={{ fontSize: 13, color: T.text, fontWeight: 600, marginBottom: 8 }}>Resumen</div>
+                {rango.archivo && (
+                  <div style={{ fontSize: 12.5, color: T.mut, lineHeight: 1.7, marginBottom: 8, paddingBottom: 8, borderBottom: `1px solid ${T.lineSoft}` }}>
+                    El archivo cubre del <b style={{ color: T.text }}>{fmtDate(rango.archivo.desde)}</b> al{" "}
+                    <b style={{ color: T.text }}>{fmtDate(rango.archivo.hasta)}</b> ({rango.archivo.dias} día(s)).<br />
+                    {rango.nuevas
+                      ? <>Hay novedades desde el <b style={{ color: T.green }}>{fmtDate(rango.nuevas.desde)}</b> ({rango.nuevas.dias} día(s) con movimientos nuevos).</>
+                      : <b style={{ color: T.mut2 }}>Todo lo del archivo ya está cargado.</b>}
+                  </div>
+                )}
+                <div style={{ fontSize: 12.5, color: T.mut, lineHeight: 1.8 }}>
+                  Líneas leídas del archivo: <b style={{ color: T.text }}>{rawOps.length}</b><br />
+                  {comUnidas > 0 && (<>Comisiones unidas a su movimiento: <b style={{ color: T.gold }}>{comUnidas}</b><br /></>)}
+                  Movimientos resultantes: <b style={{ color: T.text }}>{ops.length}</b><br />
+                  Nuevos a importar: <b style={{ color: T.green }}>{analysis.nuevas.length}</b><br />
+                  Ya registrados (se omiten): <b style={{ color: T.mut2 }}>{analysis.repetidas}</b>
+                  {analysis.sinRef > 0 && (<><br />Sin referencia del banco: <b style={{ color: T.gold }}>{analysis.sinRef}</b></>)}
+                </div>
+                {refCompartidas > 0 && (
+                  <div style={{ fontSize: 12, color: T.mut, lineHeight: 1.5, marginTop: 10 }}>
+                    {refCompartidas} línea(s) comparten referencia pero no parecen comisión
+                    (montos grandes o abonos, como las liquidaciones de punto de venta):
+                    entran como movimientos separados.
+                  </div>
+                )}
+              </div>
+
+              {analysis.nuevas.length > 0 && (
+                <>
+                  <div style={{ ...sectionTitle, marginBottom: 8 }}>Vista previa</div>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: 14 }}>
+                    {analysis.nuevas.slice(0, 6).map((op, i) => (
+                      <div key={i} style={{ ...rowCard, background: T.bg2, padding: "10px 12px" }}>
+                        <div style={{ minWidth: 0 }}>
+                          <div style={{ fontSize: 13, color: T.text, fontWeight: 600, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                            {op.desc || "(sin descripción)"}
+                          </div>
+                          <div style={{ fontSize: 11.5, color: T.mut, fontFamily: MONO }}>
+                            {op.date}{op.ref ? ` · ref ${op.ref}` : " · sin ref"}
+                          </div>
+                          {op.commission > 0 && (
+                            <div style={{ fontSize: 11.5, color: T.gold, marginTop: 2 }}>
+                              + comisión {money(op.commission, acctCur)}
+                              {op.comLines > 1 ? ` (${op.comLines} líneas)` : ""}
+                            </div>
+                          )}
+                        </div>
+                        <span style={{ fontFamily: MONO, fontSize: 13, fontWeight: 600, color: op.kind === "income" ? T.green : T.red, flexShrink: 0 }}>
+                          {op.kind === "income" ? "+" : "−"}{money(op.amount, acctCur)}
+                        </span>
+                      </div>
+                    ))}
+                    {analysis.nuevas.length > 6 && (
+                      <div style={{ fontSize: 12, color: T.mut2, textAlign: "center" }}>y {analysis.nuevas.length - 6} más…</div>
+                    )}
+                  </div>
+                </>
+              )}
+
+              {/* Confirmación de destino: última oportunidad de corregir la cuenta */}
+              <div style={{ background: T.card2, border: `1px solid ${acct ? T.gold : T.red}`, borderRadius: 14, padding: "14px 15px", marginBottom: 12 }}>
+                <div style={{ fontSize: 12.5, color: T.mut, marginBottom: 8, lineHeight: 1.5 }}>
+                  {analysis.nuevas.length > 0
+                    ? `Se van a cargar ${analysis.nuevas.length} movimiento(s) en:`
+                    : "Cuenta destino:"}
+                </div>
+                {selectorCuenta("Cuenta destino")}
+                {formCuentaNueva}
+                {acct ? (
+                  <div style={{ fontSize: 12, color: T.mut2, lineHeight: 1.5 }}>
+                    Los montos se guardan en <b style={{ color: T.text }}>{acctCur.toUpperCase()}</b>, la
+                    moneda de esta cuenta. Verificá que sea la del estado de cuenta.
+                  </div>
+                ) : (
+                  <div style={{ fontSize: 12.5, color: T.red, lineHeight: 1.5 }}>
+                    Elegí una cuenta antes de importar.
+                  </div>
+                )}
+              </div>
+
+              <PrimaryBtn color={T.green} disabled={analysis.nuevas.length === 0 || !accountId || creando} onClick={doImport}>
+                {!accountId ? "Elegí la cuenta destino"
+                  : analysis.nuevas.length === 0 ? "Nada nuevo para importar"
+                  : `Importar ${analysis.nuevas.length} movimiento(s) en ${acct ? acct.name : ""}`}
+              </PrimaryBtn>
+            </>
+          )}
+        </>
+      )}
+    </Sheet>
+  );
+}
+
+/* Intenta sacar el nombre del cliente de la descripción del banco.
+   Banesco escribe las transferencias como:
+     "TRF.MB 0134 V019224721 JIMENEZ WOLF EDUA 7101"
+      ^tipo  ^banco ^cédula/RIF ^nombre        ^código
+   Si no reconoce el formato devuelve "" y el campo queda para escribir a mano. */
+function sugerirPersona(desc) {
+  const s = String(desc || "").trim();
+  let m = s.match(/^TRF\.[A-Z]{2}\s+\d{4}\s+[VJEGPvjegp]-?\d+\s+(.+?)\s+\d{3,}$/);
+  if (m && m[1].trim().length > 2) return m[1].trim();
+  m = s.match(/^TRF\.[A-Z]{2}\s+\d{4}\s+[VJEGPvjegp]-?\d+\s+(.+)$/);
+  if (m && m[1].trim().length > 2) return m[1].trim();
+  return "";
+}
+
+/* ─────────────────────────────  Justificar movimientos importados  ───────────────────────────── */
+function JustifySheet({ state, projects, txns, cur, accounts, divisas, onClose, onSave, onEdit }) {
+  const open = !!state;
+  const target = (state && state.list) || [];
+  const single = target.length === 1 ? target[0] : null;
+  const [motivo, setMotivo] = useState("");
+  const [project, setProject] = useState("");
+  const [newProject, setNewProject] = useState("");
+  const [applySimilar, setApplySimilar] = useState(false);
+  // Operación de divisas asociada a este movimiento
+  const [divKind, setDivKind] = useState("");   // "" | "compra" | "venta"
+  const [persona, setPersona] = useState("");
+  const [tasa, setTasa] = useState("");
+
+  useEffect(() => {
+    if (!state) return;
+    setMotivo(single && single.motivo ? single.motivo : "");
+    setProject(single && single.project ? single.project : "");
+    setNewProject("");
+    setApplySimilar(false);
+    // Si el movimiento ya estaba marcado como divisa, se recuperan sus datos
+    const yaDiv = single && single.divisaId
+      ? (divisas || []).find((d) => d.id === single.divisaId)
+      : null;
+    setDivKind(yaDiv ? yaDiv.kind : "");
+    setPersona(yaDiv ? (yaDiv.persona || "") : (single ? sugerirPersona(single.bankDesc) : ""));
+    setTasa(yaDiv && yaDiv.tasa ? String(yaDiv.tasa) : "");
+  }, [state]);
+
+  /* Una compra de divisas sale de la cuenta (se paga en Bs) y una venta entra.
+     Se propone según el tipo del movimiento, pero se puede cambiar. */
+  const personasUsadas = useMemo(
+    () => Array.from(new Set((divisas || []).map((d) => d.persona).filter(Boolean))).sort(),
+    [divisas]
+  );
+  const montoVes = single ? (single.amount || 0) : 0;
+  const nTasa = numVE(tasa);
+  const usdCalc = divKind && nTasa > 0 ? montoVes / nTasa : 0;
+  const divisaValida = !divKind || (nTasa > 0 && persona.trim() && single);
+
+  /* "Similares": descripción del banco IDÉNTICA (sin quitar dígitos), misma
+     cuenta y mismo tipo. Agrupar por texto aproximado juntaba cobros de
+     clientes distintos ("PAGO MOVIL RECIBIDO 0414…" vs "…0424…"), así que se
+     exige coincidencia exacta: sirve para comisiones, nóminas y cargos fijos. */
+  const descKey = (t) => stmtNorm(t && t.bankDesc).replace(/\s+/g, " ");
+  const similares = useMemo(() => {
+    if (!single || !single.bankDesc) return [];
+    const k = descKey(single);
+    if (k.length < 6) return [];
+    return (txns || []).filter(
+      (t) => t.id !== single.id && t.pending && t.accountId === single.accountId && t.kind === single.kind && descKey(t) === k
+    );
+  }, [single, txns]);
+
+  // Aviso: cuántos de los seleccionados ya tenían un motivo que se va a reemplazar.
+  const yaJustificados = target.filter((t) => t.motivo && String(t.motivo).trim()).length;
+
+  const proj = project === "__new" ? newProject.trim() : project;
+  const valid = motivo.trim() && !(project === "__new" && !newProject.trim());
+  const acctName = (id) => ((accounts || []).find((a) => a.id === id) || {}).name || "—";
+  const selStyle = { ...inputStyle, appearance: "none", fontSize: 14, padding: "11px 12px" };
+
+  return (
+    <Sheet
+      open={open}
+      onClose={onClose}
+      title={
+        single
+          ? (single.pending ? "Justificar movimiento" : "Clasificación del movimiento")
+          : `Justificar ${target.length} movimientos`
+      }
+    >
+      {single && (
+        <div style={{ background: T.bg2, border: `1px solid ${T.lineSoft}`, borderRadius: 14, padding: "13px 15px", marginBottom: 16 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 10 }}>
+            <span style={{ fontSize: 12, color: T.mut }}>{fmtDate(single.date)} · {acctName(single.accountId)}</span>
+            <span style={{ fontFamily: MONO, fontSize: 15, fontWeight: 600, color: single.kind === "income" ? T.green : T.red }}>
+              {single.kind === "income" ? "+" : "−"}{money(single.amount, single.currency || cur)}
+            </span>
+          </div>
+          {single.bankDesc && <div style={{ fontSize: 13, color: T.text, marginTop: 6, lineHeight: 1.5 }}>{single.bankDesc}</div>}
+          {single.commission > 0 && (
+            <div style={{ fontSize: 12, color: T.gold, marginTop: 4 }}>
+              Comisión del banco: {money(single.commission, single.currency || cur)}
+            </div>
+          )}
+          {single.ref && (
+            <div style={{ fontSize: 11.5, color: T.mut2, fontFamily: MONO, marginTop: 5 }}>Referencia {single.ref}</div>
+          )}
+          {onEdit && (
+            <button
+              onClick={() => { onClose(); onEdit(single); }}
+              style={{ ...btnGhost, color: T.blue, fontSize: 12.5, fontWeight: 600, padding: "8px 0 0", marginTop: 4 }}
+            >
+              Corregir monto, fecha o cuenta →
+            </button>
+          )}
+        </div>
+      )}
+
+      {!single && (
+        <div style={{ fontSize: 12.5, color: T.mut, lineHeight: 1.6, marginBottom: 14 }}>
+          Se aplicará el mismo motivo y proyecto a los {target.length} movimientos seleccionados.
+        </div>
+      )}
+
+      {yaJustificados > 0 && (
+        <div style={{ background: T.redSoft, border: `1px solid ${T.red}`, borderRadius: 12, padding: "12px 14px", marginBottom: 14, fontSize: 12.5, color: T.text, lineHeight: 1.5 }}>
+          Atención: {yaJustificados} de estos movimientos ya tenían un motivo asignado y será <b>reemplazado</b>.
+        </div>
+      )}
+
+      <Field label="Motivo / justificación">
+        <input
+          style={inputStyle}
+          value={motivo}
+          onChange={(e) => setMotivo(e.target.value)}
+          placeholder="Ej. Pago a proveedor, Cobro cliente, Comisión bancaria…"
+          list="motivos-usados"
+        />
+      </Field>
+      <datalist id="motivos-usados">
+        {Array.from(new Set((txns || []).map((t) => t.motivo).filter(Boolean))).slice(0, 60).map((m) => (
+          <option key={m} value={m} />
+        ))}
+      </datalist>
+
+      <Field label="Proyecto (opcional)">
+        <select style={selStyle} value={project} onChange={(e) => setProject(e.target.value)}>
+          <option value="">Sin proyecto</option>
+          {(projects || []).map((p) => (<option key={p} value={p}>{p}</option>))}
+          <option value="__new">+ Nuevo proyecto…</option>
+        </select>
+      </Field>
+      {project === "__new" && (
+        <Field label="Nombre del proyecto">
+          <input style={inputStyle} value={newProject} onChange={(e) => setNewProject(e.target.value)} placeholder="Nombre" />
+        </Field>
+      )}
+
+      {/* ── Operación de divisas ── */}
+      {single && (
+        <div style={{ background: T.bg2, border: `1px solid ${divKind ? T.violet : T.lineSoft}`, borderRadius: 14, padding: "14px 15px", marginBottom: 14 }}>
+          <div style={{ fontSize: 13, color: T.text, fontWeight: 600, marginBottom: 4 }}>¿Es una operación de divisas?</div>
+          <div style={{ fontSize: 12, color: T.mut, lineHeight: 1.5, marginBottom: 10 }}>
+            Si lo marcás, se crea sola la operación en Divisas y en Cuentas por Cobrar.
+            Solo hace falta el cliente y la tasa.
+          </div>
+          <div style={{ display: "flex", background: T.card, borderRadius: 12, padding: 4, marginBottom: divKind ? 14 : 0, gap: 2 }}>
+            {[["", "No"], ["compra", "Compra"], ["venta", "Venta"]].map(([k, label]) => (
+              <button
+                key={k || "no"}
+                onClick={() => setDivKind(k)}
+                style={{
+                  flex: 1, border: "none", borderRadius: 9, padding: "10px 6px", fontSize: 13.5, fontWeight: 600,
+                  fontFamily: FONT, cursor: "pointer",
+                  background: divKind === k ? (k ? T.violet : T.mut2) : "transparent",
+                  color: divKind === k ? "#0A0F1E" : T.mut,
+                }}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+
+          {divKind && (
+            <>
+              {((divKind === "compra" && single.kind !== "expense") || (divKind === "venta" && single.kind !== "income")) && (
+                <div style={{ fontSize: 12, color: T.gold, lineHeight: 1.5, marginBottom: 10 }}>
+                  Ojo: una compra de divisas normalmente sale de la cuenta y una venta entra.
+                  Este movimiento es un {single.kind === "income" ? "ingreso" : "egreso"}.
+                </div>
+              )}
+              <Field label="Cliente">
+                <input style={inputStyle} value={persona} onChange={(e) => setPersona(e.target.value)} placeholder="Nombre del cliente" list="personas-divisas" />
+              </Field>
+              <datalist id="personas-divisas">
+                {personasUsadas.map((p) => (<option key={p} value={p} />))}
+              </datalist>
+
+              <Field label={`Tasa (${(single.currency || cur).toUpperCase()} por USD)`}>
+                <input style={{ ...inputStyle, fontFamily: MONO, fontSize: 20 }} value={tasa} onChange={(e) => setTasa(e.target.value)} inputMode="decimal" placeholder="0,00" />
+              </Field>
+
+              <div style={{ background: T.card, borderRadius: 12, padding: "12px 14px", fontSize: 12.5, color: T.mut, lineHeight: 1.9 }}>
+                <div style={{ display: "flex", justifyContent: "space-between" }}>
+                  <span>Monto del movimiento</span>
+                  <span style={{ fontFamily: MONO, color: T.text }}>{money(montoVes, single.currency || cur)}</span>
+                </div>
+                {single.commission > 0 && (
+                  <div style={{ display: "flex", justifyContent: "space-between" }}>
+                    <span>Comisión del banco</span>
+                    <span style={{ fontFamily: MONO, color: T.gold }}>{money(single.commission, single.currency || cur)}</span>
+                  </div>
+                )}
+                <div style={{ display: "flex", justifyContent: "space-between", borderTop: `1px solid ${T.lineSoft}`, marginTop: 6, paddingTop: 6 }}>
+                  <span style={{ color: T.text, fontWeight: 600 }}>{divKind === "compra" ? "USD comprados" : "USD vendidos"}</span>
+                  <span style={{ fontFamily: MONO, fontSize: 16, fontWeight: 600, color: nTasa > 0 ? T.violet : T.mut2 }}>
+                    {nTasa > 0 ? fmtUsd(usdCalc) : "poné la tasa"}
+                  </span>
+                </div>
+              </div>
+
+              {divKind === "compra" && nTasa > 0 && persona.trim() && (
+                <div style={{ fontSize: 12, color: T.mut2, lineHeight: 1.5, marginTop: 10 }}>
+                  Va a quedar {fmtUsd(usdCalc)} por cobrar a {persona.trim()} en la pestaña CxC.
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      )}
+
+      {similares.length > 0 && !divKind && (
+        <button
+          onClick={() => setApplySimilar((v) => !v)}
+          style={{
+            width: "100%", textAlign: "left", background: applySimilar ? T.goldSoft : T.bg2,
+            border: `1px solid ${applySimilar ? T.gold : T.lineSoft}`, borderRadius: 12,
+            padding: "12px 14px", marginBottom: 14, cursor: "pointer", fontFamily: FONT,
+          }}
+        >
+          <div style={{ fontSize: 13.5, fontWeight: 600, color: applySimilar ? T.gold : T.text }}>
+            {applySimilar ? "✓ " : ""}Aplicar también a {similares.length} movimiento(s) similar(es)
+          </div>
+          <div style={{ fontSize: 12, color: T.mut, marginTop: 3, lineHeight: 1.5 }}>
+            Otros movimientos por justificar con la misma descripción del banco.
+          </div>
+        </button>
+      )}
+
+      <PrimaryBtn
+        color={divKind ? T.violet : T.green}
+        disabled={!valid || !divisaValida}
+        onClick={() => {
+          const ids = target.map((t) => t.id).concat(applySimilar ? similares.map((t) => t.id) : []);
+          // Siempre se informa del movimiento único: si divKind quedó vacío y
+          // antes era una divisa, hay que deshacer esa operación.
+          const divisa = single
+            ? { txnId: single.id, kind: divKind || null, persona: persona.trim(), tasa: nTasa }
+            : null;
+          onSave(ids, { motivo: motivo.trim(), project: proj || undefined }, divisa);
+        }}
+      >
+        {!divisaValida
+          ? (!persona.trim() ? "Falta el cliente" : "Falta la tasa")
+          : divKind === "compra" ? "Justificar y registrar la compra"
+          : divKind === "venta" ? "Justificar y registrar la venta"
+          : "Justificar"}
+      </PrimaryBtn>
+    </Sheet>
   );
 }
 
@@ -4286,6 +5355,286 @@ function wbToBlobUrl(XLSX, wb, name) {
 function normRef(s) {
   return String(s || "").replace(/\s+/g, "").replace(/[^0-9a-zA-Z]/g, "").replace(/^0+/, "").toLowerCase();
 }
+/* ─────────────────────────────  Estado de cuenta bancario  ─────────────────────────────
+   Lee el .xlsx que emite el banco y lo convierte en movimientos listos para justificar.
+   La REFERENCIA del banco es la clave: sirve de código validador y de anti-duplicado,
+   así el mismo estado de cuenta se puede subir dos veces sin duplicar nada. */
+/* El ORDEN importa: cada campo se asigna a una columna y esa columna queda
+   ocupada. Así "Fecha Valor" no le roba la columna a "Monto", y
+   "Descripción de la Operación" no le roba la columna a "Referencia". */
+const STMT_FIELDS = ["fecha", "credito", "debito", "desc", "ref", "monto", "saldo"];
+const STMT_HINTS = {
+  fecha: ["fecha", "f. valor", "fec ", "date"],
+  ref: ["referencia", "ref", "comprobante", "operacion", "operación", "nro", "n°", "numero", "número", "documento"],
+  desc: ["descripcion", "descripción", "concepto", "detalle", "observacion", "observación", "transaccion", "transacción", "motivo", "beneficiario"],
+  credito: ["credito", "crédito", "haber", "abono", "deposito", "depósito", "entrada", "ingreso"],
+  debito: ["debito", "débito", "debe", "cargo", "retiro", "salida", "egreso"],
+  monto: ["monto", "importe", "valor", "amount"],
+  saldo: ["saldo", "balance"],
+};
+
+function stmtNorm(s) {
+  return String(s == null ? "" : s).toLowerCase().trim();
+}
+
+/* Fecha de estado de cuenta. Devuelve "" si la celda no es una fecha de verdad,
+   para que los pies de página ("TOTALES", "SALDO ANTERIOR") no entren como
+   movimientos. También entiende el número serial de Excel. */
+function stmtDate(v) {
+  if (v == null || v === "") return "";
+  const raw = String(v).trim();
+  // Serial de Excel (días desde 1899-12-30). Rango razonable: 1990-2100.
+  if (/^\d{5}(\.\d+)?$/.test(raw)) {
+    const n = Number(raw);
+    if (n >= 32874 && n <= 73415) {
+      const ms = Math.round((n - 25569) * 86400000);
+      const d = new Date(ms);
+      if (!isNaN(d.getTime())) return d.toISOString().slice(0, 10);
+    }
+    return "";
+  }
+  if (!/\d/.test(raw)) return "";
+  const iso = fechaISO(raw);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(iso || ""))) return "";
+  const [y, m, d] = String(iso).split("-").map(Number);
+  if (y < 1990 || y > 2100 || m < 1 || m > 12 || d < 1 || d > 31) return "";
+  return iso;
+}
+
+/* Valores que algunos bancos ponen en la columna de referencia cuando no hay
+   una: no identifican nada, así que se tratan como "sin referencia". Si no,
+   todas las comisiones del mes parecerían la misma operación. */
+const STMT_REF_VACIAS = new Set(["", "0", "00", "000", "na", "n/a", "s/n", "sn", "sinreferencia", "sinref", "ninguna", "null", "none", "-", "--"]);
+
+/* Clave de referencia para IDENTIDAD (no para comparación laxa).
+   A diferencia de normRef, conserva los ceros a la izquierda: para el banco
+   "000123" y "123" son referencias distintas. */
+function stmtRefKey(s) {
+  const raw = String(s == null ? "" : s).trim().toLowerCase();
+  const limpia = raw.replace(/[^0-9a-z]/g, "");
+  if (STMT_REF_VACIAS.has(raw) || STMT_REF_VACIAS.has(limpia)) return "";
+  // Solo ceros ("00000000000" en Banesco) no identifica ninguna operación:
+  // el banco lo usa para cargos varios, y tratarlo como referencia haría que
+  // dos cargos distintos del mismo día por el mismo monto parecieran uno.
+  if (/^0+$/.test(limpia)) return "";
+  return limpia;
+}
+
+/* Lee una tabla HTML. Varios bancos venezolanos —Banesco entre ellos— entregan
+   el estado de cuenta como HTML con extensión .xls. Se parsea con el DOM del
+   navegador en vez de con la librería de Excel: es exacto con los acentos y no
+   depende de que la librería adivine el formato. */
+function htmlTableToRows(text) {
+  const doc = new DOMParser().parseFromString(text, "text/html");
+  const tables = Array.from(doc.querySelectorAll("table"));
+  if (!tables.length) return [];
+  let best = tables[0];
+  tables.forEach((t) => { if (t.rows.length > best.rows.length) best = t; });
+  return Array.from(best.rows).map((tr) =>
+    Array.from(tr.cells).map((td) => String(td.textContent || "").replace(/ /g, " ").trim())
+  );
+}
+
+/* ¿El archivo es en realidad HTML disfrazado de .xls? */
+function looksLikeHtml(sample) {
+  const s = String(sample || "").slice(0, 1024).trim().toLowerCase();
+  return s.startsWith("<") || s.indexOf("<table") >= 0 || s.indexOf("<html") >= 0;
+}
+
+/* Decodifica respetando los acentos: intenta UTF-8 y, si aparecen caracteres
+   de reemplazo, reintenta con windows-1252 (lo que usan algunos bancos). */
+function decodeText(buf) {
+  let t = "";
+  try { t = new TextDecoder("utf-8").decode(buf); } catch (e) { t = ""; }
+  if (t && t.indexOf("�") >= 0) {
+    try { return new TextDecoder("windows-1252").decode(buf); } catch (e) { /* se queda con utf-8 */ }
+  }
+  return t;
+}
+
+/* Busca la fila de encabezado y propone un mapeo de columnas.
+   Devuelve { headerIdx, header, map } — map con índices (o -1) por campo. */
+function detectStatementLayout(rows) {
+  let best = null;
+  const limit = Math.min(rows.length, 40);
+  for (let i = 0; i < limit; i++) {
+    const cells = (rows[i] || []).map(stmtNorm);
+    if (!cells.some((c) => c)) continue;
+    const taken = new Set();
+    const map = {};
+    let score = 0;
+    // Tres pasadas por campo: coincidencia exacta, luego por prefijo, luego
+    // por contenido. Una columna ya asignada no se vuelve a ofrecer.
+    STMT_FIELDS.forEach((field) => {
+      const hints = STMT_HINTS[field];
+      const find = (test) => cells.findIndex((c, idx) => c && !taken.has(idx) && hints.some((k) => test(c, k)));
+      let idx = find((c, k) => c === k);
+      if (idx < 0) idx = find((c, k) => c.indexOf(k) === 0);
+      if (idx < 0) idx = find((c, k) => c.includes(k));
+      map[field] = idx;
+      if (idx >= 0) { taken.add(idx); score++; }
+    });
+    // "saldo" solo no basta: exigimos fecha + (referencia o algún monto)
+    const usable = map.fecha >= 0 && (map.ref >= 0 || map.monto >= 0 || map.credito >= 0 || map.debito >= 0);
+    if (usable && (!best || score > best.score)) best = { headerIdx: i, header: rows[i] || [], map, score };
+  }
+  return best;
+}
+
+/* Convierte las filas crudas en movimientos usando el mapeo dado.
+   signMode: "cols" (débito/crédito separados) | "signed" (un monto con signo)
+             | "income" | "expense" (todo del mismo tipo) */
+function rowsToStatementOps(rows, headerIdx, map, signMode) {
+  const out = [];
+  for (let i = headerIdx + 1; i < rows.length; i++) {
+    const row = rows[i];
+    if (!row || row.every((c) => !String(c == null ? "" : c).trim())) continue;
+    const at = (idx) => (idx >= 0 ? row[idx] : undefined);
+    // Si la celda de fecha no es una fecha válida, la fila no es un movimiento
+    // (encabezados repetidos, subtotales, "SALDO ANTERIOR", pies de página).
+    const date = stmtDate(at(map.fecha));
+    if (!date) continue;
+    const ref = String(at(map.ref) == null ? "" : at(map.ref)).trim();
+    const desc = String(at(map.desc) == null ? "" : at(map.desc)).trim();
+
+    let amount = NaN;
+    let kind = null;
+    if (signMode === "cols") {
+      const cr = map.credito >= 0 ? numVE(at(map.credito)) : NaN;
+      const db = map.debito >= 0 ? numVE(at(map.debito)) : NaN;
+      const crOk = !isNaN(cr) && Math.abs(cr) > 0;
+      const dbOk = !isNaN(db) && Math.abs(db) > 0;
+      if (crOk) { amount = Math.abs(cr); kind = "income"; }
+      else if (dbOk) { amount = Math.abs(db); kind = "expense"; }
+    } else {
+      const raw = map.monto >= 0 ? numVE(at(map.monto)) : NaN;
+      if (!isNaN(raw)) {
+        amount = Math.abs(raw);
+        if (signMode === "signed") kind = raw < 0 ? "expense" : "income";
+        else kind = signMode === "income" ? "income" : "expense";
+      }
+    }
+    if (isNaN(amount) || !(amount > 0) || !kind) continue;
+
+    // Saldo acumulado que trae el banco en esa línea. Es la clave del cuadre
+    // diario: permite comparar el saldo del banco contra el de la app sin que
+    // nadie tenga que sumar a mano.
+    const bankBalance = map.saldo >= 0 ? numVE(at(map.saldo)) : NaN;
+
+    out.push({
+      date, ref, desc, amount, kind,
+      refKey: stmtRefKey(ref),
+      rowNum: i + 1,
+      bankBalance: isNaN(bankBalance) ? undefined : bankBalance,
+    });
+  }
+  return out;
+}
+
+/* Proporción máxima que puede representar una comisión respecto del movimiento
+   que la genera. Banesco cobra 0,3% y 1,5%; el tope holgado deja pasar esas y
+   corta los falsos positivos. */
+const STMT_MAX_COM_RATIO = 0.25;
+
+/* En el estado de cuenta, cuando una referencia aparece más de una vez, las
+   líneas extra suelen ser la COMISIÓN de esa misma transferencia — no
+   movimientos aparte. Se unen: la línea de mayor monto es el movimiento y el
+   resto se suma como comisión.
+
+   Pero la referencia repetida NO siempre significa comisión. Banesco usa
+   referencias correlativas de lote ("00000000003") para agrupar liquidaciones
+   de punto de venta: tres depósitos grandes y positivos que comparten
+   referencia y fecha, y que fusionar destrozaría el saldo. Por eso se exige
+   que cada línea accesoria sea:
+
+     · un DÉBITO (una comisión siempre cobra, nunca abona), y
+     · pequeña frente al movimiento (≤ 25% del principal).
+
+   Si alguna línea del grupo no cumple, el grupo NO se fusiona y cada línea
+   entra como movimiento aparte. Verificado contra un estado de cuenta real de
+   499 líneas: el saldo reconstruido coincide al céntimo con el del banco.
+
+   La comisión siempre se RESTA del saldo (ver acctBalance), tanto en ingresos
+   como en egresos, que es justo lo que hace el banco. */
+function mergeStatementCommissions(ops) {
+  // Se agrupa por referencia Y fecha: la comisión siempre cae el mismo día que
+  // su transferencia. Sin la fecha, tres comisiones mensuales que compartan una
+  // referencia genérica se fusionarían como si fueran una sola operación.
+  const groupKey = (op) => (op.refKey ? `${op.refKey}|${op.date}` : "");
+  const groups = new Map();
+  ops.forEach((op) => {
+    const k = groupKey(op);
+    if (!k) return;
+    if (!groups.has(k)) groups.set(k, []);
+    groups.get(k).push(op);
+  });
+
+  const consumed = new Set();
+  const merged = [];
+  ops.forEach((op) => {
+    if (consumed.has(op)) return;
+    const gk = groupKey(op);
+    const g = gk ? groups.get(gk) : null;
+    if (!g || g.length < 2) { merged.push(op); return; }
+    // El movimiento es el de mayor monto; las demás líneas son candidatas a comisión.
+    let principal = g[0];
+    g.forEach((x) => { if (x.amount > principal.amount) principal = x; });
+    const fees = g.filter((x) => x !== principal);
+
+    // Toda línea accesoria debe ser un débito y pequeña frente al principal.
+    const sonComisiones = fees.every(
+      (x) => x.kind === "expense" && x.amount <= principal.amount * STMT_MAX_COM_RATIO
+    );
+    if (!sonComisiones) {
+      // Grupo de lote o dos cargos distintos: cada línea va por su cuenta.
+      merged.push({ ...op, refCompartida: true });
+      return;
+    }
+
+    g.forEach((x) => consumed.add(x));
+    // El saldo del banco que vale es el de la ÚLTIMA línea del grupo: el que
+    // queda después de cobrar también la comisión.
+    let ultima = g[0];
+    g.forEach((x) => { if ((x.rowNum || 0) > (ultima.rowNum || 0)) ultima = x; });
+    merged.push({
+      ...principal,
+      commission: fees.reduce((s, x) => s + (x.amount || 0), 0),
+      comLines: fees.length,
+      bankBalance: ultima.bankBalance,
+      rowNum: ultima.rowNum,
+    });
+  });
+  return merged;
+}
+
+/* Clave de identidad de un movimiento bancario dentro de una cuenta.
+   SIEMPRE incluye fecha y monto, incluso cuando hay referencia: hay bancos que
+   repiten la referencia (o ponen "N/A") en varias líneas, y si la clave fuera
+   solo la referencia esos movimientos se descartarían como falsos duplicados.
+   Sin referencia se completa con la descripción. */
+function stmtKeyOf(accountId, op) {
+  const cents = Math.round((op.amount || 0) * 100);
+  const rk = op.refKey || stmtRefKey(op.ref);
+  if (rk) return `${accountId}|r|${rk}|${op.date}|${cents}`;
+  return `${accountId}|h|${op.date}|${cents}|${stmtNorm(op.desc).replace(/\s+/g, " ").slice(0, 40)}`;
+}
+
+/* Índice de lo ya registrado, para no duplicar al reimportar el mismo estado.
+   Se cuenta CUÁNTAS veces existe cada clave, no si existe: un comercio puede
+   cobrar dos veces el mismo monto el mismo día y ambas son operaciones reales.
+   Si el archivo trae 2 y en la app hay 1, se importa solo la que falta. */
+function buildTxnIndex(txns) {
+  const m = new Map();
+  (txns || []).forEach((t) => {
+    if (!t || !t.accountId) return;
+    // Se recalcula la clave desde t.ref (no se confía en refKey guardado) para
+    // que todo el índice use siempre la misma regla de normalización.
+    const k = stmtKeyOf(t.accountId, { ref: t.ref, date: t.date, amount: t.amount, desc: t.bankDesc || t.motivo });
+    m.set(k, (m.get(k) || 0) + 1);
+  });
+  return m;
+}
+
 function parseBankRows(rows) {
   const norm = (s) => String(s || "").toLowerCase().trim();
   let hi = -1, cols = null;
