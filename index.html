@@ -29,12 +29,11 @@
 <div id="root"><div class="boot">Cargando Patrimonio&hellip;<small id="bootmsg">iniciando&hellip;</small></div></div>
 
 <script type="text/plain" id="app-src">
-
 const { useState, useEffect, useRef, useMemo } = React;
 
 /* Versión de compilación. Sirve para confirmar de un vistazo qué build está
    corriendo en pantalla (útil para detectar caché vieja de la PWA). */
-const BUILD = "v4.8 · referencia compartida con otro destino = otro movimiento · 2026-08-06";
+const BUILD = "v4.7 · Banesco, Mercantil empresa y personas · 2026-08-05";
 try { console.log("[Patrimonio] build:", BUILD); } catch (e) {}
 
 /* ─────────────────────────────  Tokens de diseño  ───────────────────────────── */
@@ -460,13 +459,14 @@ const capOf = (v) => Math.max(0, (v.usd || 0) * (v.tasa || 0) - comOp(v));
 
 // Asignación de compras a ventas:
 //  - respeta las asignaciones manuales (compra.manualAllocs, en orden)
-//  - el resto se asigna automáticamente por orden de llegada (FIFO), fraccionando
+//  - el resto se asigna automáticamente por orden de FECHA (más antigua primero), fraccionando
 // El automático no restringe por fecha: una compra puede alimentar una venta anterior o posterior.
 function allocateFIFO(ventas, compras) {
-  // Orden de llegada: el orden en que se cargaron (fila del Excel para lo sincronizado).
-  // No se ordena por fecha: una compra puede alimentar una venta anterior o posterior.
+  // Orden por FECHA (ascendente): las compras se asignan a las ventas cronológicamente.
+  // En caso de empate de fecha, se usa el orden de carga (fila del Excel / creación) como desempate.
   const seq = (x) => (x.row != null ? x.row : (x.createdAt || 0));
-  const arriv = (a, b) => seq(a) - seq(b);
+  const dateKey = (x) => x.date || "";
+  const arriv = (a, b) => (dateKey(a) < dateKey(b) ? -1 : dateKey(a) > dateKey(b) ? 1 : seq(a) - seq(b));
   const buckets = ventas.slice().sort(arriv).map((v) => ({ v, cap: capOf(v), used: 0 }));
   const byId = {};
   buckets.forEach((b) => { byId[b.v.id] = b; });
@@ -3267,9 +3267,7 @@ function StatementImportSheet({ open, onClose, accounts, cur, txns, onImport, on
                 </div>
                 <div style={{ fontSize: 12, color: T.mut, marginTop: 3, lineHeight: 1.5 }}>
                   Cuando una referencia sale más de una vez, la línea menor se suma como comisión
-                  del movimiento en lugar de cargarse aparte. Solo si su texto la nombra como cargo
-                  (comisión, IGTF, impuesto…) o va al mismo destino: si nombra otro beneficiario es
-                  otro movimiento y entra solo.
+                  del movimiento en lugar de cargarse aparte.
                 </div>
               </button>
 
@@ -3300,9 +3298,9 @@ function StatementImportSheet({ open, onClose, accounts, cur, txns, onImport, on
                 </div>
                 {refCompartidas > 0 && (
                   <div style={{ fontSize: 12, color: T.mut, lineHeight: 1.5, marginTop: 10 }}>
-                    {refCompartidas} línea(s) comparten referencia pero no son comisión:
-                    van a otro destino, o son montos grandes o abonos (las liquidaciones de punto
-                    de venta, por ejemplo). Entran como movimientos separados, que es lo que son.
+                    {refCompartidas} línea(s) comparten referencia pero no parecen comisión
+                    (montos grandes o abonos, como las liquidaciones de punto de venta):
+                    entran como movimientos separados.
                   </div>
                 )}
               </div>
@@ -5709,58 +5707,6 @@ const STMT_MAX_COM_RATIO = 0.25;
 
    La comisión siempre se RESTA del saldo (ver acctBalance), tanto en ingresos
    como en egresos, que es justo lo que hace el banco. */
-/* ¿La línea accesoria es de verdad una comisión, o es OTRO movimiento que
-   comparte referencia?
-
-   Los bancos reutilizan la referencia para todo un lote, así que dos
-   transferencias del mismo día a beneficiarios distintos pueden venir con el
-   mismo número. Ser un débito pequeño no alcanza para llamarla comisión: una
-   transferencia de 200 a otra persona, al lado de una de 1.000, cumple esas
-   dos condiciones y sin embargo es un movimiento aparte.
-
-   Regla: la línea accesoria es comisión solo si su texto la nombra como tal
-   (comisión, IGTF, impuesto, cargo…) o si va al MISMO destino que el
-   principal. Si nombra otro destino, es otro movimiento y entra solo.
-
-   Equivocarse hacia este lado es barato: el saldo sale igual de las dos
-   formas —la comisión se resta y el egreso también—, así que separar de más
-   no descuadra nada, mientras que fusionar de más esconde un movimiento
-   real. */
-/* Palabras con las que los bancos nombran un cargo. Van con borde de palabra a
-   propósito: Banesco escribe "COM ADQ. DIVISAS" (comisión) y también
-   "DB COMPRA DE DIVISAS" (el movimiento). Sin el borde, "compra" contendría
-   "com" y toda compra pasaría por comisión. */
-const STMT_PALABRAS_COMISION =
-  /(^|[^a-záéíóúñ])(com|comis[a-z]*|comn|impuesto[s]?|igtf|i\.g\.t\.f|itf|idb|i\.d\.b|gastos?|cargo[s]?|mantenim[a-z]*|manten|servicio[s]?|arancel[es]*|retenc[a-z]*|iva|debito automatico)([^a-záéíóúñ]|$)/;
-
-function stmtPareceComision(desc) {
-  return STMT_PALABRAS_COMISION.test(stmtNorm(desc).replace(/\s+/g, " "));
-}
-
-/* Destino de una línea: lo que permite decir si dos líneas van al mismo lado.
-   Del texto del banco se sacan los números largos (cédula o RIF, cuenta,
-   teléfono de pago móvil) y el nombre. Los números mandan cuando están: el
-   nombre a veces viene recortado y con distinto largo entre exportaciones. */
-function stmtDestino(desc) {
-  const t = stmtNorm(desc).replace(/\s+/g, " ").trim();
-  return {
-    numeros: (t.match(/\d{4,}/g) || []).join("|"),
-    letras: t.replace(/[^a-záéíóúñ ]/g, " ").replace(/\s+/g, " ").trim(),
-  };
-}
-
-function stmtMismoDestino(descA, descB) {
-  const a = stmtDestino(descA), b = stmtDestino(descB);
-  if (a.numeros && b.numeros) return a.numeros === b.numeros;
-  // Sin texto no hay con qué distinguir: se deja pasar la regla del monto.
-  if (!a.letras || !b.letras) return true;
-  if (a.letras === b.letras) return true;
-  // Uno puede venir recortado ("JIMENEZ WOLF EDUA" vs "JIMENEZ WOLF EDUARDO").
-  const corto = a.letras.length <= b.letras.length ? a.letras : b.letras;
-  const largo = a.letras.length <= b.letras.length ? b.letras : a.letras;
-  return corto.length >= 8 && largo.indexOf(corto) === 0;
-}
-
 function mergeStatementCommissions(ops) {
   // Se agrupa por referencia Y fecha: la comisión siempre cae el mismo día que
   // su transferencia. Sin la fecha, tres comisiones mensuales que compartan una
@@ -5786,14 +5732,9 @@ function mergeStatementCommissions(ops) {
     g.forEach((x) => { if (x.amount > principal.amount) principal = x; });
     const fees = g.filter((x) => x !== principal);
 
-    /* Toda línea accesoria debe ser un débito, pequeña frente al principal, y
-       además parecer una comisión: o su texto la nombra, o va al mismo destino.
-       Si nombra otro beneficiario es otro movimiento, por chico que sea. */
+    // Toda línea accesoria debe ser un débito y pequeña frente al principal.
     const sonComisiones = fees.every(
-      (x) =>
-        x.kind === "expense" &&
-        x.amount <= principal.amount * STMT_MAX_COM_RATIO &&
-        (stmtPareceComision(x.desc) || stmtMismoDestino(x.desc, principal.desc))
+      (x) => x.kind === "expense" && x.amount <= principal.amount * STMT_MAX_COM_RATIO
     );
     if (!sonComisiones) {
       // Grupo de lote o dos cargos distintos: cada línea va por su cuenta.
@@ -6371,7 +6312,6 @@ const css = `
 
 ReactDOM.createRoot(document.getElementById('root')).render(<App />);
 window.__mounted = true;
-
 
 </script>
 <script>
