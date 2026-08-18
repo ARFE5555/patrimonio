@@ -33,7 +33,7 @@ const { useState, useEffect, useRef, useMemo } = React;
 
 /* Versión de compilación. Sirve para confirmar de un vistazo qué build está
    corriendo en pantalla (útil para detectar caché vieja de la PWA). */
-const BUILD = "v4.7 · Banesco, Mercantil empresa y personas · 2026-08-05";
+const BUILD = "v4.9 · Banesco, Mercantil empresa y personas · 2026-08-05";
 try { console.log("[Patrimonio] build:", BUILD); } catch (e) {}
 
 /* ─────────────────────────────  Tokens de diseño  ───────────────────────────── */
@@ -128,7 +128,7 @@ const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBh
 const CLOUD = !!(SUPABASE_URL && SUPABASE_ANON_KEY);
 
 const ROLE_LABEL = { viewer: "Consulta", loader: "Carga de datos", editor: "Editor (todo)" };
-const TABLES = { accounts: "accounts", txns: "txns", divisas: "divisas", projectsMeta: "projects" };
+const TABLES = { accounts: "accounts", txns: "txns", divisas: "divisas", projectsMeta: "projects", prestamos: "prestamos" };
 
 // Comparación estable (ignora el orden de las claves y los undefined)
 function stableStr(v) {
@@ -974,6 +974,7 @@ function AppMain({ session, role, signOut }) {
   const [cryptoSheet, setCryptoSheet] = useState(false);
   const [divisas, setDivisas, rDiv] = useCollection("fin:divisas", TABLES.divisas, session, canWriteData, refreshTick);
   const [projectsMeta, setProjectsMeta, rPrj] = useCollection("fin:projectsMeta", TABLES.projectsMeta, session, canEditAll, refreshTick);
+  const [prestamos, setPrestamos, rPre] = useCollection("fin:prestamos", TABLES.prestamos, session, canWriteData, refreshTick);
   const [txnView, setTxnView] = useState("mov");
   const [diaFijado, setDiaFijado] = useState(""); // día que se vino a mirar desde el cierre diario
   const [divView, setDivView] = useState("ops");
@@ -1392,6 +1393,7 @@ function AppMain({ session, role, signOut }) {
     if (d.accounts) setAccounts(fixIds(d.accounts));
     if (d.txns) setTxns(fixIds(d.txns));
     if (d.divisas) setDivisas(fixIds(d.divisas));
+    if (d.prestamos) setPrestamos(fixIds(d.prestamos));
     if (d.projectsMeta) setProjectsMeta(d.projectsMeta.map((m) => ({ ...m, id: m.id || m.name })));
     if (d.settings) setSettings((s) => ({ ...s, ...d.settings }));
   }
@@ -1599,6 +1601,10 @@ function AppMain({ session, role, signOut }) {
                 projectsMeta={projectsMeta}
                 cur={cur}
                 canEdit={canEditAll}
+                prestamos={prestamos}
+                setPrestamos={setPrestamos}
+                canLoan={canWriteData}
+                prestamosListos={rPre}
                 onAdd={() => setProjectSheet({ mode: "new" })}
                 onEdit={(name) => setProjectSheet({ name })}
               />
@@ -1658,6 +1664,7 @@ function AppMain({ session, role, signOut }) {
             prices={prices}
             cur={cur}
             divisas={divisas}
+            prestamos={prestamos}
             projectsMeta={projectsMeta}
             onSync={syncSheet}
             onRestore={restoreBackup}
@@ -1765,6 +1772,7 @@ function AppMain({ session, role, signOut }) {
       <DivisaSheet
         state={divisaSheet}
         divisas={divisas}
+        binancePct={settings && settings.binancePct != null ? settings.binancePct : 0.2}
         onClose={() => setDivisaSheet(null)}
         onSave={saveDivisa}
         onDelete={deleteDivisa}
@@ -4142,7 +4150,7 @@ function CoinBadge({ sym }) {
 }
 
 /* ─────────────────────────────  Tab: Ajustes  ───────────────────────────── */
-function AjustesTab({ settings, setSettings, accounts, txns, prices, cur, divisas, projectsMeta, onSync, onRestore, session, role, signOut, canEditAll }) {
+function AjustesTab({ settings, setSettings, accounts, txns, prices, cur, divisas, prestamos, projectsMeta, onSync, onRestore, session, role, signOut, canEditAll }) {
   const theme = settings.theme || "dark";
   const autoRate = vesRateOf(settings, divisas);
   const [syncing, setSyncing] = useState(false);
@@ -4186,7 +4194,7 @@ function AjustesTab({ settings, setSettings, accounts, txns, prices, cur, divisa
       const ws = wb.Sheets["Respaldo"];
       if (!ws) throw new Error("Este archivo no tiene hoja 'Respaldo'. Usá un Excel generado por la app (versión actual).");
       const rows = XLSX.utils.sheet_to_json(ws, { header: 1, raw: false, defval: "" });
-      const keys = ["accounts", "txns", "divisas", "projectsMeta", "settings"];
+      const keys = ["accounts", "txns", "divisas", "projectsMeta", "settings", "prestamos"];
       const parts = {};
       rows.forEach((r) => {
         const k = String(r[0] || "");
@@ -4204,6 +4212,7 @@ function AjustesTab({ settings, setSettings, accounts, txns, prices, cur, divisa
           [(data.txns || []).length, "movimientos"],
           [(data.divisas || []).length, "operaciones de divisas"],
           [(data.projectsMeta || []).length, "proyectos"],
+          [(data.prestamos || []).length, "préstamos entre proyectos"],
         ],
       });
       setMsg("");
@@ -4425,6 +4434,7 @@ function AjustesTab({ settings, setSettings, accounts, txns, prices, cur, divisa
         accounts: accounts || [],
         txns: txns || [],
         divisas: divisas || [],
+        prestamos: prestamos || [],
         projectsMeta: projectsMeta || [],
         settings: settings || {},
       }).forEach(([k, v]) => {
@@ -4507,6 +4517,26 @@ function AjustesTab({ settings, setSettings, accounts, txns, prices, cur, divisa
         {autoRate
           ? `Se usa para convertir cuentas en VES a ${cur.toUpperCase()} en el balance y el Excel. Tasa activa: ${autoRate}.`
           : `Cargá una tasa (o registrá una operación de divisas) para poder convertir cuentas en VES a ${cur.toUpperCase()}.`}
+      </div>
+
+      {/* Comisión Binance */}
+      <div style={{ ...sectionTitle, marginBottom: 10 }}>Comisión Binance</div>
+      <Field label="Porcentaje sobre el monto en USD (%)">
+        <input
+          style={{ ...inputStyle, fontFamily: MONO }}
+          value={settings.binancePct != null ? String(settings.binancePct) : ""}
+          onChange={(e) => {
+            const v = e.target.value;
+            setSettings((s) => ({ ...s, binancePct: v === "" ? undefined : numVE(v) }));
+          }}
+          inputMode="decimal"
+          placeholder="0,2"
+        />
+      </Field>
+      <div style={{ fontSize: 12.5, color: T.mut, marginBottom: 26, marginLeft: 2, lineHeight: 1.5 }}>
+        En las operaciones de divisas cuyo cliente o referencia lleve la etiqueta "Binance",
+        se aplica sola esta comisión en USD sobre el monto (ej.: 1.076,27 USD × 0,2% = 2,15).
+        Se puede corregir a mano en cada operación. Vacío = 0,2%.
       </div>
 
       {/* Exportar */}
@@ -5177,7 +5207,7 @@ function DivisasTab({ divisas, onAdd, onEdit, onDelete, onPatch, canWrite = true
 }
 
 /* ─────────────────────────────  Sheet: Divisa (venta/compra)  ───────────────────────────── */
-function DivisaSheet({ state, divisas, onClose, onSave, onDelete }) {
+function DivisaSheet({ state, divisas, onClose, onSave, onDelete, binancePct = 0.2 }) {
   const editing = state && state.id;
   const kind = state ? state.kind : "venta";
   const venta = kind === "venta";
@@ -5191,6 +5221,7 @@ function DivisaSheet({ state, divisas, onClose, onSave, onDelete }) {
   const [manualAllocs, setManualAllocs] = useState([]);
   const [referencia, setReferencia] = useState("");
   const [date, setDate] = useState(todayISO());
+  const [comAuto, setComAuto] = useState(true); // comisión Binance automática; se apaga al editarla a mano
 
   useEffect(() => {
     if (state && state.id) {
@@ -5204,11 +5235,24 @@ function DivisaSheet({ state, divisas, onClose, onSave, onDelete }) {
       setManualAllocs(state.manualAllocs || (state.ventaId ? [state.ventaId] : []));
       setReferencia(state.referencia || "");
       setDate(state.date || todayISO());
+      setComAuto(false); // al editar, se respeta la comisión guardada
     } else if (state) {
       setUsd(""); setTasa(""); setPersona(""); setComisionTipo("mismo"); setComMode(state.kind === "venta" ? "none" : "pct"); setComVes(""); setComUsd(""); setReferencia(""); setDate(todayISO());
       setManualAllocs([]);
+      setComAuto(true);
     }
   }, [state]);
+
+  /* ── Comisión Binance automática ──
+     Si el cliente o la referencia llevan la etiqueta "Binance", se aplica sola
+     una comisión en USD = monto × porcentaje (ajustable en Ajustes). */
+  const esBinance = /binance/i.test(persona || "") || /binance/i.test(referencia || "");
+  useEffect(() => {
+    if (!state || !esBinance || !comAuto) return;
+    const g = numVE(usd);
+    setComMode("usd");
+    setComUsd(!isNaN(g) && g > 0 ? String(Math.round(g * binancePct) / 100) : "");
+  }, [esBinance, usd, comAuto, binancePct, state]);
 
   if (!state) return null;
   const nUsd = numVE(usd);
@@ -5277,7 +5321,7 @@ function DivisaSheet({ state, divisas, onClose, onSave, onDelete }) {
             <input style={inputStyle} value={persona} onChange={(e) => setPersona(e.target.value)} placeholder="Nombre" />
           </Field>
           <Field label="Comisión (opcional)">
-            <select style={{ ...inputStyle, appearance: "none" }} value={comMode} onChange={(e) => setComMode(e.target.value)}>
+            <select style={{ ...inputStyle, appearance: "none" }} value={comMode} onChange={(e) => { setComAuto(false); setComMode(e.target.value); }}>
               <option value="none">Sin comisión</option>
               <option value="ves">Monto en VES</option>
               <option value="usd">Monto en USD</option>
@@ -5290,7 +5334,7 @@ function DivisaSheet({ state, divisas, onClose, onSave, onDelete }) {
           )}
           {comMode === "usd" && (
             <Field label="Comisión en USD">
-              <input style={{ ...inputStyle, fontFamily: MONO }} value={comUsd} onChange={(e) => setComUsd(e.target.value)} inputMode="decimal" placeholder="0.00" />
+              <input style={{ ...inputStyle, fontFamily: MONO }} value={comUsd} onChange={(e) => { setComAuto(false); setComUsd(e.target.value); }} inputMode="decimal" placeholder="0.00" />
             </Field>
           )}
           {comMode !== "none" && (
@@ -5307,7 +5351,7 @@ function DivisaSheet({ state, divisas, onClose, onSave, onDelete }) {
             <input style={inputStyle} value={persona} onChange={(e) => setPersona(e.target.value)} placeholder="Nombre" />
           </Field>
           <Field label="Comisión">
-            <select style={{ ...inputStyle, appearance: "none" }} value={comMode} onChange={(e) => setComMode(e.target.value)}>
+            <select style={{ ...inputStyle, appearance: "none" }} value={comMode} onChange={(e) => { setComAuto(false); setComMode(e.target.value); }}>
               <option value="pct">Banco (0% / 0,3%)</option>
               <option value="ves">Monto en VES</option>
               <option value="usd">Monto en USD</option>
@@ -5328,7 +5372,7 @@ function DivisaSheet({ state, divisas, onClose, onSave, onDelete }) {
           )}
           {comMode === "usd" && (
             <Field label="Comisión en USD">
-              <input style={{ ...inputStyle, fontFamily: MONO }} value={comUsd} onChange={(e) => setComUsd(e.target.value)} inputMode="decimal" placeholder="0.00" />
+              <input style={{ ...inputStyle, fontFamily: MONO }} value={comUsd} onChange={(e) => { setComAuto(false); setComUsd(e.target.value); }} inputMode="decimal" placeholder="0.00" />
             </Field>
           )}
           <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13, color: T.mut, margin: "-4px 2px 16px" }}>
@@ -5380,6 +5424,12 @@ function DivisaSheet({ state, divisas, onClose, onSave, onDelete }) {
         </>
       )}
 
+      {esBinance && (
+        <div style={{ fontSize: 12.5, color: T.gold, margin: "0 2px 12px", lineHeight: 1.5 }}>
+          ⚡ Etiqueta <b>Binance</b> detectada: comisión del {String(binancePct).replace(".", ",")}% en USD
+          {comAuto && comMode === "usd" ? " aplicada automáticamente." : " (editada a mano)."} El porcentaje se ajusta en Ajustes.
+        </div>
+      )}
       <Field label="Referencia bancaria (opcional)">
         <input style={inputStyle} value={referencia} onChange={(e) => setReferencia(e.target.value)} placeholder="N° de operación / referencia" autoCapitalize="none" />
       </Field>
@@ -5992,15 +6042,100 @@ function ConciliacionTab({ divisas }) {
 const PROJECT_COLORS = ["#E3B24D", "#5B8DEF", "#3FCB8B", "#F0645F", "#9B7BEA", "#4DB6AC", "#EC87C0", "#8A93A7"];
 const PROJECT_EMOJIS = ["📁", "🏠", "🏢", "🚗", "🛒", "💼", "🍽️", "✈️", "🏗️", "💡", "📦", "🎯"];
 
-function ProjectsTab({ txns, projectsMeta, cur, onAdd, onEdit, canEdit = true }) {
+function ProjectsTab({ txns, projectsMeta, cur, onAdd, onEdit, canEdit = true, prestamos = [], setPrestamos, canLoan = false, prestamosListos = true }) {
   const metaFor = (name) => projectsMeta.find((m) => m.name === name) || { name, color: "#8A93A7", emoji: "📁" };
   const names = Array.from(new Set([...projectsMeta.map((m) => m.name), ...txns.map((t) => t.project).filter(Boolean)])).sort();
+
+  /* ── Préstamos entre proyectos (registro manual) ── */
+  const hoyISO = () => new Date().toISOString().slice(0, 10);
+  const [loanSheet, setLoanSheet] = useState(false);
+  const [devSheet, setDevSheet] = useState(null);
+  const [loanForm, setLoanForm] = useState({});
+  const [devForm, setDevForm] = useState({});
+  const [verSaldados, setVerSaldados] = useState(false);
+  const selStyle = { ...inputStyle, appearance: "none", fontSize: 14, padding: "11px 12px" };
+  const saveBtn = { width: "100%", padding: 13, borderRadius: 14, border: "none", background: T.gold, color: "#141414", fontSize: 15, fontWeight: 700, cursor: "pointer", marginTop: 6 };
+  const pendienteDe = (p) => Math.max(0, (p.monto || 0) - (p.devoluciones || []).reduce((s, d) => s + (d.monto || 0), 0));
+  const activos = (prestamos || []).filter((p) => pendienteDe(p) > 0.005);
+  const saldados = (prestamos || []).filter((p) => pendienteDe(p) <= 0.005);
+
+  function guardarPrestamo() {
+    const f = loanForm;
+    const monto = parseFloat(f.monto);
+    if (!f.origen || !f.destino || f.origen === f.destino || !Number.isFinite(monto) || monto <= 0) return;
+    setPrestamos((prev) => [...prev, {
+      id: uid(), fecha: f.fecha || hoyISO(), origen: f.origen, destino: f.destino,
+      monto, currency: f.currency || "usd", nota: (f.nota || "").trim(), devoluciones: [],
+    }]);
+    setLoanForm({}); setLoanSheet(false);
+  }
+  function guardarDevolucion() {
+    const pr = devSheet; if (!pr) return;
+    const monto = parseFloat(devForm.monto);
+    if (!Number.isFinite(monto) || monto <= 0) return;
+    setPrestamos((prev) => prev.map((x) => x.id === pr.id
+      ? { ...x, devoluciones: [...(x.devoluciones || []), { id: uid(), fecha: devForm.fecha || hoyISO(), monto, nota: (devForm.nota || "").trim() }] }
+      : x));
+    setDevForm({}); setDevSheet(null);
+  }
+  function borrarPrestamo(id) {
+    if (!window.confirm("¿Eliminar este préstamo y sus devoluciones?")) return;
+    setPrestamos((prev) => prev.filter((x) => x.id !== id));
+  }
+  const deudaPorProyecto = (name) => {
+    const debe = {}, cobra = {};
+    for (const p of activos) {
+      const pend = pendienteDe(p), c = p.currency || "usd";
+      if (p.destino === name) { const k = p.origen + "|" + c; debe[k] = (debe[k] || 0) + pend; }
+      if (p.origen === name) { const k = p.destino + "|" + c; cobra[k] = (cobra[k] || 0) + pend; }
+    }
+    return { debe: Object.entries(debe), cobra: Object.entries(cobra) };
+  };
+
+  const renderPrestamo = (p, saldado) => {
+    const pend = pendienteDe(p), c = p.currency || "usd";
+    return (
+      <div key={p.id} style={{ borderTop: `1px solid ${T.lineSoft}`, paddingTop: 10, marginTop: 10, opacity: saldado ? 0.6 : 1 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}>
+          <div style={{ minWidth: 0 }}>
+            <div style={{ fontSize: 13.5, fontWeight: 650, color: T.text }}>
+              {metaFor(p.destino).emoji || "📁"} {p.destino} <span style={{ color: T.mut, fontWeight: 400 }}>debe a</span> {metaFor(p.origen).emoji || "📁"} {p.origen}
+            </div>
+            <div style={{ fontSize: 11.5, color: T.mut, marginTop: 2 }}>
+              {p.fecha} · préstamo de <span style={{ fontFamily: MONO }}>{money(p.monto, c)}</span>{p.nota ? " · " + p.nota : ""}
+            </div>
+            {(p.devoluciones || []).length > 0 && (
+              <div style={{ fontSize: 11, color: T.mut2, marginTop: 2 }}>
+                Devuelto: <span style={{ fontFamily: MONO }}>{money((p.monto || 0) - pend, c)}</span> en {(p.devoluciones || []).length} pago(s)
+              </div>
+            )}
+          </div>
+          <div style={{ textAlign: "right", flexShrink: 0 }}>
+            <div style={{ fontSize: 11, color: T.mut }}>{saldado ? "Saldado" : "Pendiente"}</div>
+            <div style={{ fontFamily: MONO, fontSize: 14.5, fontWeight: 700, color: saldado ? T.green : T.red }}>
+              {saldado ? "✓" : money(pend, c)}
+            </div>
+          </div>
+        </div>
+        {canLoan && !saldado && (
+          <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+            <button onClick={() => { setDevForm({ fecha: hoyISO() }); setDevSheet(p); }} style={{ ...btnGhost, color: T.green, fontSize: 12.5 }}>Registrar devolución</button>
+            <button onClick={() => borrarPrestamo(p.id)} style={{ ...btnGhost, color: T.mut2, fontSize: 12.5 }}>Eliminar</button>
+          </div>
+        )}
+        {canLoan && saldado && (
+          <div style={{ display: "flex", gap: 8, marginTop: 6 }}>
+            <button onClick={() => borrarPrestamo(p.id)} style={{ ...btnGhost, color: T.mut2, fontSize: 12 }}>Eliminar</button>
+          </div>
+        )}
+      </div>
+    );
+  };
 
   const summary = (name) => {
     const m = {};
     const meta = metaFor(name);
     const opening = meta.opening || {};
-    // Semilla con los saldos iniciales cargados en el proyecto
     Object.entries(opening).forEach(([c, v]) => {
       if (v != null && !isNaN(v)) m[c] = { inc: 0, exp: 0, com: 0, open: v };
     });
@@ -6008,8 +6143,6 @@ function ProjectsTab({ txns, projectsMeta, cur, onAdd, onEdit, canEdit = true })
       const c = t.currency || cur;
       const com = t.commission || 0;
       if (!m[c]) m[c] = { inc: 0, exp: 0, com: 0, open: 0 };
-      // Mismo criterio que el saldo de la cuenta:
-      // ingreso neto = monto - comisión ; egreso total = monto + comisión
       if (t.kind === "income") m[c].inc += (t.amount || 0) - com;
       else m[c].exp += (t.amount || 0) + com;
       m[c].com += com;
@@ -6025,6 +6158,31 @@ function ProjectsTab({ txns, projectsMeta, cur, onAdd, onEdit, canEdit = true })
         </button>
       )}
 
+      {/* ── Préstamos entre proyectos ── */}
+      <div style={{ ...rowCard, flexDirection: "column", alignItems: "stretch", padding: "14px 15px", marginBottom: 16, borderLeft: `4px solid ${T.gold}` }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <div style={{ fontSize: 15, fontWeight: 700, color: T.text }}>🤝 Préstamos entre proyectos</div>
+          {canLoan && prestamosListos && (
+            <button onClick={() => { setLoanForm({ fecha: hoyISO(), currency: "usd" }); setLoanSheet(true); }} style={{ ...btnGhost, color: T.gold, fontWeight: 650 }}>+ Nuevo préstamo</button>
+          )}
+        </div>
+        {!prestamosListos ? (
+          <div style={{ fontSize: 12.5, color: T.mut, marginTop: 8 }}>Cargando préstamos…</div>
+        ) : activos.length === 0 ? (
+          <div style={{ fontSize: 12.5, color: T.mut, marginTop: 8 }}>Sin préstamos pendientes.</div>
+        ) : (
+          activos.map((p) => renderPrestamo(p, false))
+        )}
+        {prestamosListos && saldados.length > 0 && (
+          <div style={{ marginTop: 10 }}>
+            <button onClick={() => setVerSaldados(!verSaldados)} style={{ ...btnGhost, color: T.mut, fontSize: 12 }}>
+              {verSaldados ? "Ocultar" : "Ver"} {saldados.length} saldado(s) ✓
+            </button>
+            {verSaldados && saldados.map((p) => renderPrestamo(p, true))}
+          </div>
+        )}
+      </div>
+
       {names.length === 0 ? (
         <div style={emptyRow}>Todavía no tenés proyectos. Creá uno y asigná movimientos.</div>
       ) : (
@@ -6032,6 +6190,7 @@ function ProjectsTab({ txns, projectsMeta, cur, onAdd, onEdit, canEdit = true })
           {names.map((name) => {
             const meta = metaFor(name);
             const rows = summary(name);
+            const { debe, cobra } = deudaPorProyecto(name);
             return (
               <div key={name} style={{ ...rowCard, flexDirection: "column", alignItems: "stretch", padding: 0, overflow: "hidden", borderLeft: `4px solid ${meta.color}` }}>
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "14px 15px" }}>
@@ -6080,12 +6239,103 @@ function ProjectsTab({ txns, projectsMeta, cur, onAdd, onEdit, canEdit = true })
                       </div>
                     ))
                   )}
+                  {(debe.length > 0 || cobra.length > 0) && (
+                    <div style={{ borderTop: `1px dashed ${T.lineSoft}`, paddingTop: 10, marginTop: 10, display: "flex", flexDirection: "column", gap: 5 }}>
+                      {debe.map(([k, v]) => { const parts = k.split("|"); return (
+                        <div key={"d" + k} style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5 }}>
+                          <span style={{ color: T.red }}>🔻 Debe a {parts[0]} (préstamo)</span>
+                          <span style={{ fontFamily: MONO, color: T.red, fontWeight: 650 }}>{money(v, parts[1])}</span>
+                        </div>
+                      ); })}
+                      {cobra.map(([k, v]) => { const parts = k.split("|"); return (
+                        <div key={"c" + k} style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5 }}>
+                          <span style={{ color: T.green }}>🔸 {parts[0]} le debe (préstamo)</span>
+                          <span style={{ fontFamily: MONO, color: T.green, fontWeight: 650 }}>{money(v, parts[1])}</span>
+                        </div>
+                      ); })}
+                    </div>
+                  )}
                 </div>
               </div>
             );
           })}
         </div>
       )}
+
+      {/* Sheet: nuevo préstamo */}
+      <Sheet open={loanSheet} onClose={() => setLoanSheet(false)} title="Nuevo préstamo entre proyectos">
+        <Field label="Fecha">
+          <input type="date" value={loanForm.fecha || ""} onChange={(e) => setLoanForm({ ...loanForm, fecha: e.target.value })} style={inputStyle} />
+        </Field>
+        <Field label="Proyecto que presta">
+          <select value={loanForm.origen || ""} onChange={(e) => setLoanForm({ ...loanForm, origen: e.target.value })} style={selStyle}>
+            <option value="">— elegir —</option>
+            {names.map((n) => <option key={n} value={n}>{n}</option>)}
+          </select>
+        </Field>
+        <Field label="Proyecto que recibe (queda debiendo)">
+          <select value={loanForm.destino || ""} onChange={(e) => setLoanForm({ ...loanForm, destino: e.target.value })} style={selStyle}>
+            <option value="">— elegir —</option>
+            {names.filter((n) => n !== loanForm.origen).map((n) => <option key={n} value={n}>{n}</option>)}
+          </select>
+        </Field>
+        <div style={{ display: "flex", gap: 10 }}>
+          <div style={{ flex: 2 }}>
+            <Field label="Monto">
+              <input type="number" inputMode="decimal" placeholder="0.00" value={loanForm.monto || ""} onChange={(e) => setLoanForm({ ...loanForm, monto: e.target.value })} style={inputStyle} />
+            </Field>
+          </div>
+          <div style={{ flex: 1 }}>
+            <Field label="Moneda">
+              <select value={loanForm.currency || "usd"} onChange={(e) => setLoanForm({ ...loanForm, currency: e.target.value })} style={selStyle}>
+                <option value="usd">USD</option>
+                <option value="ves">VES</option>
+              </select>
+            </Field>
+          </div>
+        </div>
+        <Field label="Nota (opcional)">
+          <input placeholder="Motivo del préstamo…" value={loanForm.nota || ""} onChange={(e) => setLoanForm({ ...loanForm, nota: e.target.value })} style={inputStyle} />
+        </Field>
+        <button
+          onClick={guardarPrestamo}
+          disabled={!loanForm.origen || !loanForm.destino || loanForm.origen === loanForm.destino || !(parseFloat(loanForm.monto) > 0)}
+          style={{ ...saveBtn, opacity: (!loanForm.origen || !loanForm.destino || loanForm.origen === loanForm.destino || !(parseFloat(loanForm.monto) > 0)) ? 0.45 : 1 }}
+        >
+          Guardar préstamo
+        </button>
+      </Sheet>
+
+      {/* Sheet: devolución */}
+      <Sheet open={!!devSheet} onClose={() => setDevSheet(null)} title="Registrar devolución">
+        {devSheet && (
+          <div>
+            <div style={{ fontSize: 13.5, color: T.mut, marginBottom: 12 }}>
+              <b style={{ color: T.text }}>{devSheet.destino}</b> le debe a <b style={{ color: T.text }}>{devSheet.origen}</b>:{" "}
+              <span style={{ fontFamily: MONO, color: T.red, fontWeight: 700 }}>{money(pendienteDe(devSheet), devSheet.currency || "usd")}</span> pendiente
+            </div>
+            <Field label="Fecha">
+              <input type="date" value={devForm.fecha || ""} onChange={(e) => setDevForm({ ...devForm, fecha: e.target.value })} style={inputStyle} />
+            </Field>
+            <Field label="Monto devuelto">
+              <input type="number" inputMode="decimal" placeholder="0.00" value={devForm.monto || ""} onChange={(e) => setDevForm({ ...devForm, monto: e.target.value })} style={inputStyle} />
+            </Field>
+            <Field label="Nota (opcional)">
+              <input value={devForm.nota || ""} onChange={(e) => setDevForm({ ...devForm, nota: e.target.value })} style={inputStyle} />
+            </Field>
+            {parseFloat(devForm.monto) > pendienteDe(devSheet) + 0.005 && (
+              <div style={{ fontSize: 12, color: T.gold, marginBottom: 8 }}>⚠ El monto es mayor que lo pendiente; el préstamo quedará saldado.</div>
+            )}
+            <button
+              onClick={guardarDevolucion}
+              disabled={!(parseFloat(devForm.monto) > 0)}
+              style={{ ...saveBtn, opacity: !(parseFloat(devForm.monto) > 0) ? 0.45 : 1 }}
+            >
+              Guardar devolución
+            </button>
+          </div>
+        )}
+      </Sheet>
     </div>
   );
 }
