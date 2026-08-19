@@ -449,9 +449,15 @@ function comOp(d) {
   if (mode === "usd") return 0; // la comisión en USD NO consume bolívares
   return (d.usd || 0) * (d.tasa || 0) * (COMISION[d.comisionTipo] || 0);
 }
+let BINANCE_PCT = 0.2; // % de comisión Binance; se actualiza desde Ajustes
+const esBinanceOp = (d) => !!d && (/binance/i.test(d.persona || "") || /binance/i.test(d.referencia || ""));
 function comUsdOf(d) {
   // comisión cobrada en USD (ej. fee P2P de Binance): reduce el USDT neto
-  return d.comMode === "usd" ? (d.comisionUsdInput || 0) : 0;
+  if (d.comMode === "usd") return d.comisionUsdInput || 0;
+  // Etiqueta Binance sin comisión USD cargada → se aplica el % automático,
+  // así el disponible real coincide aunque la operación venga del Sheet.
+  if (esBinanceOp(d)) return Math.round((d.usd || 0) * BINANCE_PCT) / 100;
+  return 0;
 }
 
 // Capacidad de VES de una venta (generados menos comisión en VES)
@@ -989,6 +995,9 @@ function AppMain({ session, role, signOut }) {
     if (typeof document !== "undefined")
       document.documentElement.setAttribute("data-theme", settings.theme || "dark");
   }, [settings.theme]);
+  useEffect(() => {
+    BINANCE_PCT = settings && settings.binancePct != null && !isNaN(settings.binancePct) ? settings.binancePct : 0.2;
+  }, [settings.binancePct]);
   const didAutoSync = useRef(false);
   useEffect(() => {
     if (didAutoSync.current) return;
@@ -4153,6 +4162,7 @@ function CoinBadge({ sym }) {
 function AjustesTab({ settings, setSettings, accounts, txns, prices, cur, divisas, prestamos, projectsMeta, onSync, onRestore, session, role, signOut, canEditAll }) {
   const theme = settings.theme || "dark";
   const autoRate = vesRateOf(settings, divisas);
+  const [binPctTxt, setBinPctTxt] = useState(settings.binancePct != null ? String(settings.binancePct).replace(".", ",") : "");
   const [syncing, setSyncing] = useState(false);
   const [syncMsg, setSyncMsg] = useState("");
   async function doSync() {
@@ -4524,10 +4534,12 @@ function AjustesTab({ settings, setSettings, accounts, txns, prices, cur, divisa
       <Field label="Porcentaje sobre el monto en USD (%)">
         <input
           style={{ ...inputStyle, fontFamily: MONO }}
-          value={settings.binancePct != null ? String(settings.binancePct) : ""}
+          value={binPctTxt}
           onChange={(e) => {
             const v = e.target.value;
-            setSettings((s) => ({ ...s, binancePct: v === "" ? undefined : numVE(v) }));
+            setBinPctTxt(v);
+            const n = numVE(v);
+            setSettings((s) => ({ ...s, binancePct: v.trim() === "" || isNaN(n) ? undefined : n }));
           }}
           inputMode="decimal"
           placeholder="0,2"
@@ -5235,7 +5247,8 @@ function DivisaSheet({ state, divisas, onClose, onSave, onDelete, binancePct = 0
       setManualAllocs(state.manualAllocs || (state.ventaId ? [state.ventaId] : []));
       setReferencia(state.referencia || "");
       setDate(state.date || todayISO());
-      setComAuto(false); // al editar, se respeta la comisión guardada
+      // Si ya tiene comisión USD cargada se respeta; si es Binance sin comisión USD, se carga sola
+      setComAuto(!(state.comMode === "usd" && state.comisionUsdInput != null));
     } else if (state) {
       setUsd(""); setTasa(""); setPersona(""); setComisionTipo("mismo"); setComMode(state.kind === "venta" ? "none" : "pct"); setComVes(""); setComUsd(""); setReferencia(""); setDate(todayISO());
       setManualAllocs([]);
