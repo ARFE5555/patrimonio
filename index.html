@@ -33,7 +33,7 @@ const { useState, useEffect, useRef, useMemo } = React;
 
 /* Versión de compilación. Sirve para confirmar de un vistazo qué build está
    corriendo en pantalla (útil para detectar caché vieja de la PWA). */
-const BUILD = "v5.0 · Búsqueda por últimos dígitos de la referencia · 2026-08-24";
+const BUILD = "v5.1 · Búsqueda por últimos dígitos + traslados entre cuentas · 2026-08-24";
 try { console.log("[Patrimonio] build:", BUILD); } catch (e) {}
 
 /* ─────────────────────────────  Tokens de diseño  ───────────────────────────── */
@@ -1251,9 +1251,13 @@ function AppMain({ session, role, signOut }) {
         newTxns.push({ ...data, id: uid(), createdAt: Date.now() }); added++;
       }
     }
-    setTxns((prev) => [...newTxns, ...prev.map((t) => (updates[t.id] ? { ...t, ...updates[t.id] } : t))]);
+    // Misma regla que en el importador del banco: la referencia repetida en dos
+    // cuentas se justifica sola como traslado.
+    const mezclado = [...newTxns, ...txns.map((t) => (updates[t.id] ? { ...t, ...updates[t.id] } : t))];
+    const autoBulk = autoTraslados(mezclado);
+    setTxns(autoBulk.tocados ? autoBulk.lista : mezclado);
     // No se ajustan saldos: se derivan automáticamente de los movimientos.
-    return { updated, added, skipped };
+    return { updated, added, skipped, traslados: autoBulk.tocados };
   }
 
   /* Crea una cuenta desde el importador y devuelve su id, para poder cargarle
@@ -1300,8 +1304,33 @@ function AppMain({ session, role, signOut }) {
       importedAt,
       importFile: (meta && meta.fileName) || undefined,
     }));
-    setTxns((prev) => [...nuevos, ...prev]);
-    return { added: nuevos.length };
+    /* Traslados entre cuentas: si alguna de las líneas recién cargadas comparte
+       referencia con un movimiento de OTRA cuenta, las dos patas se justifican
+       solas como traslado y se quedan sin proyecto. Así la bandeja de "por
+       justificar" queda solo con movimientos reales. */
+    const combinado = [...nuevos, ...txns];
+    const auto = autoTraslados(combinado);
+    setTxns(auto.tocados ? auto.lista : combinado);
+    return { added: nuevos.length, traslados: auto.tocados };
+  }
+
+  /* Justifica como traslado los grupos que se aprueben desde la bandeja.
+     Va con forzar: acá el usuario lo pidió, así que también convierte los que
+     ya tenían un motivo puesto a mano. */
+  function justificarTraslados(claves) {
+    setTxns((prev) => autoTraslados(prev, { claves, forzar: true }).lista);
+  }
+
+  /* "No es un traslado": la referencia queda marcada para que la detección no
+     vuelva a proponerla, y el movimiento regresa a la bandeja por justificar. */
+  function descartarTraslado(clave) {
+    setTxns((prev) =>
+      prev.map((t) => {
+        if (trasladoKey(t) !== clave) return t;
+        if (t.traslado) return { ...t, noTraslado: true, traslado: undefined, trasladoRef: undefined, motivo: "", pending: true };
+        return { ...t, noTraslado: true };
+      })
+    );
   }
 
   /* Justificar: asigna motivo (y proyecto) y saca el movimiento de la bandeja.
@@ -1353,6 +1382,13 @@ function AppMain({ session, role, signOut }) {
       prev.map((x) => {
         if (!set.has(x.id)) return x;
         const base = { ...x, motivo: patch.motivo, project: patch.project || x.project, pending: false };
+        /* Si alguien justifica a mano un traslado con otro motivo, manda su
+           criterio: deja de ser traslado y la detección no vuelve a tocarlo. */
+        if (x.traslado && String(patch.motivo || "").trim() !== TRASLADO_MOTIVO) {
+          base.traslado = undefined;
+          base.trasladoRef = undefined;
+          base.noTraslado = true;
+        }
         if (t && x.id === t.id && nuevoDivisaId !== undefined) {
           base.divisaId = nuevoDivisaId || undefined;
           base.divisaKind = nuevoDivisaId ? divisa.kind : undefined;
@@ -1594,6 +1630,8 @@ function AppMain({ session, role, signOut }) {
                 onBulkImport={bulkImportTxns}
                 onImportStatement={() => setStmtSheet(true)}
                 onJustify={(list) => setJustifySheet({ list })}
+                onTraslados={justificarTraslados}
+                onNoTraslado={descartarTraslado}
                 diaFijado={diaFijado}
                 onLimpiarDia={() => setDiaFijado("")}
               />
@@ -2282,7 +2320,7 @@ function AccountsTab({ accounts, prices, cur, settings, vesRate, onSetRate, onAd
 }
 
 /* ─────────────────────────────  Tab: Movimientos  ───────────────────────────── */
-function TxnsTab({ txns, accounts, cur, onAdd, onEdit, onDelete, onBulkImport, onImportStatement, onJustify, canWrite = true, diaFijado = "", onLimpiarDia }) {
+function TxnsTab({ txns, accounts, cur, onAdd, onEdit, onDelete, onBulkImport, onImportStatement, onJustify, onTraslados, onNoTraslado, canWrite = true, diaFijado = "", onLimpiarDia }) {
   const acct = (id) => accounts.find((a) => a.id === id);
   const acctName = (id) => (acct(id) || {}).name || "—";
   const acctCur = (t) => t.currency || (acct(t.accountId) || {}).currency || cur;
@@ -2303,6 +2341,14 @@ function TxnsTab({ txns, accounts, cur, onAdd, onEdit, onDelete, onBulkImport, o
   const projects = useMemo(() => Array.from(new Set(txns.map((t) => t.project).filter(Boolean))).sort(), [txns]);
   const activos = (fAcct !== "all" ? 1 : 0) + (fKind !== "all" ? 1 : 0) + (fProject !== "all" ? 1 : 0) + (fFrom ? 1 : 0) + (fTo ? 1 : 0);
   const pendientes = useMemo(() => txns.filter((t) => t.pending), [txns]);
+
+  /* Traslados entre cuentas: misma referencia en dos cuentas distintas. Los que
+     entran por el importador ya quedan justificados solos; acá se muestran los
+     grupos que todavía tienen alguna pata sin marcar (por ejemplo, cuando el
+     movimiento de la otra cuenta se cargó a mano después). */
+  const gruposTraslado = useMemo(() => detectarTraslados(txns), [txns]);
+  const trasladosPorMarcar = useMemo(() => gruposTraslado.filter((g) => g.porMarcar.length > 0), [gruposTraslado]);
+  const [verTraslados, setVerTraslados] = useState(false);
 
   /* Búsqueda: referencia del banco (código validador), motivo, descripción, cuenta,
      proyecto y monto. La referencia se compara normalizada, así da igual si la
@@ -2440,7 +2486,7 @@ function TxnsTab({ txns, accounts, cur, onAdd, onEdit, onDelete, onBulkImport, o
       const ws = wb.Sheets[wb.SheetNames[0]];
       const rows = XLSX.utils.sheet_to_json(ws, { header: 1, raw: false, defval: "" });
       const res = onBulkImport(rows);
-      setBulkMsg(res.error ? res.error : `Listo: ${res.updated} modificado(s), ${res.added} nuevo(s)${res.skipped ? `, ${res.skipped} omitido(s)` : ""}.`);
+      setBulkMsg(res.error ? res.error : `Listo: ${res.updated} modificado(s), ${res.added} nuevo(s)${res.skipped ? `, ${res.skipped} omitido(s)` : ""}${res.traslados ? `, ${res.traslados} justificado(s) como traslado entre cuentas` : ""}.`);
     } catch (ex) { setBulkMsg((ex && ex.message) || "No se pudo leer el archivo."); }
     finally { setBulkBusy(false); }
   }
@@ -2515,6 +2561,78 @@ function TxnsTab({ txns, accounts, cur, onAdd, onEdit, onDelete, onBulkImport, o
           </span>
           <span style={{ color: T.gold, fontSize: 13, fontWeight: 600, flexShrink: 0 }}>{soloPend ? "Ver todos" : "Revisar →"}</span>
         </button>
+      )}
+
+      {/* Traslados entre cuentas detectados por referencia repetida */}
+      {canWrite && trasladosPorMarcar.length > 0 && (
+        <div style={{ background: T.bg2, border: `1px solid ${T.blue}`, borderRadius: 14, padding: "13px 15px", marginBottom: 12 }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
+            <span style={{ minWidth: 0 }}>
+              <span style={{ display: "block", fontSize: 14, fontWeight: 700, color: T.blue }}>
+                ⇄ {trasladosPorMarcar.length} traslado(s) entre cuentas
+              </span>
+              <span style={{ display: "block", fontSize: 12, color: T.mut, marginTop: 2, lineHeight: 1.5 }}>
+                Misma referencia en dos cuentas: es plata que se mudó de banco, no un movimiento real.
+                Se justifica como <b>{TRASLADO_MOTIVO}</b> y sin proyecto.
+              </span>
+            </span>
+            <button
+              onClick={() => setVerTraslados((v) => !v)}
+              style={{ ...btnGhost, color: T.blue, fontSize: 12.5, fontWeight: 600, flexShrink: 0 }}
+            >
+              {verTraslados ? "Ocultar" : "Ver"}
+            </button>
+          </div>
+
+          {verTraslados && (
+            <div style={{ display: "flex", flexDirection: "column", gap: 10, marginTop: 12 }}>
+              {trasladosPorMarcar.map((g) => (
+                <div key={g.key} style={{ background: T.card, border: `1px solid ${T.lineSoft}`, borderRadius: 12, padding: "11px 13px" }}>
+                  <div style={{ fontSize: 11.5, color: T.mut2, fontFamily: MONO, marginBottom: 6 }}>
+                    ref {(g.items[0] || {}).ref || g.key} · {fmtDate(g.fecha)}
+                  </div>
+                  {g.items.map((t) => (
+                    <div key={t.id} style={{ display: "flex", justifyContent: "space-between", gap: 10, fontSize: 12.5, color: T.text, padding: "2px 0" }}>
+                      <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                        {t.kind === "income" ? "Entra en " : "Sale de "}{acctName(t.accountId)}
+                      </span>
+                      <span style={{ fontFamily: MONO, flexShrink: 0, color: t.kind === "income" ? T.green : T.red }}>
+                        {t.kind === "income" ? "+" : "−"}{money(t.amount, acctCur(t))}
+                      </span>
+                    </div>
+                  ))}
+                  {Math.abs(g.descuadre) > 0.005 && (
+                    <div style={{ fontSize: 11.5, color: T.gold, marginTop: 5 }}>
+                      Diferencia entre las dos patas: {money(Math.abs(g.descuadre), acctCur(g.items[0]))} (suele ser la comisión del banco)
+                    </div>
+                  )}
+                  <div style={{ display: "flex", gap: 8, marginTop: 9 }}>
+                    <button
+                      onClick={() => onNoTraslado && onNoTraslado(g.key)}
+                      style={{ flex: 1, background: "transparent", color: T.mut, border: `1px solid ${T.line}`, borderRadius: 10, padding: "9px", fontSize: 12.5, fontWeight: 600, fontFamily: FONT, cursor: "pointer" }}
+                    >
+                      No es traslado
+                    </button>
+                    <button
+                      onClick={() => onTraslados && onTraslados([g.key])}
+                      style={{ flex: 1.4, background: T.blue, color: "#0A0F1E", border: "none", borderRadius: 10, padding: "9px", fontSize: 12.5, fontWeight: 700, fontFamily: FONT, cursor: "pointer" }}
+                    >
+                      Justificar como traslado
+                    </button>
+                  </div>
+                </div>
+              ))}
+              {trasladosPorMarcar.length > 1 && (
+                <button
+                  onClick={() => onTraslados && onTraslados(trasladosPorMarcar.map((g) => g.key))}
+                  style={{ background: "transparent", color: T.blue, border: `1px solid ${T.blue}`, borderRadius: 11, padding: "10px", fontSize: 13, fontWeight: 700, fontFamily: FONT, cursor: "pointer" }}
+                >
+                  Justificar los {trasladosPorMarcar.length} como traslado
+                </button>
+              )}
+            </div>
+          )}
+        </div>
       )}
 
       {canWrite && (
@@ -2713,6 +2831,11 @@ function TxnsTab({ txns, accounts, cur, onAdd, onEdit, onDelete, onBulkImport, o
                           {t.divisaKind && (
                             <span style={{ fontSize: 10.5, fontWeight: 700, color: T.violet, marginLeft: 6, letterSpacing: 0.3 }}>
                               · {t.divisaKind === "compra" ? "COMPRA DIVISA" : "VENTA DIVISA"}
+                            </span>
+                          )}
+                          {t.traslado && (
+                            <span style={{ fontSize: 10.5, fontWeight: 700, color: T.blue, marginLeft: 6, letterSpacing: 0.3 }}>
+                              · ⇄ TRASLADO
                             </span>
                           )}
                         </div>
@@ -3197,6 +3320,15 @@ function StatementImportSheet({ open, onClose, accounts, cur, txns, onImport, on
             <div style={{ fontSize: 13.5, color: T.text, lineHeight: 1.6 }}>
               {done.added} movimiento(s) cargado(s) en <b>{(acct || {}).name}</b>.<br />
               Quedaron marcados como <b>por justificar</b>: asignales el motivo desde la lista de movimientos.
+              {done.traslados > 0 && (
+                <>
+                  <br />
+                  <span style={{ color: T.blue }}>
+                    ⇄ {done.traslados} quedaron justificados solos como <b>{TRASLADO_MOTIVO}</b> (misma
+                    referencia en otra cuenta) y sin proyecto.
+                  </span>
+                </>
+              )}
             </div>
           </div>
 
@@ -3545,6 +3677,14 @@ function JustifySheet({ state, projects, txns, cur, accounts, divisas, onClose, 
       {!single && (
         <div style={{ fontSize: 12.5, color: T.mut, lineHeight: 1.6, marginBottom: 14 }}>
           Se aplicará el mismo motivo y proyecto a los {target.length} movimientos seleccionados.
+        </div>
+      )}
+
+      {single && single.traslado && (
+        <div style={{ background: "rgba(91,141,239,0.14)", border: `1px solid ${T.blue}`, borderRadius: 12, padding: "12px 14px", marginBottom: 14, fontSize: 12.5, color: T.text, lineHeight: 1.5 }}>
+          ⇄ Este movimiento está justificado como <b>{TRASLADO_MOTIVO}</b>: la misma referencia aparece en
+          otra cuenta, así que es un traslado de plata propia y no lleva proyecto. Si le ponés otro motivo,
+          deja de contarse como traslado.
         </div>
       )}
 
@@ -5668,6 +5808,110 @@ function refCoincide(campos, codigo, enCualquierParte) {
   if (!codigo) return false;
   const lista = Array.isArray(campos) ? campos : [campos];
   return lista.some((c) => (enCualquierParte ? refContiene(c, codigo) : refTerminaEn(c, codigo)));
+}
+
+/* ───────────────  Traslados entre cuentas propias  ───────────────
+   La MISMA referencia en DOS cuentas distintas —saliendo de una y entrando en
+   la otra— no es un ingreso ni un gasto: es plata propia que se mudó de banco.
+   Contarla como movimiento real infla ingresos y egresos por igual y ensucia
+   los proyectos. Por eso se justifica sola como "Transferencia entre cuentas"
+   y se queda SIN proyecto: así solo se justifica lo que de verdad entró o
+   salió del negocio.
+
+   Condiciones para considerarlo traslado (las tres, sin excepción):
+     1. Misma referencia del banco (mínimo 4 caracteres: "0" o "000" no vale).
+     2. Cuentas distintas.
+     3. Una pata que sale y otra que entra, con fechas cercanas — algunos
+        bancos acreditan al día siguiente. */
+const TRASLADO_MOTIVO = "Transferencia entre cuentas";
+const TRASLADO_DIAS = 5;
+
+/* Referencia utilizable para emparejar. Se recalcula desde t.ref y no se confía
+   solo en refKey, porque los movimientos cargados a mano no lo traen. */
+function trasladoKey(t) {
+  if (!t) return "";
+  const k = t.refKey || stmtRefKey(t.ref);
+  return k && k.length >= 4 ? k : "";
+}
+
+function diasEntre(a, b) {
+  const da = Date.parse(String(a || "") + "T00:00:00Z");
+  const db = Date.parse(String(b || "") + "T00:00:00Z");
+  if (isNaN(da) || isNaN(db)) return 0;
+  return Math.abs(da - db) / 86400000;
+}
+
+/* Un movimiento que ya es una operación de divisas no se toca: ahí la
+   referencia se repite por otro motivo y sí es un movimiento real. */
+function trasladoElegible(t) {
+  return !!t && !t.noTraslado && !t.divisaId && !t.divisaKind;
+}
+
+/* Devuelve los grupos de movimientos que forman un traslado. */
+function detectarTraslados(lista, dias) {
+  const margen = dias == null ? TRASLADO_DIAS : dias;
+  const porRef = new Map();
+  (lista || []).forEach((t) => {
+    if (!trasladoElegible(t)) return;
+    const k = trasladoKey(t);
+    if (!k) return;
+    if (!porRef.has(k)) porRef.set(k, []);
+    porRef.get(k).push(t);
+  });
+  const grupos = [];
+  porRef.forEach((items, key) => {
+    if (new Set(items.map((t) => t.accountId)).size < 2) return;   // la misma cuenta no es traslado
+    const entradas = items.filter((t) => t.kind === "income");
+    const salidas = items.filter((t) => t.kind !== "income");
+    if (!entradas.length || !salidas.length) return;               // tiene que salir de una y entrar en otra
+    const fechas = items.map((t) => t.date).filter(Boolean).sort();
+    if (fechas.length > 1 && diasEntre(fechas[0], fechas[fechas.length - 1]) > margen) return;
+    const entra = entradas.reduce((s, t) => s + (t.amount || 0), 0);
+    const sale = salidas.reduce((s, t) => s + (t.amount || 0) + (t.commission || 0), 0);
+    grupos.push({
+      key, items, entradas, salidas, entra, sale,
+      descuadre: entra - sale,                                     // suele ser la comisión del banco
+      fecha: fechas[0] || "",
+      porMarcar: items.filter((t) => !esTraslado(t)),
+    });
+  });
+  return grupos;
+}
+
+function esTraslado(t) {
+  return !!t && !!t.traslado && t.motivo === TRASLADO_MOTIVO && !t.project;
+}
+
+function marcarTraslado(t, key) {
+  return { ...t, motivo: TRASLADO_MOTIVO, project: undefined, pending: false, traslado: true, trasladoRef: key, noTraslado: undefined };
+}
+
+/* Justificación automática. Regla de oro: NUNCA pisa un movimiento que alguien
+   ya justificó a mano — esos solo se convierten si se pide expresamente desde
+   el botón de la bandeja (forzar). */
+function autoTraslados(lista, opts) {
+  const o = opts || {};
+  const claves = o.claves ? new Set(o.claves) : null;
+  const grupos = detectarTraslados(lista, o.dias);
+  const cambios = new Map();
+  grupos.forEach((g) => {
+    if (claves && !claves.has(g.key)) return;
+    /* Si alguna pata ya se justificó a mano, el grupo entero se deja para la
+       revisión de la bandeja: es mejor preguntar que dejar media transferencia
+       marcada como traslado y la otra media como un gasto con proyecto. */
+    const hayManual = g.items.some((t) => !t.pending && String(t.motivo || "").trim() && !t.traslado);
+    if (hayManual && !o.forzar) return;
+    g.items.forEach((t) => {
+      if (esTraslado(t)) return;                                   // ya estaba marcado
+      cambios.set(t.id, marcarTraslado(t, g.key));
+    });
+  });
+  if (!cambios.size) return { lista, tocados: 0, grupos: grupos.length };
+  return {
+    lista: (lista || []).map((t) => cambios.get(t.id) || t),
+    tocados: cambios.size,
+    grupos: grupos.length,
+  };
 }
 /* ─────────────────────────────  Estado de cuenta bancario  ─────────────────────────────
    Lee el .xlsx que emite el banco y lo convierte en movimientos listos para justificar.
