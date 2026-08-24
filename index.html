@@ -33,7 +33,7 @@ const { useState, useEffect, useRef, useMemo } = React;
 
 /* Versión de compilación. Sirve para confirmar de un vistazo qué build está
    corriendo en pantalla (útil para detectar caché vieja de la PWA). */
-const BUILD = "v5.1 · Búsqueda por últimos dígitos + traslados entre cuentas · 2026-08-24";
+const BUILD = "v5.2 · Traslados entre cuentas · Mercantil valida por 6 dígitos · 2026-08-24";
 try { console.log("[Patrimonio] build:", BUILD); } catch (e) {}
 
 /* ─────────────────────────────  Tokens de diseño  ───────────────────────────── */
@@ -1254,7 +1254,7 @@ function AppMain({ session, role, signOut }) {
     // Misma regla que en el importador del banco: la referencia repetida en dos
     // cuentas se justifica sola como traslado.
     const mezclado = [...newTxns, ...txns.map((t) => (updates[t.id] ? { ...t, ...updates[t.id] } : t))];
-    const autoBulk = autoTraslados(mezclado);
+    const autoBulk = autoTraslados(mezclado, accounts);
     setTxns(autoBulk.tocados ? autoBulk.lista : mezclado);
     // No se ajustan saldos: se derivan automáticamente de los movimientos.
     return { updated, added, skipped, traslados: autoBulk.tocados };
@@ -1309,7 +1309,7 @@ function AppMain({ session, role, signOut }) {
        solas como traslado y se quedan sin proyecto. Así la bandeja de "por
        justificar" queda solo con movimientos reales. */
     const combinado = [...nuevos, ...txns];
-    const auto = autoTraslados(combinado);
+    const auto = autoTraslados(combinado, accounts);
     setTxns(auto.tocados ? auto.lista : combinado);
     return { added: nuevos.length, traslados: auto.tocados };
   }
@@ -1317,16 +1317,18 @@ function AppMain({ session, role, signOut }) {
   /* Justifica como traslado los grupos que se aprueben desde la bandeja.
      Va con forzar: acá el usuario lo pidió, así que también convierte los que
      ya tenían un motivo puesto a mano. */
-  function justificarTraslados(claves) {
-    setTxns((prev) => autoTraslados(prev, { claves, forzar: true }).lista);
+  function justificarTraslados(ids) {
+    setTxns((prev) => autoTraslados(prev, accounts, { ids, forzar: true }).lista);
   }
 
-  /* "No es un traslado": la referencia queda marcada para que la detección no
-     vuelva a proponerla, y el movimiento regresa a la bandeja por justificar. */
-  function descartarTraslado(clave) {
+  /* "No es un traslado": esos movimientos quedan marcados para que la detección
+     no vuelva a proponerlos, y regresan a la bandeja por justificar. */
+  function descartarTraslado(ids) {
+    const set = new Set(ids || []);
+    if (!set.size) return;
     setTxns((prev) =>
       prev.map((t) => {
-        if (trasladoKey(t) !== clave) return t;
+        if (!set.has(t.id)) return t;
         if (t.traslado) return { ...t, noTraslado: true, traslado: undefined, trasladoRef: undefined, motivo: "", pending: true };
         return { ...t, noTraslado: true };
       })
@@ -2346,7 +2348,7 @@ function TxnsTab({ txns, accounts, cur, onAdd, onEdit, onDelete, onBulkImport, o
      entran por el importador ya quedan justificados solos; acá se muestran los
      grupos que todavía tienen alguna pata sin marcar (por ejemplo, cuando el
      movimiento de la otra cuenta se cargó a mano después). */
-  const gruposTraslado = useMemo(() => detectarTraslados(txns), [txns]);
+  const gruposTraslado = useMemo(() => detectarTraslados(txns, accounts), [txns, accounts]);
   const trasladosPorMarcar = useMemo(() => gruposTraslado.filter((g) => g.porMarcar.length > 0), [gruposTraslado]);
   const [verTraslados, setVerTraslados] = useState(false);
 
@@ -2591,6 +2593,11 @@ function TxnsTab({ txns, accounts, cur, onAdd, onEdit, onDelete, onBulkImport, o
                   <div style={{ fontSize: 11.5, color: T.mut2, fontFamily: MONO, marginBottom: 6 }}>
                     ref {(g.items[0] || {}).ref || g.key} · {fmtDate(g.fecha)}
                   </div>
+                  {g.laxo && (
+                    <div style={{ fontSize: 11, color: T.blue, marginBottom: 6 }}>
+                      Emparejado por los últimos 6 dígitos (cuenta Mercantil)
+                    </div>
+                  )}
                   {g.items.map((t) => (
                     <div key={t.id} style={{ display: "flex", justifyContent: "space-between", gap: 10, fontSize: 12.5, color: T.text, padding: "2px 0" }}>
                       <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
@@ -2608,13 +2615,13 @@ function TxnsTab({ txns, accounts, cur, onAdd, onEdit, onDelete, onBulkImport, o
                   )}
                   <div style={{ display: "flex", gap: 8, marginTop: 9 }}>
                     <button
-                      onClick={() => onNoTraslado && onNoTraslado(g.key)}
+                      onClick={() => onNoTraslado && onNoTraslado(g.ids)}
                       style={{ flex: 1, background: "transparent", color: T.mut, border: `1px solid ${T.line}`, borderRadius: 10, padding: "9px", fontSize: 12.5, fontWeight: 600, fontFamily: FONT, cursor: "pointer" }}
                     >
                       No es traslado
                     </button>
                     <button
-                      onClick={() => onTraslados && onTraslados([g.key])}
+                      onClick={() => onTraslados && onTraslados(g.ids)}
                       style={{ flex: 1.4, background: T.blue, color: "#0A0F1E", border: "none", borderRadius: 10, padding: "9px", fontSize: 12.5, fontWeight: 700, fontFamily: FONT, cursor: "pointer" }}
                     >
                       Justificar como traslado
@@ -2624,7 +2631,7 @@ function TxnsTab({ txns, accounts, cur, onAdd, onEdit, onDelete, onBulkImport, o
               ))}
               {trasladosPorMarcar.length > 1 && (
                 <button
-                  onClick={() => onTraslados && onTraslados(trasladosPorMarcar.map((g) => g.key))}
+                  onClick={() => onTraslados && onTraslados(trasladosPorMarcar.reduce((s, g) => s.concat(g.ids), []))}
                   style={{ background: "transparent", color: T.blue, border: `1px solid ${T.blue}`, borderRadius: 11, padding: "10px", fontSize: 13, fontWeight: 700, fontFamily: FONT, cursor: "pointer" }}
                 >
                   Justificar los {trasladosPorMarcar.length} como traslado
@@ -3149,7 +3156,10 @@ function StatementImportSheet({ open, onClose, accounts, cur, txns, onImport, on
   const comUnidas = useMemo(() => ops.reduce((s, o) => s + (o.comLines || 0), 0), [ops]);
   const refCompartidas = useMemo(() => ops.filter((o) => o.refCompartida).length, [ops]);
 
-  const existing = useMemo(() => buildTxnIndex(txns), [txns]);
+  const existing = useMemo(() => buildTxnIndex(txns, accounts), [txns, accounts]);
+  // Mercantil: la referencia se valida por los últimos 6 dígitos (el banco la
+  // escribe de dos formas distintas y si no, la misma línea entra dos veces).
+  const esMerc = useMemo(() => cuentaEsMercantil(accounts, accountId), [accounts, accountId]);
   const analysis = useMemo(() => {
     if (!accountId) return { nuevas: [], repetidas: 0, sinRef: 0 };
     // Presupuesto por clave: cuántas veces ya está registrada. Cada línea del
@@ -3159,13 +3169,13 @@ function StatementImportSheet({ open, onClose, accounts, cur, txns, onImport, on
     let repetidas = 0;
     const sinRef = ops.filter((o) => !o.refKey).length;
     ops.forEach((op) => {
-      const k = stmtKeyOf(accountId, op);
+      const k = stmtKeyOf(accountId, op, esMerc);
       const left = budget.get(k) || 0;
       if (left > 0) { budget.set(k, left - 1); repetidas++; return; }
       nuevas.push(op);
     });
     return { nuevas, repetidas, sinRef };
-  }, [ops, accountId, existing]);
+  }, [ops, accountId, existing, esMerc]);
 
   const acct = usable.find((a) => a.id === accountId);
   const acctCur = (acct && acct.currency) || cur;
@@ -3473,6 +3483,15 @@ function StatementImportSheet({ open, onClose, accounts, cur, txns, onImport, on
                   Nuevos a importar: <b style={{ color: T.green }}>{analysis.nuevas.length}</b><br />
                   Ya registrados (se omiten): <b style={{ color: T.mut2 }}>{analysis.repetidas}</b>
                   {analysis.sinRef > 0 && (<><br />Sin referencia del banco: <b style={{ color: T.gold }}>{analysis.sinRef}</b></>)}
+                  {esMerc && (
+                    <>
+                      <br />
+                      <span style={{ color: T.blue }}>
+                        Cuenta Mercantil: la referencia se valida por los <b>últimos 6 dígitos</b>, porque el
+                        banco la escribe de dos formas distintas.
+                      </span>
+                    </>
+                  )}
                 </div>
                 {refCompartidas > 0 && (
                   <div style={{ fontSize: 12, color: T.mut, lineHeight: 1.5, marginTop: 10 }}>
@@ -5826,6 +5845,40 @@ function refCoincide(campos, codigo, enCualquierParte) {
 const TRASLADO_MOTIVO = "Transferencia entre cuentas";
 const TRASLADO_DIAS = 5;
 
+/* ───────────────  Cuentas Mercantil: referencia por los últimos 6  ───────────────
+   Mercantil muestra la MISMA referencia de dos formas distintas según de dónde
+   salga el archivo (una larga, con prefijo o ceros, y una corta). Lo único que
+   se mantiene igual en las dos son los últimos 6 dígitos, así que para las
+   cuentas cuyo nombre lleva "Mercantil" —"Socialmed Mercantil", "Eduardo
+   Mercantil", la que sea— la referencia se valida por ahí: al emparejar
+   traslados y al detectar líneas ya importadas. El resto de los bancos sigue
+   comparando la referencia completa. */
+function esCuentaMercantil(acc) {
+  const nombre = typeof acc === "string" ? acc : (acc && acc.name) || "";
+  return /mercantil/i.test(nombre);
+}
+
+function cuentaEsMercantil(accounts, accountId) {
+  if (!accountId) return false;
+  return esCuentaMercantil((accounts || []).find((a) => a && a.id === accountId));
+}
+
+/* Últimos 6 dígitos de una referencia. "" si no llega a 6. */
+function refUltimos6(ref) {
+  const d = String(ref == null ? "" : ref).replace(/\D/g, "");
+  return d.length >= 6 ? d.slice(-6) : "";
+}
+
+/* Clave de referencia según la cuenta: Mercantil → últimos 6; el resto → la
+   referencia completa normalizada. */
+function refKeyDeCuenta(ref, esMerc) {
+  if (esMerc) {
+    const c = refUltimos6(ref);
+    if (c) return c;
+  }
+  return stmtRefKey(ref);
+}
+
 /* Referencia utilizable para emparejar. Se recalcula desde t.ref y no se confía
    solo en refKey, porque los movimientos cargados a mano no lo traen. */
 function trasladoKey(t) {
@@ -5847,31 +5900,74 @@ function trasladoElegible(t) {
   return !!t && !t.noTraslado && !t.divisaId && !t.divisaKind;
 }
 
-/* Devuelve los grupos de movimientos que forman un traslado. */
-function detectarTraslados(lista, dias) {
-  const margen = dias == null ? TRASLADO_DIAS : dias;
-  const porRef = new Map();
+/* Devuelve los grupos de movimientos que forman un traslado.
+
+   El emparejamiento se hace en dos pasos:
+     1. Se juntan los movimientos por los ÚLTIMOS 6 dígitos de la referencia.
+     2. Cada bolsa se vuelve a partir por la referencia completa… salvo que
+        participe una cuenta Mercantil. Ahí mandan los 6 dígitos, porque el
+        banco escribe la misma referencia de dos formas.
+   Como 6 dígitos son pocos, a esos grupos laxos se les exige además que los
+   montos cuadren: el monto es la prueba de que es la misma operación. */
+function detectarTraslados(lista, accounts, opts) {
+  const o = opts || {};
+  const margen = o.dias == null ? TRASLADO_DIAS : o.dias;
+
+  const bolsas = new Map();
   (lista || []).forEach((t) => {
     if (!trasladoElegible(t)) return;
-    const k = trasladoKey(t);
-    if (!k) return;
-    if (!porRef.has(k)) porRef.set(k, []);
-    porRef.get(k).push(t);
+    const bolsa = refUltimos6(t.ref || t.refKey) || trasladoKey(t);
+    if (!bolsa) return;
+    if (!bolsas.has(bolsa)) bolsas.set(bolsa, []);
+    bolsas.get(bolsa).push(t);
   });
+
+  const candidatos = [];
+  bolsas.forEach((items, bolsa) => {
+    const hayMercantil = items.some((t) => cuentaEsMercantil(accounts, t.accountId));
+    if (!hayMercantil) {
+      // Sin Mercantil de por medio: la referencia completa manda, como siempre.
+      const porFull = new Map();
+      items.forEach((t) => {
+        const k = trasladoKey(t);
+        if (!k) return;
+        if (!porFull.has(k)) porFull.set(k, []);
+        porFull.get(k).push(t);
+      });
+      porFull.forEach((its, k) => candidatos.push({ key: k, items: its, laxo: false }));
+      return;
+    }
+    if (items.length <= 2) { candidatos.push({ key: bolsa, items, laxo: true }); return; }
+    // Bolsa grande: se separa por monto para no mezclar operaciones distintas
+    // que por casualidad terminen en los mismos 6 dígitos.
+    const porMonto = new Map();
+    items.forEach((t) => {
+      const k = String(Math.round((t.amount || 0) * 100));
+      if (!porMonto.has(k)) porMonto.set(k, []);
+      porMonto.get(k).push(t);
+    });
+    porMonto.forEach((its, k) => { if (its.length > 1) candidatos.push({ key: bolsa + "|" + k, items: its, laxo: true }); });
+  });
+
   const grupos = [];
-  porRef.forEach((items, key) => {
-    if (new Set(items.map((t) => t.accountId)).size < 2) return;   // la misma cuenta no es traslado
+  candidatos.forEach((c) => {
+    const items = c.items;
+    if (new Set(items.map((t) => t.accountId)).size < 2) return;    // la misma cuenta no es traslado
     const entradas = items.filter((t) => t.kind === "income");
     const salidas = items.filter((t) => t.kind !== "income");
-    if (!entradas.length || !salidas.length) return;               // tiene que salir de una y entrar en otra
+    if (!entradas.length || !salidas.length) return;                // tiene que salir de una y entrar en otra
     const fechas = items.map((t) => t.date).filter(Boolean).sort();
     if (fechas.length > 1 && diasEntre(fechas[0], fechas[fechas.length - 1]) > margen) return;
     const entra = entradas.reduce((s, t) => s + (t.amount || 0), 0);
     const sale = salidas.reduce((s, t) => s + (t.amount || 0) + (t.commission || 0), 0);
+    const descuadre = entra - sale;
+    // Emparejado solo por 6 dígitos: los montos tienen que cuadrar.
+    if (c.laxo && Math.abs(descuadre) > Math.max(0.01, entra * 0.01)) return;
     grupos.push({
-      key, items, entradas, salidas, entra, sale,
-      descuadre: entra - sale,                                     // suele ser la comisión del banco
+      key: c.key, laxo: c.laxo, items, entradas, salidas, entra, sale,
+      descuadre,                                                    // suele ser la comisión del banco
       fecha: fechas[0] || "",
+      ids: items.map((t) => t.id),
       porMarcar: items.filter((t) => !esTraslado(t)),
     });
   });
@@ -5889,13 +5985,14 @@ function marcarTraslado(t, key) {
 /* Justificación automática. Regla de oro: NUNCA pisa un movimiento que alguien
    ya justificó a mano — esos solo se convierten si se pide expresamente desde
    el botón de la bandeja (forzar). */
-function autoTraslados(lista, opts) {
+function autoTraslados(lista, accounts, opts) {
   const o = opts || {};
-  const claves = o.claves ? new Set(o.claves) : null;
-  const grupos = detectarTraslados(lista, o.dias);
+  const ids = o.ids ? new Set(o.ids) : null;
+  const grupos = detectarTraslados(lista, accounts, o);
   const cambios = new Map();
   grupos.forEach((g) => {
-    if (claves && !claves.has(g.key)) return;
+    // Cuando se aprueba desde la bandeja llegan los ids de ese grupo
+    if (ids && !g.items.some((t) => ids.has(t.id))) return;
     /* Si alguna pata ya se justificó a mano, el grupo entero se deja para la
        revisión de la bandeja: es mejor preguntar que dejar media transferencia
        marcada como traslado y la otra media como un gasto con proyecto. */
@@ -6229,9 +6326,12 @@ function mergeStatementCommissions(ops) {
    repiten la referencia (o ponen "N/A") en varias líneas, y si la clave fuera
    solo la referencia esos movimientos se descartarían como falsos duplicados.
    Sin referencia se completa con la descripción. */
-function stmtKeyOf(accountId, op) {
+/* `esMerc`: la cuenta es Mercantil, así que la referencia se valida por los
+   últimos 6 dígitos. Sin eso, el mismo movimiento bajado en los dos formatos
+   que usa el banco entraría dos veces. */
+function stmtKeyOf(accountId, op, esMerc) {
   const cents = Math.round((op.amount || 0) * 100);
-  const rk = op.refKey || stmtRefKey(op.ref);
+  const rk = refKeyDeCuenta(op.ref || op.refKey, esMerc);
   if (rk) return `${accountId}|r|${rk}|${op.date}|${cents}`;
   return `${accountId}|h|${op.date}|${cents}|${stmtNorm(op.desc).replace(/\s+/g, " ").slice(0, 40)}`;
 }
@@ -6240,13 +6340,17 @@ function stmtKeyOf(accountId, op) {
    Se cuenta CUÁNTAS veces existe cada clave, no si existe: un comercio puede
    cobrar dos veces el mismo monto el mismo día y ambas son operaciones reales.
    Si el archivo trae 2 y en la app hay 1, se importa solo la que falta. */
-function buildTxnIndex(txns) {
+function buildTxnIndex(txns, accounts) {
   const m = new Map();
   (txns || []).forEach((t) => {
     if (!t || !t.accountId) return;
     // Se recalcula la clave desde t.ref (no se confía en refKey guardado) para
     // que todo el índice use siempre la misma regla de normalización.
-    const k = stmtKeyOf(t.accountId, { ref: t.ref, date: t.date, amount: t.amount, desc: t.bankDesc || t.motivo });
+    const k = stmtKeyOf(
+      t.accountId,
+      { ref: t.ref, date: t.date, amount: t.amount, desc: t.bankDesc || t.motivo },
+      cuentaEsMercantil(accounts, t.accountId)
+    );
     m.set(k, (m.get(k) || 0) + 1);
   });
   return m;
