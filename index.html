@@ -33,7 +33,7 @@ const { useState, useEffect, useRef, useMemo } = React;
 
 /* Versión de compilación. Sirve para confirmar de un vistazo qué build está
    corriendo en pantalla (útil para detectar caché vieja de la PWA). */
-const BUILD = "v4.9 · Banesco, Mercantil empresa y personas · 2026-08-05";
+const BUILD = "v5.0 · Búsqueda por últimos dígitos de la referencia · 2026-08-24";
 try { console.log("[Patrimonio] build:", BUILD); } catch (e) {}
 
 /* ─────────────────────────────  Tokens de diseño  ───────────────────────────── */
@@ -2294,6 +2294,7 @@ function TxnsTab({ txns, accounts, cur, onAdd, onEdit, onDelete, onBulkImport, o
   const [fTo, setFTo] = useState("");
   const [showF, setShowF] = useState(false);
   const [q, setQ] = useState("");
+  const [refAmplio, setRefAmplio] = useState(false); // buscar el código en cualquier parte de la referencia
   const [soloPend, setSoloPend] = useState(false);
   const [sel, setSel] = useState({});          // id -> true (selección para justificar en lote)
   const [selMode, setSelMode] = useState(false);
@@ -2305,11 +2306,25 @@ function TxnsTab({ txns, accounts, cur, onAdd, onEdit, onDelete, onBulkImport, o
 
   /* Búsqueda: referencia del banco (código validador), motivo, descripción, cuenta,
      proyecto y monto. La referencia se compara normalizada, así da igual si la
-     escribís con espacios, guiones o ceros al principio. */
+     escribís con espacios, guiones o ceros al principio.
+
+     Caso especial —y el más común en la calle—: escribir solo los últimos 4 o 6
+     números de la referencia. Cuando lo que se escribe es únicamente un código
+     de dígitos, se busca por el FINAL de la referencia (la del banco y la que
+     venga dentro de la descripción), no en cualquier parte. Si eso no trae
+     nada, el botón "Buscar en cualquier parte" afloja la comparación. */
   const qn = q.trim().toLowerCase();
   const qRef = normRef(q);
+  const qCodigo = codigoRef(q);
   const matchQ = (t) => {
     if (!qn) return true;
+    if (qCodigo) {
+      if (refCoincide([t.ref, t.bankDesc], qCodigo, refAmplio)) return true;
+      // Un número también puede ser un monto: 4523 → Bs 4.523,00
+      const nqc = numVE(q);
+      if (!isNaN(nqc) && nqc > 0 && Math.abs((t.amount || 0) - nqc) < 0.005) return true;
+      return false;
+    }
     if (qRef && normRef(t.ref).includes(qRef)) return true;
     const hay = [t.motivo, t.bankDesc, t.ref, t.project, acctName(t.accountId)]
       .filter(Boolean).join(" ").toLowerCase();
@@ -2332,7 +2347,7 @@ function TxnsTab({ txns, accounts, cur, onAdd, onEdit, onDelete, onBulkImport, o
           (!soloPend || !!t.pending) &&
           matchQ(t)
       ),
-    [txns, fAcct, fKind, fProject, fFrom, fTo, soloPend, q, accounts, diaFijado]
+    [txns, fAcct, fKind, fProject, fFrom, fTo, soloPend, q, refAmplio, accounts, diaFijado]
   );
 
   const selIds = Object.keys(sel).filter((k) => sel[k]);
@@ -2447,14 +2462,14 @@ function TxnsTab({ txns, accounts, cur, onAdd, onEdit, onDelete, onBulkImport, o
         <input
           style={{ ...inputStyle, paddingLeft: 38, marginBottom: 0 }}
           value={q}
-          onChange={(e) => setQ(e.target.value)}
-          placeholder="Buscar por referencia, monto, motivo…"
+          onChange={(e) => { setQ(e.target.value); setRefAmplio(false); }}
+          placeholder="Últimos 4 o 6 dígitos de la referencia, monto, motivo…"
           inputMode="search"
         />
         <span style={{ position: "absolute", left: 13, top: "50%", transform: "translateY(-50%)", color: T.mut2, fontSize: 15 }}>⌕</span>
         {q && (
           <button
-            onClick={() => setQ("")}
+            onClick={() => { setQ(""); setRefAmplio(false); }}
             style={{ position: "absolute", right: 8, top: "50%", transform: "translateY(-50%)", ...btnGhost, color: T.mut2, fontSize: 18, lineHeight: 1 }}
             aria-label="Limpiar búsqueda"
           >×</button>
@@ -2462,7 +2477,21 @@ function TxnsTab({ txns, accounts, cur, onAdd, onEdit, onDelete, onBulkImport, o
       </div>
       {q && (
         <div style={{ fontSize: 12.5, color: T.mut, marginBottom: 12 }}>
-          {filtrados.length} resultado(s) para “{q}”
+          {qCodigo ? (
+            <>
+              {filtrados.length} resultado(s) con referencia{" "}
+              <b style={{ color: T.text }}>{refAmplio ? "que contiene" : "terminada en"} {qCodigo}</b>
+              {/* Salida de emergencia: si el que pagó dictó dígitos del medio */}
+              <button
+                onClick={() => setRefAmplio((v) => !v)}
+                style={{ ...btnGhost, color: T.gold, fontSize: 12.5, fontWeight: 600, padding: "0 0 0 8px" }}
+              >
+                {refAmplio ? "Solo por el final" : "Buscar en cualquier parte"}
+              </button>
+            </>
+          ) : (
+            <>{filtrados.length} resultado(s) para “{q}”</>
+          )}
         </div>
       )}
 
@@ -4896,7 +4925,27 @@ function DivisasTab({ divisas, onAdd, onEdit, onDelete, onPatch, canWrite = true
   const miniBtn = { flex: 1, borderRadius: 11, padding: "11px", fontSize: 13.5, fontWeight: 600, fontFamily: FONT, cursor: "pointer", textAlign: "center", boxSizing: "border-box" };
   const sortDesc = (a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : (b.createdAt || 0) - (a.createdAt || 0));
   const sortAsc = (a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : (a.createdAt || 0) - (b.createdAt || 0));
-  const ventasOrden = ventas.slice().sort(sortDesc);
+  /* Buscador por referencia: mismo criterio que en Movimientos. Con un código de
+     4 a 6 dígitos se compara contra el FINAL de la referencia; con texto, contra
+     el cliente. Filtra las ventas y, aparte, saca a la superficie las compras
+     que coincidan (que normalmente viven colgadas de una venta). */
+  const [q, setQ] = useState("");
+  const [refAmplio, setRefAmplio] = useState(false);
+  const qn = q.trim().toLowerCase();
+  const qCodigo = codigoRef(q);
+  const matchOp = (d) => {
+    if (!qn) return true;
+    if (qCodigo) {
+      if (refCoincide(d.referencia, qCodigo, refAmplio)) return true;
+      const nq = numVE(q);
+      if (!isNaN(nq) && nq > 0 && (Math.abs((d.usd || 0) - nq) < 0.005 || Math.abs((d.usd || 0) * (d.tasa || 0) - nq) < 0.5)) return true;
+      return false;
+    }
+    return [d.persona, d.referencia].filter(Boolean).join(" ").toLowerCase().includes(qn);
+  };
+  const ventasOrden = ventas.filter(matchOp).slice().sort(sortDesc);
+  const comprasHallada = qn ? compras.filter(matchOp).slice().sort(sortDesc) : [];
+  const hallados = qn ? ventasOrden.length + comprasHallada.length : 0;
   const sueltas = compras.filter((c) => !c.ventaId).slice().sort(sortDesc);
 
   async function onReceiptFile(op, e) {
@@ -5040,10 +5089,72 @@ function DivisasTab({ divisas, onAdd, onEdit, onDelete, onPatch, canWrite = true
         </button>
       </div>
 
+      {/* Buscador por referencia: los últimos 4 o 6 dígitos alcanzan */}
+      <div style={{ position: "relative", marginBottom: 12 }}>
+        <input
+          style={{ ...inputStyle, paddingLeft: 38, marginBottom: 0 }}
+          value={q}
+          onChange={(e) => { setQ(e.target.value); setRefAmplio(false); }}
+          placeholder="Últimos 4 o 6 dígitos de la referencia, cliente…"
+          inputMode="search"
+        />
+        <span style={{ position: "absolute", left: 13, top: "50%", transform: "translateY(-50%)", color: T.mut2, fontSize: 15 }}>⌕</span>
+        {q && (
+          <button
+            onClick={() => { setQ(""); setRefAmplio(false); }}
+            style={{ position: "absolute", right: 8, top: "50%", transform: "translateY(-50%)", ...btnGhost, color: T.mut2, fontSize: 18, lineHeight: 1 }}
+            aria-label="Limpiar búsqueda"
+          >×</button>
+        )}
+      </div>
+      {q && (
+        <div style={{ fontSize: 12.5, color: T.mut, marginBottom: 12 }}>
+          {qCodigo ? (
+            <>
+              {hallados} operación(es) con referencia{" "}
+              <b style={{ color: T.text }}>{refAmplio ? "que contiene" : "terminada en"} {qCodigo}</b>
+              <button
+                onClick={() => setRefAmplio((v) => !v)}
+                style={{ ...btnGhost, color: T.gold, fontSize: 12.5, fontWeight: 600, padding: "0 0 0 8px" }}
+              >
+                {refAmplio ? "Solo por el final" : "Buscar en cualquier parte"}
+              </button>
+            </>
+          ) : (
+            <>{hallados} operación(es) para “{q}”</>
+          )}
+        </div>
+      )}
+
+      {/* Compras que coinciden: normalmente viven dentro de una venta, así que
+          cuando se busca una referencia se muestran aparte para poder tocarlas. */}
+      {qn && comprasHallada.length > 0 && (
+        <>
+          <div style={{ ...sectionTitle, marginBottom: 10 }}>Compras encontradas</div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 18 }}>
+            {comprasHallada.map((c) => (
+              <button key={c.id} onClick={() => onEdit(c)} style={{ ...rowCard, cursor: "pointer", textAlign: "left" }}>
+                <div style={{ minWidth: 0 }}>
+                  <div style={{ fontSize: 13.5, fontWeight: 600, color: T.text }}>
+                    {fmtUsd(c.usd || 0)} <span style={{ color: T.mut, fontWeight: 400 }}>× {(c.tasa || 0).toLocaleString("es-VE")}</span>
+                  </div>
+                  <div style={{ fontSize: 11.5, color: T.mut, fontFamily: MONO, marginTop: 2 }}>
+                    {fmtDate(c.date)}{c.persona ? ` · ${c.persona}` : ""}{c.referencia ? ` · ref ${c.referencia}` : " · sin ref"}
+                  </div>
+                </div>
+                <div style={{ fontFamily: MONO, fontVariantNumeric: "tabular-nums", fontSize: 13.5, color: T.blue }}>
+                  {fmtBs(vesDe(c))}
+                </div>
+              </button>
+            ))}
+          </div>
+        </>
+      )}
+
       {/* Ventas (desplegables) */}
       <div style={{ ...sectionTitle, marginBottom: 10 }}>Ventas</div>
       {ventasOrden.length === 0 ? (
-        <div style={emptyRow}>Registrá tu primera venta de divisas</div>
+        <div style={emptyRow}>{qn ? "Ninguna venta coincide con la búsqueda" : "Registrá tu primera venta de divisas"}</div>
       ) : (
         <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
           {ventasOrden.map((v) => {
@@ -5509,6 +5620,54 @@ function wbToBlobUrl(XLSX, wb, name) {
 }
 function normRef(s) {
   return String(s || "").replace(/\s+/g, "").replace(/[^0-9a-zA-Z]/g, "").replace(/^0+/, "").toLowerCase();
+}
+
+/* ───────────  Búsqueda por los últimos dígitos de la referencia  ───────────
+   El cliente casi nunca dicta la referencia completa: manda los últimos 4 o 6
+   números del comprobante. Por eso, cuando lo que se escribe en el buscador es
+   solo un código de 4 a 12 dígitos, la referencia se compara contra el FINAL y
+   no en cualquier parte: así "4523" trae la ref 00123454523 y no las que
+   llevan 4523 en el medio. */
+
+/* Si el texto es un código de referencia (solo dígitos, admitiendo espacios,
+   guiones o puntos), devuelve sus dígitos. Si no, devuelve "". */
+function codigoRef(s) {
+  const raw = String(s || "").trim();
+  if (!/^[\d\s.\-/]+$/.test(raw)) return "";
+  const d = raw.replace(/\D/g, "");
+  return d.length >= 4 && d.length <= 12 ? d : "";
+}
+
+/* Números que aparecen en un texto. Sirve tanto para la referencia sola
+   ("00123454523") como para la descripción del banco, que muchas veces trae la
+   referencia embutida ("TRANSF 00123454523 PAGO MOVIL"). */
+function refTokens(s) {
+  return String(s || "").match(/\d{3,}/g) || [];
+}
+
+/* ¿Alguno de los números del texto TERMINA en el código buscado?
+   Se prueba también sin los ceros de la izquierda: quien dicta "004523" está
+   buscando lo mismo que quien dicta "4523". */
+function refTerminaEn(texto, codigo) {
+  if (!codigo) return false;
+  const sinCeros = codigo.replace(/^0+/, "") || codigo;
+  return refTokens(texto).some((t) => t.endsWith(codigo) || t.endsWith(sinCeros));
+}
+
+/* Igual que la anterior pero laxa: el código aparece en cualquier posición.
+   Es la salida de emergencia cuando la búsqueda por final no trae nada. */
+function refContiene(texto, codigo) {
+  if (!codigo) return false;
+  const sinCeros = codigo.replace(/^0+/, "") || codigo;
+  return refTokens(texto).some((t) => t.includes(codigo) || t.includes(sinCeros));
+}
+
+/* Un solo lugar donde se decide si una operación coincide con el código.
+   `campos` son los textos donde puede vivir la referencia. */
+function refCoincide(campos, codigo, enCualquierParte) {
+  if (!codigo) return false;
+  const lista = Array.isArray(campos) ? campos : [campos];
+  return lista.some((c) => (enCualquierParte ? refContiene(c, codigo) : refTerminaEn(c, codigo)));
 }
 /* ─────────────────────────────  Estado de cuenta bancario  ─────────────────────────────
    Lee el .xlsx que emite el banco y lo convierte en movimientos listos para justificar.
