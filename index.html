@@ -33,7 +33,7 @@ const { useState, useEffect, useRef, useMemo } = React;
 
 /* Versión de compilación. Sirve para confirmar de un vistazo qué build está
    corriendo en pantalla (útil para detectar caché vieja de la PWA). */
-const BUILD = "v5.4 · Tasas diarias USDT + BCV (usdt.com.ve) · 2026-08-25";
+const BUILD = "v5.5 · Abonos con cuenta USD, método y proyecto · 2026-08-25";
 try { console.log("[Patrimonio] build:", BUILD); } catch (e) {}
 
 /* ─────────────────────────────  Tokens de diseño  ───────────────────────────── */
@@ -533,6 +533,62 @@ function allocateFIFO(ventas, compras) {
     ventaStats[k].allocs.sort((a, b) => arriv(a.compra, b.compra));
   });
   return { ventaStats, unalloc };
+}
+
+/* ─────────────  Abonos de Cuentas por cobrar  ─────────────
+   Un abono es plata que entra de verdad, así que va a parar a una cuenta en
+   USD. Y solo hay dos formas de cobrar: EFECTIVO o TRANSFERENCIA. Por eso las
+   cuentas válidas para un abono son exactamente dos —una de efectivo y una de
+   transferencias, ambas en USD— y no cualquier cuenta de la lista. */
+const ABONO_METODOS = [
+  { id: "efectivo", label: "EFECTIVO", nombre: "Efectivo USD", type: "cash" },
+  { id: "transferencia", label: "TRANSFERENCIA", nombre: "Transferencias USD", type: "bank" },
+];
+
+function metodoAbono(id) {
+  return ABONO_METODOS.find((m) => m.id === id) || null;
+}
+
+/* Busca, entre las cuentas en USD, cuál corresponde a cada método. Primero por
+   el nombre (así respeta las cuentas que ya existan, se llamen como se llamen)
+   y si no, por el tipo: efectivo → caja, transferencia → banco. */
+const RE_EFECTIVO = /efectivo|caja|cash/i;
+const RE_TRANSF = /transferencia|banco|bank|zelle|wire/i;
+
+function cuentasDeAbono(accounts) {
+  const usd = (accounts || []).filter(
+    (a) => a && String(a.currency || "").toLowerCase() === "usd" && (a.type === "bank" || a.type === "cash")
+  );
+  const nom = (a) => String((a && a.name) || "");
+  /* El orden importa y el tipo manda sobre el nombre: así una cuenta llamada
+     "Banco Caja USD" no se reclama los dos puestos, que era la vía para
+     terminar creando una cuenta nueva en cada abono. */
+  const elegir = (lista, reglas) => {
+    for (let i = 0; i < reglas.length; i++) {
+      const a = lista.find(reglas[i]);
+      if (a) return a;
+    }
+    return null;
+  };
+  const efectivo = elegir(usd, [
+    (a) => a.type === "cash" && RE_EFECTIVO.test(nom(a)),
+    (a) => a.type === "cash",
+    (a) => RE_EFECTIVO.test(nom(a)) && !RE_TRANSF.test(nom(a)),
+  ]);
+  const resto = usd.filter((a) => !efectivo || a.id !== efectivo.id);
+  const transferencia = elegir(resto, [
+    (a) => a.type === "bank" && RE_TRANSF.test(nom(a)),
+    (a) => a.type === "bank",
+    (a) => RE_TRANSF.test(nom(a)),
+  ]);
+  return { efectivo, transferencia, usd };
+}
+
+/* Etiqueta del movimiento que genera el abono. */
+function motivoAbono(persona, metodoId) {
+  const m = metodoAbono(metodoId);
+  const quien = String(persona || "").trim();
+  return ["ABONO" + (quien ? " " + quien : ""), m ? m.label : ""].filter(Boolean).join(" · ");
 }
 
 /* ── Multimoneda: conversión USD ↔ VES ── */
@@ -1376,6 +1432,14 @@ function AppMain({ session, role, signOut }) {
     setCryptoSheet(false);
   }
   function deleteAccount(id) {
+    // Los abonos ligados a movimientos de esta cuenta se van con ella: dejarlos
+    // sueltos haría que Cuentas por cobrar descontara cobros inexistentes.
+    const abonosHuerfanos = (txns || []).filter((t) => t.accountId === id && t.abonoId).map((t) => t.abonoId);
+    if (abonosHuerfanos.length) {
+      const set = new Set(abonosHuerfanos);
+      setDivisas((prev) => prev.filter((d) => !set.has(d.id)));
+      abonosHuerfanos.forEach((aid) => receiptDel(aid));
+    }
     setAccounts((prev) => prev.filter((a) => a.id !== id));
     setTxns((prev) => prev.filter((t) => t.accountId !== id));
     setAcctSheet(null);
@@ -1383,6 +1447,44 @@ function AppMain({ session, role, signOut }) {
 
   /* Acciones movimientos */
   const txnDelta = (t) => (t.kind === "income" ? t.amount : -t.amount) - (t.commission || 0);
+
+  /* Si se edita el movimiento que nació de un abono (a mano o por Excel), el
+     abono tiene que seguirlo: si no, Cuentas por cobrar seguiría descontando el
+     monto viejo y mostrando la cuenta vieja. */
+  function sincronizarAbonos(lista) {
+    const porAbono = new Map();
+    (lista || []).forEach((t) => {
+      // Solo se copia lo que sigue siendo un cobro en dólares. Si alguien mueve
+      // el movimiento a una cuenta en bolívares o lo convierte en egreso, el
+      // abono se deja como estaba: meter bolívares en el campo `usd` borraría
+      // el pendiente del cliente de un plumazo.
+      if (!t || !t.abonoId) return;
+      if (String(t.currency || "").toLowerCase() !== "usd") return;
+      if (t.kind !== "income") return;
+      porAbono.set(t.abonoId, t);
+    });
+    if (!porAbono.size) return;
+    const ctas = cuentasDeAbono(accounts);
+    setDivisas((prev) =>
+      prev.map((d) => {
+        const t = d && d.kind === "abono" ? porAbono.get(d.id) : null;
+        if (!t) return d;
+        // El método sigue a la cuenta: si el movimiento se pasó a la otra
+        // cuenta, la etiqueta tiene que cambiar con él.
+        let metodo = d.metodo;
+        if (ctas.efectivo && t.accountId === ctas.efectivo.id) metodo = "efectivo";
+        else if (ctas.transferencia && t.accountId === ctas.transferencia.id) metodo = "transferencia";
+        return {
+          ...d,
+          usd: t.amount || 0,
+          date: t.date || d.date,
+          accountId: t.accountId,
+          project: t.project || undefined,
+          metodo,
+        };
+      })
+    );
+  }
   function saveTxn(data) {
     // El saldo de la cuenta se deriva de los movimientos (ver acctBalance/accountsView),
     // por eso acá sólo se guarda el movimiento. No se toca ningún saldo de cuenta.
@@ -1403,6 +1505,10 @@ function AppMain({ session, role, signOut }) {
       });
       return [{ ...patch, id: uid(), createdAt: Date.now() }, ...prev];
     });
+    if (data.id) {
+      const viejo = (txns || []).find((x) => x.id === data.id);
+      if (viejo && viejo.abonoId) sincronizarAbonos([{ ...viejo, ...patch }]);
+    }
     setTxnSheet(false);
   }
   function deleteTxn(t) {
@@ -1413,6 +1519,12 @@ function AppMain({ session, role, signOut }) {
     if (t && t.divisaId) {
       setDivisas((prev) => prev.filter((d) => d.id !== t.divisaId));
       receiptDel(t.divisaId);
+    }
+    // Y si era el ingreso de un abono, se borra también el abono: dejarlo suelto
+    // haría que Cuentas por cobrar mostrara un cobro que ya no existe.
+    if (t && t.abonoId) {
+      setDivisas((prev) => prev.filter((d) => d.id !== t.abonoId));
+      receiptDel(t.abonoId);
     }
     setTxnSheet(false);
   }
@@ -1475,6 +1587,12 @@ function AppMain({ session, role, signOut }) {
       const auto = autoTraslados(mezclado, accounts);
       return auto.tocados ? auto.lista : mezclado;
     });
+    // Los abonos editados por Excel arrastran su ficha de Cuentas por cobrar
+    sincronizarAbonos(
+      Object.keys(updates)
+        .map((id) => { const v = (txns || []).find((t) => t.id === id); return v && v.abonoId ? { ...v, ...updates[id] } : null; })
+        .filter(Boolean)
+    );
     // Solo para el mensaje que se le muestra al usuario
     const previstos = autoTraslados(
       [...newTxns, ...txns.map((t) => (updates[t.id] ? { ...t, ...updates[t.id] } : t))],
@@ -1643,6 +1761,14 @@ function AppMain({ session, role, signOut }) {
         return base;
       })
     );
+
+    // Si entre los justificados hay ingresos de abonos, su ficha de Cuentas por
+    // cobrar sigue el motivo y el proyecto que se acaba de asignar.
+    sincronizarAbonos(
+      (txns || [])
+        .filter((x) => set.has(x.id) && x.abonoId)
+        .map((x) => ({ ...x, motivo: patch.motivo, project: patch.project || x.project }))
+    );
   }
 
   /* Acciones divisas */
@@ -1653,11 +1779,66 @@ function AppMain({ session, role, signOut }) {
     });
     setDivisaSheet(null);
   }
+  /* Crea, si hace falta, las dos únicas cuentas en USD que admiten abonos, y
+     devuelve el id de la que corresponda al método. */
+  function cuentaParaAbono(metodoId) {
+    const m = metodoAbono(metodoId);
+    if (!m) return null;
+    const ya = cuentasDeAbono(accounts)[m.id];
+    if (ya) return ya.id;
+    const id = uid();
+    setAccounts((prev) => [...prev, { id, name: m.nombre, type: m.type, currency: "usd", opening: 0 }]);
+    return id;
+  }
+
+  /* Registrar abono: además de la ficha en Cuentas por cobrar, entra como
+     INGRESO en la cuenta USD elegida y con su proyecto, porque es plata que
+     efectivamente entró. Los dos quedan ligados por id: si se borra el abono,
+     se borra el movimiento. */
   function addAbono(data) {
-    setDivisas((prev) => [{ ...data, kind: "abono", id: uid(), createdAt: Date.now() }, ...prev]);
+    const metodo = metodoAbono(data && data.metodo) ? data.metodo : null;
+    if (!metodo) return;
+    const accountId = data.accountId || cuentaParaAbono(metodo);
+    if (!accountId) return;
+    const abonoId = uid();
+    const txnId = uid();
+    setDivisas((prev) => [
+      { ...data, metodo, accountId, txnId, kind: "abono", id: abonoId, createdAt: Date.now() },
+      ...prev,
+    ]);
+    setTxns((prev) => [
+      {
+        id: txnId,
+        createdAt: Date.now(),
+        kind: "income",
+        amount: data.usd || 0,
+        currency: "usd",
+        accountId,
+        date: data.date || todayISO(),
+        motivo: motivoAbono(data.persona, metodo),
+        project: data.project || undefined,
+        commission: 0,
+        comMode: "none",
+        pending: false,
+        source: "abono",
+        abonoId,
+        /* La referencia del banco es opcional, pero conviene cargarla en los
+           abonos por transferencia: con ella, cuando después se importe el
+           estado de cuenta de esa cuenta USD, el importador reconoce la línea
+           como ya cargada y no la duplica. */
+        ref: data.ref || "",
+        refKey: data.ref ? stmtRefKey(data.ref) : "",
+      },
+      ...prev,
+    ]);
   }
   function deleteDivisa(id) {
-    setDivisas((prev) => prev.filter((d) => d.id !== id));
+    // Si era un abono, se lleva consigo el ingreso que había generado
+    const d = (divisas || []).find((x) => x.id === id);
+    if (d && d.kind === "abono") {
+      setTxns((prev) => prev.filter((t) => t.id !== d.txnId && t.abonoId !== id));
+    }
+    setDivisas((prev) => prev.filter((x) => x.id !== id));
     receiptDel(id);
     setDivisaSheet(null);
   }
@@ -1942,6 +2123,8 @@ function AppMain({ session, role, signOut }) {
             ) : (
               <CxCTab
                 divisas={divisas}
+                accounts={accounts}
+                projects={projects}
                 canWrite={canWriteData}
                 onAddAbono={addAbono}
                 onDeleteAbono={deleteDivisa}
@@ -5232,11 +5415,15 @@ function AjustesTab({ settings, setSettings, accounts, txns, prices, cur, divisa
 
 /* ─────────────────────────────  Tab: Divisas (USD / VES)  ───────────────────────────── */
 /* ─────────────────────────────  Cuentas por cobrar (por cliente)  ───────────────────────────── */
-function CxCTab({ divisas, canWrite = true, onAddAbono, onDeleteAbono, onPatch }) {
+function CxCTab({ divisas, accounts = [], projects = [], canWrite = true, onAddAbono, onDeleteAbono, onPatch }) {
   const [openKey, setOpenKey] = useState(null);
   const [monto, setMonto] = useState("");
   const [fecha, setFecha] = useState(todayISO());
   const [nota, setNota] = useState("");
+  const [metodo, setMetodo] = useState("");            // EFECTIVO | TRANSFERENCIA
+  const [proyecto, setProyecto] = useState("");
+  const [nuevoProy, setNuevoProy] = useState("");
+  const [refAbono, setRefAbono] = useState("");
   const [busyId, setBusyId] = useState(null);
   const [err, setErr] = useState("");
   const [viewer, setViewer] = useState(null);
@@ -5280,12 +5467,46 @@ function CxCTab({ divisas, canWrite = true, onAddAbono, onDeleteAbono, onPatch }
     catch (ex) { setErr("No se pudo abrir el comprobante."); }
   }
 
+  /* Cuentas en USD que admiten abonos: exactamente dos. Si todavía no existen,
+     se crean solas al registrar el primer abono de ese método. */
+  const cuentas = useMemo(() => cuentasDeAbono(accounts), [accounts]);
+  const proy = proyecto === "__new" ? nuevoProy.trim() : proyecto;
+  const abonoValido = numVE(monto) > 0 && !!metodoAbono(metodo) && !!proy;
+
   function registrarAbono(c) {
     const n = numVE(monto);
-    if (!(n > 0)) return;
-    onAddAbono({ persona: c.nombre, usd: n, date: fecha, note: nota.trim() || undefined });
-    setMonto(""); setNota(""); setFecha(todayISO());
+    if (!abonoValido) return;
+    const cta = cuentas[metodo];
+    onAddAbono({
+      persona: c.nombre,
+      usd: n,
+      date: fecha,
+      note: nota.trim() || undefined,
+      metodo,
+      accountId: cta ? cta.id : undefined,   // si no existe, la crea la app
+      project: proy,
+      ref: metodo === "transferencia" ? refAbono.trim() || undefined : undefined,
+    });
+    limpiarFormulario();
   }
+
+  /* El formulario es uno solo para toda la lista, así que se limpia al cambiar
+     de cliente: si no, lo tipeado para uno quedaría listo para registrarse en
+     el siguiente que se abra. */
+  function limpiarFormulario() {
+    setMonto(""); setNota(""); setFecha(todayISO());
+    setMetodo(""); setProyecto(""); setNuevoProy(""); setRefAbono("");
+  }
+  function abrirCliente(k) {
+    setOpenKey((prev) => (prev === k ? null : k));
+    limpiarFormulario();
+    setErr("");
+  }
+
+  const nombreCuenta = (id) => {
+    const a = (accounts || []).find((x) => x.id === id);
+    return a ? a.name : "";
+  };
 
   const miniBtn = { borderRadius: 10, padding: "9px 12px", fontSize: 12.5, fontWeight: 600, fontFamily: FONT, cursor: "pointer", textAlign: "center" };
 
@@ -5308,7 +5529,7 @@ function CxCTab({ divisas, canWrite = true, onAddAbono, onDeleteAbono, onPatch }
             const saldada = c.pendiente <= 0.01;
             return (
               <div key={c.key} style={{ ...rowCard, flexDirection: "column", alignItems: "stretch", padding: 0, overflow: "hidden" }}>
-                <div onClick={() => setOpenKey(open ? null : c.key)} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10, padding: "13px 15px", cursor: "pointer" }}>
+                <div onClick={() => abrirCliente(c.key)} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10, padding: "13px 15px", cursor: "pointer" }}>
                   <div style={{ minWidth: 0, flex: 1 }}>
                     <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", marginBottom: 3 }}>
                       <span style={{ fontSize: 15, fontWeight: 700, color: T.text }}>{c.nombre}</span>
@@ -5354,8 +5575,22 @@ function CxCTab({ divisas, canWrite = true, onAddAbono, onDeleteAbono, onPatch }
                           <div key={a.id} style={{ background: T.bg2, border: `1px solid ${T.lineSoft}`, borderRadius: 10, padding: "9px 11px" }}>
                             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}>
                               <div style={{ minWidth: 0 }}>
-                                <div style={{ fontSize: 13, fontWeight: 600, color: T.green, fontFamily: MONO }}>+{fmtUsd(a.usd)}</div>
+                                <div style={{ fontSize: 13, fontWeight: 600, color: T.green, fontFamily: MONO }}>
+                                  +{fmtUsd(a.usd)}
+                                  {metodoAbono(a.metodo) && (
+                                    <span style={{ fontSize: 10.5, fontWeight: 700, color: T.blue, marginLeft: 6, letterSpacing: 0.3 }}>
+                                      {metodoAbono(a.metodo).label}
+                                    </span>
+                                  )}
+                                </div>
                                 <div style={{ fontSize: 11.5, color: T.mut, fontFamily: MONO }}>{fmtDate(a.date)}{a.note ? ` · ${a.note}` : ""}</div>
+                                {(a.accountId || a.project) && (
+                                  <div style={{ fontSize: 11, color: T.mut2, marginTop: 2 }}>
+                                    {a.accountId ? nombreCuenta(a.accountId) : ""}
+                                    {a.accountId && a.project ? " · " : ""}
+                                    {a.project || ""}
+                                  </div>
+                                )}
                               </div>
                               {canWrite && (
                                 <button onClick={() => onDeleteAbono(a.id)} style={{ ...btnGhost, color: T.mut2, fontSize: 17, lineHeight: 1 }} aria-label="Eliminar abono">×</button>
@@ -5390,14 +5625,77 @@ function CxCTab({ divisas, canWrite = true, onAddAbono, onDeleteAbono, onPatch }
                             <input type="date" style={{ ...inputStyle, fontFamily: MONO }} value={fecha} onChange={(e) => setFecha(e.target.value)} />
                           </div>
                         </div>
+                        {/* Método de cobro: solo dos, y cada uno manda a su cuenta en USD */}
+                        <label style={labelStyle}>Método de pago</label>
+                        <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
+                          {ABONO_METODOS.map((m) => {
+                            const activo = metodo === m.id;
+                            const cta = cuentas[m.id];
+                            return (
+                              <button
+                                key={m.id}
+                                onClick={() => setMetodo(activo ? "" : m.id)}
+                                style={{
+                                  flex: 1, borderRadius: 11, padding: "11px 8px", fontSize: 13, fontWeight: 700, fontFamily: FONT, cursor: "pointer",
+                                  background: activo ? T.green : "transparent",
+                                  color: activo ? "#0A0F1E" : T.text,
+                                  border: `1px solid ${activo ? T.green : T.line}`,
+                                }}
+                              >
+                                {m.label}
+                                <span style={{ display: "block", fontSize: 10.5, fontWeight: 500, marginTop: 3, color: activo ? "#0A0F1E" : T.mut2 }}>
+                                  {cta ? cta.name : "se crea: " + m.nombre}
+                                </span>
+                              </button>
+                            );
+                          })}
+                        </div>
+
+                        {/* Proyecto: obligatorio, para que el ingreso quede imputado */}
+                        <label style={labelStyle}>Proyecto</label>
+                        <select
+                          style={{ ...inputStyle, appearance: "none" }}
+                          value={proyecto}
+                          onChange={(e) => setProyecto(e.target.value)}
+                        >
+                          <option value="">Elegí un proyecto…</option>
+                          {projects.map((p) => (<option key={p} value={p}>{p}</option>))}
+                          <option value="__new">+ Proyecto nuevo…</option>
+                        </select>
+                        {proyecto === "__new" && (
+                          <input style={inputStyle} value={nuevoProy} onChange={(e) => setNuevoProy(e.target.value)} placeholder="Nombre del proyecto nuevo" />
+                        )}
+
+                        {metodo === "transferencia" && (
+                          <>
+                            <label style={labelStyle}>Referencia bancaria (recomendada)</label>
+                            <input
+                              style={{ ...inputStyle, fontFamily: MONO }}
+                              value={refAbono}
+                              onChange={(e) => setRefAbono(e.target.value)}
+                              inputMode="numeric"
+                              placeholder="N° de la transferencia"
+                              autoCapitalize="none"
+                            />
+                            <div style={{ fontSize: 11.5, color: T.mut2, lineHeight: 1.5, margin: "-4px 0 8px" }}>
+                              Con la referencia, al importar después el estado de cuenta de esa cuenta USD
+                              el movimiento no entra dos veces.
+                            </div>
+                          </>
+                        )}
+
                         <label style={labelStyle}>Nota (opcional)</label>
                         <input style={inputStyle} value={nota} onChange={(e) => setNota(e.target.value)} placeholder="Ej. transferencia parcial" />
+                        <div style={{ fontSize: 11.5, color: T.mut2, lineHeight: 1.5, margin: "2px 0 8px" }}>
+                          El abono entra como ingreso en la cuenta USD del método elegido y queda imputado
+                          al proyecto. Si borrás el abono, ese movimiento se borra con él.
+                        </div>
                         <button
                           onClick={() => registrarAbono(c)}
-                          disabled={!(numVE(monto) > 0)}
-                          style={{ width: "100%", marginTop: 10, background: numVE(monto) > 0 ? T.green : T.card, color: numVE(monto) > 0 ? "#0A0F1E" : T.mut2, border: "none", borderRadius: 11, padding: "12px", fontSize: 14.5, fontWeight: 650, fontFamily: FONT, cursor: numVE(monto) > 0 ? "pointer" : "default" }}
+                          disabled={!abonoValido}
+                          style={{ width: "100%", marginTop: 4, background: abonoValido ? T.green : T.card, color: abonoValido ? "#0A0F1E" : T.mut2, border: "none", borderRadius: 11, padding: "12px", fontSize: 14.5, fontWeight: 650, fontFamily: FONT, cursor: abonoValido ? "pointer" : "default" }}
                         >
-                          Registrar abono
+                          {!(numVE(monto) > 0) ? "Poné el monto" : !metodoAbono(metodo) ? "Elegí el método" : !proy ? "Elegí el proyecto" : "Registrar abono"}
                         </button>
                       </div>
                     )}
@@ -6306,7 +6604,10 @@ function diasEntre(a, b) {
 /* Un movimiento que ya es una operación de divisas no se toca: ahí la
    referencia se repite por otro motivo y sí es un movimiento real. */
 function trasladoElegible(t) {
-  return !!t && !t.noTraslado && !t.divisaId && !t.divisaKind;
+  // El ingreso de un abono lleva la referencia del banco solo para que el
+  // importador no lo duplique. No es plata propia mudándose de cuenta: es un
+  // cobro real, así que queda fuera del emparejamiento de traslados.
+  return !!t && !t.noTraslado && !t.divisaId && !t.divisaKind && !t.abonoId;
 }
 
 /* Devuelve los grupos de movimientos que forman un traslado.
