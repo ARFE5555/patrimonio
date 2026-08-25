@@ -6831,11 +6831,11 @@ function ProjectsTab({ txns, projectsMeta, cur, onAdd, onEdit, canEdit = true, p
      Se usa el pendiente: recibir suma, prestar resta, y al devolverse vuelve a cero. */
   const efectoPrestamos = (name) => {
     const out = {};
-    const ens = (c) => { if (!out[c]) out[c] = { recibido: 0, prestado: 0 }; return out[c]; };
+    const ens = (c) => { if (!out[c]) out[c] = { recibido: 0, prestado: 0, deQuien: {}, aQuien: {} }; return out[c]; };
     for (const p of activos) {
       const pend = pendienteDe(p), c = p.currency || "usd";
-      if (p.destino === name) ens(c).recibido += pend;
-      if (p.origen === name) ens(c).prestado += pend;
+      if (p.destino === name) { const e = ens(c); e.recibido += pend; e.deQuien[p.origen] = (e.deQuien[p.origen] || 0) + pend; }
+      if (p.origen === name) { const e = ens(c); e.prestado += pend; e.aQuien[p.destino] = (e.aQuien[p.destino] || 0) + pend; }
     }
     return out;
   };
@@ -6847,10 +6847,13 @@ function ProjectsTab({ txns, projectsMeta, cur, onAdd, onEdit, canEdit = true, p
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}>
           <div style={{ minWidth: 0 }}>
             <div style={{ fontSize: 13.5, fontWeight: 650, color: T.text }}>
-              {metaFor(p.destino).emoji || "📁"} {p.destino} <span style={{ color: T.mut, fontWeight: 400 }}>debe a</span> {metaFor(p.origen).emoji || "📁"} {p.origen}
+              {metaFor(p.origen).emoji || "📁"} {p.origen} <span style={{ color: T.gold, fontWeight: 400 }}>➡️</span> {metaFor(p.destino).emoji || "📁"} {p.destino}
             </div>
             <div style={{ fontSize: 11.5, color: T.mut, marginTop: 2 }}>
-              {p.fecha} · préstamo de <span style={{ fontFamily: MONO }}>{money(p.monto, c)}</span>{p.nota ? " · " + p.nota : ""}
+              {p.fecha} · transferencia de <span style={{ fontFamily: MONO }}>{money(p.monto, c)}</span>{p.nota ? " · " + p.nota : ""}
+            </div>
+            <div style={{ fontSize: 11, color: T.mut2, marginTop: 2 }}>
+              {p.destino} le debe a {p.origen}
             </div>
             {(p.devoluciones || []).length > 0 && (
               <div style={{ fontSize: 11, color: T.mut2, marginTop: 2 }}>
@@ -6884,7 +6887,7 @@ function ProjectsTab({ txns, projectsMeta, cur, onAdd, onEdit, canEdit = true, p
     const m = {};
     const meta = metaFor(name);
     const opening = meta.opening || {};
-    const ens = (c) => { if (!m[c]) m[c] = { inc: 0, exp: 0, com: 0, open: 0, preIn: 0, preOut: 0 }; return m[c]; };
+    const ens = (c) => { if (!m[c]) m[c] = { inc: 0, exp: 0, com: 0, open: 0, preIn: 0, preOut: 0, deQuien: {}, aQuien: {} }; return m[c]; };
     Object.entries(opening).forEach(([c, v]) => {
       if (v != null && !isNaN(v)) ens(c).open = v;
     });
@@ -6901,6 +6904,8 @@ function ProjectsTab({ txns, projectsMeta, cur, onAdd, onEdit, canEdit = true, p
       const e = ens(c);
       e.preIn = v.recibido;
       e.preOut = v.prestado;
+      e.deQuien = v.deQuien;
+      e.aQuien = v.aQuien;
     });
     return Object.entries(m);
   };
@@ -6967,7 +6972,8 @@ function ProjectsTab({ txns, projectsMeta, cur, onAdd, onEdit, canEdit = true, p
                     rows.map(([c, v]) => {
                       const preIn = v.preIn || 0, preOut = v.preOut || 0;
                       const neto = preIn - preOut;
-                      const bal = (v.open || 0) + v.inc - v.exp + neto;
+                      const propio = (v.open || 0) + v.inc - v.exp;
+                      const bal = propio + neto;
                       return (
                       <div key={c} style={{ borderTop: `1px solid ${T.lineSoft}`, paddingTop: 10, marginTop: 10 }}>
                         <div style={{ fontSize: 11.5, color: T.mut2, fontWeight: 600, marginBottom: 6 }}>{c.toUpperCase()}</div>
@@ -6975,18 +6981,6 @@ function ProjectsTab({ txns, projectsMeta, cur, onAdd, onEdit, canEdit = true, p
                           <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11.5, color: T.mut, marginBottom: 8 }}>
                             <span>Saldo inicial</span>
                             <span style={{ fontFamily: MONO, color: T.text }}>{money(v.open || 0, c)}</span>
-                          </div>
-                        )}
-                        {preIn > 0.005 && (
-                          <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11.5, color: T.mut, marginBottom: 6 }}>
-                            <span>🤝 Préstamo recibido <span style={{ color: T.mut2 }}>(interno)</span></span>
-                            <span style={{ fontFamily: MONO, color: T.green }}>+{money(preIn, c)}</span>
-                          </div>
-                        )}
-                        {preOut > 0.005 && (
-                          <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11.5, color: T.mut, marginBottom: 6 }}>
-                            <span>🤝 Prestado a otro proyecto <span style={{ color: T.mut2 }}>(interno)</span></span>
-                            <span style={{ fontFamily: MONO, color: T.red }}>−{money(preOut, c)}</span>
                           </div>
                         )}
                         <div style={{ display: "flex", gap: 10 }}>
@@ -6999,15 +6993,33 @@ function ProjectsTab({ txns, projectsMeta, cur, onAdd, onEdit, canEdit = true, p
                             <div style={{ fontFamily: MONO, fontSize: 13.5, fontWeight: 600, color: T.red }}>{money(v.exp, c)}</div>
                           </div>
                           <div style={{ flex: 1 }}>
-                            <div style={{ fontSize: 11, color: T.mut }}>Balance</div>
-                            <div style={{ fontFamily: MONO, fontSize: 13.5, fontWeight: 700, color: bal >= 0 ? T.text : T.red }}>
-                              {money(bal, c)}
+                            <div style={{ fontSize: 11, color: T.mut }}>{Math.abs(neto) > 0.005 ? "Balance propio" : "Balance"}</div>
+                            <div style={{ fontFamily: MONO, fontSize: 13.5, fontWeight: 700, color: propio >= 0 ? T.text : T.red }}>
+                              {money(propio, c)}
                             </div>
                           </div>
                         </div>
                         {Math.abs(neto) > 0.005 && (
-                          <div style={{ fontSize: 10.5, color: T.mut2, marginTop: 6 }}>
-                            Balance operativo (sin préstamos): <span style={{ fontFamily: MONO }}>{money((v.open || 0) + v.inc - v.exp, c)}</span>
+                          <div style={{ marginTop: 10, padding: "9px 10px", borderRadius: 11, background: T.gold + "12", border: `1px solid ${T.gold}33` }}>
+                            {Object.entries(v.deQuien || {}).map(([o, amt]) => (
+                              <div key={"in" + o} style={{ display: "flex", justifyContent: "space-between", fontSize: 11.5, color: T.mut, marginBottom: 4 }}>
+                                <span>⬅️ Recibido de {metaFor(o).emoji || "📁"} {o}</span>
+                                <span style={{ fontFamily: MONO, color: T.green, fontWeight: 650 }}>+{money(amt, c)}</span>
+                              </div>
+                            ))}
+                            {Object.entries(v.aQuien || {}).map(([d, amt]) => (
+                              <div key={"out" + d} style={{ display: "flex", justifyContent: "space-between", fontSize: 11.5, color: T.mut, marginBottom: 4 }}>
+                                <span>➡️ Enviado a {metaFor(d).emoji || "📁"} {d}</span>
+                                <span style={{ fontFamily: MONO, color: T.red, fontWeight: 650 }}>−{money(amt, c)}</span>
+                              </div>
+                            ))}
+                            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", borderTop: `1px solid ${T.gold}33`, paddingTop: 6, marginTop: 4 }}>
+                              <span style={{ fontSize: 12, fontWeight: 700, color: T.text }}>Balance disponible</span>
+                              <span style={{ fontFamily: MONO, fontSize: 14.5, fontWeight: 800, color: bal >= 0 ? T.gold : T.red }}>{money(bal, c)}</span>
+                            </div>
+                            <div style={{ fontSize: 10, color: T.mut2, marginTop: 4 }}>
+                              Transferencia interna entre proyectos · no afecta cuentas ni movimientos
+                            </div>
                           </div>
                         )}
                         {v.com > 0 && (
