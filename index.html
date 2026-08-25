@@ -33,7 +33,7 @@ const { useState, useEffect, useRef, useMemo } = React;
 
 /* Versión de compilación. Sirve para confirmar de un vistazo qué build está
    corriendo en pantalla (útil para detectar caché vieja de la PWA). */
-const BUILD = "v5.3 · TRANSFERENCIA ENTRE CUENTAS · barrido de todo el archivo · 2026-08-24";
+const BUILD = "v5.4 · Tasas diarias USDT + BCV (usdt.com.ve) · 2026-08-25";
 try { console.log("[Patrimonio] build:", BUILD); } catch (e) {}
 
 /* ─────────────────────────────  Tokens de diseño  ───────────────────────────── */
@@ -565,6 +565,121 @@ function convertAmt(amount, from, to, rate) {
   return null; // par no soportado
 }
 
+/* ─────────────────  Tasas diarias: usdt.com.ve  ─────────────────
+   Fuente pública (CC-BY-4.0, atribución a usdt.com.ve). Se guardan DOS tasas
+   por día: la de USDT P2P —la que manda para los cálculos, porque es a la que
+   se opera— y la del BCV, al lado, como referencia oficial.
+
+   Las tasas viven en settings.rateHistory, la misma lista de siempre: cada
+   entrada conserva `rate` (la que usa toda la app) y suma `usdt`, `bcv` y
+   `src`. Las cargadas a mano no llevan `src`, y por eso nunca se pisan. */
+const TASAS_API = "https://www.usdt.com.ve/api/v1/rates/current";
+const TASAS_CSV = "https://www.usdt.com.ve/data/usdt-ves-historical.csv";
+const TASAS_DESDE = "2026-07-01";     // desde cuándo se quiere el histórico
+const TASAS_TZ_H = -4;                // Venezuela, para pasar el UTC del dataset al día local
+
+/* Día local venezolano de una marca de tiempo UTC. Sin esto, lo capturado
+   después de las 20:00 quedaría contado en el día siguiente. */
+function fechaVE(iso) {
+  const t = Date.parse(iso);
+  if (isNaN(t)) return "";
+  return new Date(t + TASAS_TZ_H * 3600000).toISOString().slice(0, 10);
+}
+
+/* Arma una entrada de historial a partir de las tasas de un día. */
+function filaTasa(date, binance, bybit, bcv) {
+  const usdt = binance > 0 ? binance : bybit > 0 ? bybit : null;
+  if (!usdt && !(bcv > 0)) return null;
+  return {
+    date,
+    rate: usdt || bcv,                                   // la que usa toda la app
+    usdt: usdt || undefined,
+    bcv: bcv > 0 ? bcv : undefined,
+    src: usdt ? (binance > 0 ? "binance" : "bybit") : "bcv",
+  };
+}
+
+/* Del dataset histórico (una fila cada 5 minutos) saca UNA por día: el último
+   snapshot del día de cada fuente, que es el cierre de esa jornada. */
+function parseTasasHistoricas(texto, desde) {
+  const porDia = new Map();
+  const lineas = String(texto || "").split(/\r?\n/);
+  for (let i = 0; i < lineas.length; i++) {
+    const linea = lineas[i];
+    if (!linea || linea.charAt(0) === "#") continue;
+    const p = linea.split(",");
+    if (p.length < 3) continue;
+    const ts = Date.parse(p[0]);
+    if (isNaN(ts)) continue;                             // cabecera y basura
+    const fecha = fechaVE(p[0]);
+    if (!fecha || (desde && fecha < desde)) continue;
+    const fuente = String(p[1] || "").trim().toLowerCase();
+    const valor = parseFloat(p[2]);
+    if (!(valor > 0)) continue;
+    let d = porDia.get(fecha);
+    if (!d) { d = { date: fecha, ts: {} }; porDia.set(fecha, d); }
+    // Se queda con el más reciente del día por si el archivo no viniera ordenado
+    if (!(d.ts[fuente] > ts)) { d.ts[fuente] = ts; d[fuente] = valor; }
+  }
+  const out = [];
+  porDia.forEach((d) => {
+    const fila = filaTasa(d.date, d.binance, d.bybit, d.bcv);
+    if (fila) out.push(fila);
+  });
+  return out.sort((a, b) => (a.date < b.date ? -1 : 1));
+}
+
+/* Mezcla las tasas bajadas con el historial existente. Una tasa cargada a mano
+   (sin `src`) manda siempre: se respeta y no se toca. */
+function mezclarTasas(hist, nuevas) {
+  const m = new Map();
+  (hist || []).forEach((r) => { if (r && r.date) m.set(r.date, r); });
+  let nuevos = 0, actualizados = 0, respetados = 0;
+  (nuevas || []).forEach((r) => {
+    if (!r || !r.date) return;
+    const prev = m.get(r.date);
+    if (prev && !prev.src) { respetados++; return; }     // puesta a mano
+    if (!prev) nuevos++;
+    else if (prev.rate === r.rate && prev.bcv === r.bcv && prev.usdt === r.usdt) return;
+    else actualizados++;
+    m.set(r.date, { ...(prev || {}), ...r });
+  });
+  const lista = Array.from(m.values()).sort((a, b) => (a.date < b.date ? -1 : 1));
+  return { hist: lista, nuevos, actualizados, respetados };
+}
+
+/* Descargas. Van sueltas para poder llamarlas desde el arranque automático y
+   desde los botones de Ajustes. */
+async function bajarTasasHistoricas(desde) {
+  const r = await fetch(TASAS_CSV, { cache: "no-store" });
+  if (!r.ok) throw new Error("El servidor respondió " + r.status + " al pedir el histórico.");
+  const filas = parseTasasHistoricas(await r.text(), desde || TASAS_DESDE);
+  if (!filas.length) throw new Error("El histórico no trajo ninguna fecha desde " + (desde || TASAS_DESDE) + ".");
+  return filas;
+}
+
+async function bajarTasaActual() {
+  const r = await fetch(TASAS_API, { cache: "no-store" });
+  if (!r.ok) throw new Error("El servidor respondió " + r.status + " al pedir la tasa de hoy.");
+  const j = await r.json();
+  const d = (j && j.data) || {};
+  const fila = filaTasa(
+    fechaVE(d.captured_at) || todayISO(),
+    d.binance && d.binance.buy_rate,
+    d.bybit && d.bybit.buy_rate,
+    d.bcv && d.bcv.rate
+  );
+  if (!fila) throw new Error("La API no devolvió ninguna tasa.");
+  return fila;
+}
+
+/* Última fila del historial que tenga tasa de la fuente pedida. */
+function ultimaTasa(settings, campo) {
+  const hist = ((settings && settings.rateHistory) || []).filter((r) => r && r[campo] > 0);
+  if (!hist.length) return null;
+  return hist.slice().sort((a, b) => (a.date < b.date ? 1 : -1))[0];
+}
+
 /* ── Lectura de Google Sheets (CSV publicado) ── */
 function parseCSV(text) {
   const rows = [];
@@ -1013,6 +1128,78 @@ function AppMain({ session, role, signOut }) {
     if (!auto.tocados) return;
     setTxns(auto.lista);
   }, [loaded, canWriteData, txns, accounts]);
+
+  /* ── Tasas del día (usdt.com.ve) ──
+     Al abrir: si todavía no está el histórico desde TASAS_DESDE, se baja una
+     sola vez (el dataset pesa varios MB, por eso queda marcado en settings) y
+     después se refresca la tasa de hoy. Sin internet no pasa nada: se sigue
+     trabajando con lo que ya está guardado. */
+  const tasasIniciadas = useRef(false);
+  const [tasasMsg, setTasasMsg] = useState("");
+  const [tasasBusy, setTasasBusy] = useState(false);
+
+  async function cargarHistoricoTasas(desde) {
+    setTasasBusy(true); setTasasMsg("Bajando el histórico de tasas…");
+    try {
+      const filas = await bajarTasasHistoricas(desde || TASAS_DESDE);
+      // El updater es funcional para no pisar cambios que hayan entrado mientras
+      // se bajaba el archivo; el conteo del mensaje se calcula aparte.
+      setSettings((s) => ({
+        ...s,
+        rateHistory: mezclarTasas(s.rateHistory, filas).hist,
+        tasasHistDesde: desde || TASAS_DESDE,
+        tasasAl: new Date().toISOString(),
+      }));
+      const info = mezclarTasas(settings.rateHistory, filas);
+      setTasasMsg(
+        `Histórico cargado desde ${fmtDate(desde || TASAS_DESDE)}: ${filas.length} día(s)` +
+        (info.respetados ? ` · ${info.respetados} tasa(s) tuyas respetadas` : "")
+      );
+      return true;
+    } catch (e) {
+      setTasasMsg("No se pudo bajar el histórico: " + ((e && e.message) || "error") + " Si el navegador lo bloquea, descargá el CSV y cargalo con el botón de abajo.");
+      return false;
+    } finally { setTasasBusy(false); }
+  }
+
+  async function actualizarTasaHoy(silencioso) {
+    if (!silencioso) { setTasasBusy(true); setTasasMsg("Consultando la tasa de hoy…"); }
+    try {
+      const fila = await bajarTasaActual();
+      setSettings((s) => ({ ...s, rateHistory: mezclarTasas(s.rateHistory, [fila]).hist, tasasAl: new Date().toISOString() }));
+      if (!silencioso) {
+        setTasasMsg(`Tasa del ${fmtDate(fila.date)} · USDT ${fila.usdt != null ? fila.usdt : "—"} · BCV ${fila.bcv != null ? fila.bcv : "—"}`);
+      }
+      return true;
+    } catch (e) {
+      if (!silencioso) setTasasMsg("No se pudo consultar la tasa: " + ((e && e.message) || "error"));
+      return false;
+    } finally { if (!silencioso) setTasasBusy(false); }
+  }
+
+  /* Carga a mano del CSV, para cuando el navegador bloquea la descarga directa */
+  async function cargarCsvTasas(file) {
+    if (!file) return;
+    setTasasBusy(true); setTasasMsg("Leyendo el archivo…");
+    try {
+      const filas = parseTasasHistoricas(await file.text(), TASAS_DESDE);
+      if (!filas.length) throw new Error("El archivo no trae fechas desde " + TASAS_DESDE + ".");
+      setSettings((s) => ({ ...s, rateHistory: mezclarTasas(s.rateHistory, filas).hist, tasasHistDesde: TASAS_DESDE, tasasAl: new Date().toISOString() }));
+      setTasasMsg(`Cargadas ${filas.length} fecha(s) desde el archivo.`);
+    } catch (e) {
+      setTasasMsg("No se pudo leer el archivo: " + ((e && e.message) || "error"));
+    } finally { setTasasBusy(false); }
+  }
+
+  useEffect(() => {
+    if (tasasIniciadas.current || !loaded || !canWriteData) return;
+    tasasIniciadas.current = true;
+    (async () => {
+      const falta = !settings.tasasHistDesde || settings.tasasHistDesde > TASAS_DESDE;
+      if (falta) await cargarHistoricoTasas(TASAS_DESDE);
+      await actualizarTasaHoy(true);
+    })();
+  }, [loaded, canWriteData]);
 
   const didAutoSync = useRef(false);
   useEffect(() => {
@@ -1777,6 +1964,11 @@ function AppMain({ session, role, signOut }) {
             projectsMeta={projectsMeta}
             onSync={syncSheet}
             onRestore={restoreBackup}
+            tasasMsg={tasasMsg}
+            tasasBusy={tasasBusy}
+            onCargarHistTasas={cargarHistoricoTasas}
+            onActualizarTasa={actualizarTasaHoy}
+            onCsvTasas={cargarCsvTasas}
             session={session}
             role={role}
             signOut={signOut}
@@ -2247,16 +2439,25 @@ function AccountsTab({ accounts, prices, cur, settings, vesRate, onSetRate, onAd
     .reduce((s, a) => s + (a.balance || 0), 0);
   const vesInUsd = vesRate ? vesTotal / vesRate : null;
   const hist = (settings && settings.rateHistory) || [];
+  const ultimaUsdt = ultimaTasa(settings, "usdt");
+  const ultimaBcv = ultimaTasa(settings, "bcv");
   return (
     <div style={{ paddingTop: 8 }}>
-      {/* Tasa de cambio (manual, para cuentas VES) */}
+      {/* Tasa de cambio (automática de usdt.com.ve, o manual) */}
       <div style={{ background: `linear-gradient(160deg, ${T.card2}, ${T.card})`, border: `1px solid ${T.line}`, borderRadius: 18, padding: "18px", marginBottom: 20 }}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
           <div style={{ fontSize: 13, color: T.mut, fontWeight: 500 }}>Tasa de cambio (VES/USD)</div>
           {hist.length > 0 && <div style={{ fontSize: 11.5, color: T.mut2 }}>{hist.length} registro(s)</div>}
         </div>
-        <div style={{ fontFamily: MONO, fontVariantNumeric: "tabular-nums", fontSize: 30, fontWeight: 600, letterSpacing: -0.5, color: T.text, margin: "4px 0 12px" }}>
+        <div style={{ fontFamily: MONO, fontVariantNumeric: "tabular-nums", fontSize: 30, fontWeight: 600, letterSpacing: -0.5, color: T.text, margin: "4px 0 2px" }}>
           {vesRate ? vesRate.toLocaleString("es-VE", { maximumFractionDigits: 2 }) : "—"}
+        </div>
+        {/* USDT es la que manda; el BCV va al lado como referencia oficial */}
+        <div style={{ fontSize: 12, color: T.mut, marginBottom: 12, fontFamily: MONO }}>
+          {ultimaUsdt ? `USDT ${ultimaUsdt.usdt.toLocaleString("es-VE", { maximumFractionDigits: 2 })}` : ""}
+          {ultimaUsdt && ultimaBcv ? "  ·  " : ""}
+          {ultimaBcv ? `BCV ${ultimaBcv.bcv.toLocaleString("es-VE", { maximumFractionDigits: 2 })}` : ""}
+          {ultimaUsdt || ultimaBcv ? ` · ${fmtDate((ultimaUsdt || ultimaBcv).date)}` : ""}
         </div>
         <div style={{ display: "flex", gap: 8, alignItems: "flex-end" }}>
           <div style={{ flex: 1.3 }}>
@@ -4474,9 +4675,14 @@ function CoinBadge({ sym }) {
 }
 
 /* ─────────────────────────────  Tab: Ajustes  ───────────────────────────── */
-function AjustesTab({ settings, setSettings, accounts, txns, prices, cur, divisas, prestamos, projectsMeta, onSync, onRestore, session, role, signOut, canEditAll }) {
+function AjustesTab({ settings, setSettings, accounts, txns, prices, cur, divisas, prestamos, projectsMeta, onSync, onRestore, tasasMsg = "", tasasBusy = false, onCargarHistTasas, onActualizarTasa, onCsvTasas, session, role, signOut, canEditAll }) {
   const theme = settings.theme || "dark";
   const autoRate = vesRateOf(settings, divisas);
+  // Tasas del día: la última de cada fuente puede venir de días distintos
+  const ultUsdt = ultimaTasa(settings, "usdt");
+  const ultBcv = ultimaTasa(settings, "bcv");
+  const diasTasas = ((settings && settings.rateHistory) || []).length;
+  const brechaPct = ultUsdt && ultBcv && ultBcv.bcv > 0 ? ((ultUsdt.usdt - ultBcv.bcv) / ultBcv.bcv) * 100 : null;
   const [binPctTxt, setBinPctTxt] = useState(settings.binancePct != null ? String(settings.binancePct).replace(".", ",") : "");
   const [syncing, setSyncing] = useState(false);
   const [syncMsg, setSyncMsg] = useState("");
@@ -4746,9 +4952,12 @@ function AjustesTab({ settings, setSettings, accounts, txns, prices, cur, divisa
 
       // Hoja Tasas: historial diario de la tasa VES/USD
       const histRate = (settings.rateHistory || []).slice().sort((a, b) => (a.date < b.date ? -1 : 1));
-      const tasasAoa = [["Fecha", "Tasa VES/USD"], ...histRate.map((r) => [r.date, round2(r.rate)])];
+      const tasasAoa = [
+        ["Fecha", "Tasa usada (VES/USD)", "USDT", "BCV", "Fuente"],
+        ...histRate.map((r) => [r.date, round2(r.rate), r.usdt != null ? round2(r.usdt) : "", r.bcv != null ? round2(r.bcv) : "", r.src || "manual"]),
+      ];
       const wsT = XLSX.utils.aoa_to_sheet(tasasAoa);
-      wsT["!cols"] = [{ wch: 14 }, { wch: 16 }];
+      wsT["!cols"] = [{ wch: 14 }, { wch: 20 }, { wch: 12 }, { wch: 12 }, { wch: 12 }];
       XLSX.utils.book_append_sheet(wb, wsT, "Tasas");
 
       // Hoja "Respaldo": datos crudos completos (todas las fechas), restaurables desde Ajustes.
@@ -4822,6 +5031,66 @@ function AjustesTab({ settings, setSettings, accounts, txns, prices, cur, divisa
       </div>
       <div style={{ fontSize: 12.5, color: T.mut, marginBottom: 26, marginLeft: 2, lineHeight: 1.5 }}>
         "Automática" usa escritorio en pantallas anchas y móvil en el teléfono. En escritorio, el menú pasa a la barra lateral.
+      </div>
+
+      {/* Tasas diarias automáticas */}
+      <div style={{ ...sectionTitle, marginBottom: 10 }}>Tasas diarias (usdt.com.ve)</div>
+      <div style={{ background: T.card, border: `1px solid ${T.line}`, borderRadius: 16, padding: "15px 16px", marginBottom: 12 }}>
+        <div style={{ display: "flex", gap: 12 }}>
+          <div style={{ flex: 1 }}>
+            <div style={{ fontSize: 11.5, color: T.mut, marginBottom: 3 }}>USDT · principal</div>
+            <div style={{ fontFamily: MONO, fontVariantNumeric: "tabular-nums", fontSize: 22, fontWeight: 600, color: T.green }}>
+              {ultUsdt ? ultUsdt.usdt.toLocaleString("es-VE", { maximumFractionDigits: 2 }) : "—"}
+            </div>
+            <div style={{ fontSize: 11, color: T.mut2, marginTop: 2 }}>{ultUsdt ? fmtDate(ultUsdt.date) : "sin datos"}</div>
+          </div>
+          <div style={{ flex: 1 }}>
+            <div style={{ fontSize: 11.5, color: T.mut, marginBottom: 3 }}>BCV · referencia</div>
+            <div style={{ fontFamily: MONO, fontVariantNumeric: "tabular-nums", fontSize: 22, fontWeight: 600, color: T.blue }}>
+              {ultBcv ? ultBcv.bcv.toLocaleString("es-VE", { maximumFractionDigits: 2 }) : "—"}
+            </div>
+            <div style={{ fontSize: 11, color: T.mut2, marginTop: 2 }}>{ultBcv ? fmtDate(ultBcv.date) : "sin datos"}</div>
+          </div>
+        </div>
+        {brechaPct != null && (
+          <div style={{ fontSize: 12, color: T.gold, marginTop: 10 }}>
+            Brecha USDT vs BCV: {brechaPct.toLocaleString("es-VE", { maximumFractionDigits: 1 })}%
+          </div>
+        )}
+        <div style={{ fontSize: 12, color: T.mut, marginTop: 10, lineHeight: 1.5 }}>
+          {diasTasas} día(s) guardados{settings.tasasHistDesde ? ` desde el ${fmtDate(settings.tasasHistDesde)}` : ""}.
+          La app baja el histórico una vez y después refresca la tasa del día sola al abrir.
+        </div>
+        <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
+          <button
+            onClick={() => onActualizarTasa && onActualizarTasa(false)}
+            disabled={tasasBusy || !canEditAll}
+            style={{ flex: 1, background: "transparent", color: T.text, border: `1px solid ${T.line}`, borderRadius: 11, padding: "11px", fontSize: 13.5, fontWeight: 600, fontFamily: FONT, cursor: tasasBusy ? "default" : "pointer" }}
+          >
+            {tasasBusy ? "…" : "Actualizar hoy"}
+          </button>
+          <button
+            onClick={() => onCargarHistTasas && onCargarHistTasas(TASAS_DESDE)}
+            disabled={tasasBusy || !canEditAll}
+            style={{ flex: 1.4, background: "transparent", color: T.gold, border: `1px solid ${T.gold}`, borderRadius: 11, padding: "11px", fontSize: 13.5, fontWeight: 600, fontFamily: FONT, cursor: tasasBusy ? "default" : "pointer" }}
+          >
+            {tasasBusy ? "…" : `Recargar desde el ${fmtDate(TASAS_DESDE)}`}
+          </button>
+        </div>
+        <label style={{ display: canEditAll ? "block" : "none", textAlign: "center", color: T.mut, fontSize: 12.5, fontWeight: 600, fontFamily: FONT, cursor: "pointer", marginTop: 10 }}>
+          …o cargar el CSV del histórico a mano
+          <input type="file" accept=".csv,text/csv" style={{ display: "none" }} onChange={(e) => { const f = e.target.files && e.target.files[0]; e.target.value = ""; onCsvTasas && onCsvTasas(f); }} />
+        </label>
+        {tasasMsg && <div style={{ fontSize: 12.5, color: T.mut, marginTop: 10, lineHeight: 1.5 }}>{tasasMsg}</div>}
+        <div style={{ fontSize: 11, color: T.mut2, marginTop: 10, lineHeight: 1.5 }}>
+          Datos de <b>usdt.com.ve</b> (CC-BY-4.0). USDT es la tasa de las operaciones P2P
+          (Binance, y Bybit si ese día falta Binance); es la que usa la app para convertir.
+          El BCV se guarda al lado, solo para comparar.
+        </div>
+      </div>
+      <div style={{ fontSize: 12.5, color: T.mut, marginBottom: 26, marginLeft: 2, lineHeight: 1.5 }}>
+        Las tasas que cargues a mano abajo mandan sobre las automáticas: si un día ya tiene
+        tasa tuya, la descarga no la pisa.
       </div>
 
       {/* Tasa VES */}
@@ -6883,7 +7152,7 @@ function ProjectsTab({ txns, projectsMeta, cur, onAdd, onEdit, canEdit = true, p
     );
   };
 
-  const summary = (name) => {
+  const calcSummary = (name) => {
     const m = {};
     const meta = metaFor(name);
     const opening = meta.opening || {};
@@ -6909,6 +7178,38 @@ function ProjectsTab({ txns, projectsMeta, cur, onAdd, onEdit, canEdit = true, p
     });
     return Object.entries(m);
   };
+  /* Se calcula una sola vez por render para todos los proyectos */
+  const resumenAll = useMemo(() => {
+    const o = {};
+    for (const n of names) o[n] = calcSummary(n);
+    return o;
+  }, [txns, projectsMeta, prestamos, cur, names.join("|")]);
+  const summary = (name) => resumenAll[name] || calcSummary(name);
+
+  /* ── Cuenta interna: estado real del proyecto ──
+     disponible = saldo inicial + ingresos − egresos + recibido − prestado.
+     Un proyecto NO puede quedar en negativo: si lo está, es un descubierto
+     que debe financiarse con un préstamo de otro proyecto. */
+  const dispRow = (v) => (v.open || 0) + v.inc - v.exp + (v.preIn || 0) - (v.preOut || 0);
+  const dispDe = (name, c) => {
+    const row = summary(name).find(([k]) => k === c);
+    return row ? dispRow(row[1]) : 0;
+  };
+  const descubiertos = [];
+  for (const n of names) {
+    for (const [c, v] of summary(n)) {
+      const d = dispRow(v);
+      if (d < -0.005) descubiertos.push({ name: n, c, falta: -d });
+    }
+  }
+  const abrirPrestamoPara = (name, c, falta) => {
+    setLoanForm({ fecha: hoyISO(), currency: c, destino: name, monto: falta != null ? String(Math.round(falta * 100) / 100) : "" });
+    setLoanSheet(true);
+  };
+
+  const montoLoan = parseFloat(loanForm.monto);
+  const dispOrigenLoan = loanForm.origen ? dispDe(loanForm.origen, loanForm.currency || "usd") : null;
+  const loanDejaNegativo = dispOrigenLoan != null && Number.isFinite(montoLoan) && montoLoan > 0 && montoLoan > dispOrigenLoan + 0.005;
 
   return (
     <div style={{ paddingTop: 8 }}>
@@ -6916,6 +7217,27 @@ function ProjectsTab({ txns, projectsMeta, cur, onAdd, onEdit, canEdit = true, p
         <button onClick={onAdd} style={{ ...rowCard, cursor: "pointer", justifyContent: "center", gap: 8, color: T.gold, fontWeight: 600, fontSize: 15, marginBottom: 16 }}>
           <IconPlus color={T.gold} /> Nuevo proyecto
         </button>
+      )}
+
+      {/* ── Alerta: proyectos en negativo (descubierto sin financiar) ── */}
+      {prestamosListos && descubiertos.length > 0 && (
+        <div style={{ ...rowCard, flexDirection: "column", alignItems: "stretch", padding: "13px 15px", marginBottom: 16, borderLeft: `4px solid ${T.red}`, background: T.red + "10" }}>
+          <div style={{ fontSize: 14.5, fontWeight: 750, color: T.red }}>⚠️ {descubiertos.length} proyecto(s) en negativo</div>
+          <div style={{ fontSize: 11, color: T.mut, marginTop: 2, marginBottom: 8 }}>
+            Un proyecto no puede quedar en negativo: necesita financiarse con un préstamo de otro proyecto.
+          </div>
+          {descubiertos.map((d) => (
+            <div key={d.name + d.c} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, borderTop: `1px solid ${T.lineSoft}`, paddingTop: 8, marginTop: 8 }}>
+              <div style={{ minWidth: 0 }}>
+                <div style={{ fontSize: 13, fontWeight: 650, color: T.text }}>{metaFor(d.name).emoji || "📁"} {d.name}</div>
+                <div style={{ fontSize: 11, color: T.mut }}>Descubierto <span style={{ fontFamily: MONO, color: T.red, fontWeight: 700 }}>{money(d.falta, d.c)}</span></div>
+              </div>
+              {canLoan && (
+                <button onClick={() => abrirPrestamoPara(d.name, d.c, d.falta)} style={{ ...btnGhost, color: T.gold, fontWeight: 700, fontSize: 12.5, flexShrink: 0 }}>Cubrir con préstamo</button>
+              )}
+            </div>
+          ))}
+        </div>
       )}
 
       {/* ── Préstamos entre proyectos ── */}
@@ -6999,8 +7321,9 @@ function ProjectsTab({ txns, projectsMeta, cur, onAdd, onEdit, canEdit = true, p
                             </div>
                           </div>
                         </div>
-                        {Math.abs(neto) > 0.005 && (
-                          <div style={{ marginTop: 10, padding: "9px 10px", borderRadius: 11, background: T.gold + "12", border: `1px solid ${T.gold}33` }}>
+                        {(Math.abs(neto) > 0.005 || bal < -0.005) && (
+                          <div style={{ marginTop: 10, padding: "9px 10px", borderRadius: 11, background: (bal < -0.005 ? T.red : T.gold) + "12", border: `1px solid ${(bal < -0.005 ? T.red : T.gold)}33` }}>
+                            <div style={{ fontSize: 10, color: T.mut2, fontWeight: 700, letterSpacing: 0.4, marginBottom: 5 }}>CUENTA INTERNA</div>
                             {Object.entries(v.deQuien || {}).map(([o, amt]) => (
                               <div key={"in" + o} style={{ display: "flex", justifyContent: "space-between", fontSize: 11.5, color: T.mut, marginBottom: 4 }}>
                                 <span>⬅️ Recibido de {metaFor(o).emoji || "📁"} {o}</span>
@@ -7013,13 +7336,29 @@ function ProjectsTab({ txns, projectsMeta, cur, onAdd, onEdit, canEdit = true, p
                                 <span style={{ fontFamily: MONO, color: T.red, fontWeight: 650 }}>−{money(amt, c)}</span>
                               </div>
                             ))}
-                            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", borderTop: `1px solid ${T.gold}33`, paddingTop: 6, marginTop: 4 }}>
+                            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", borderTop: `1px solid ${(bal < -0.005 ? T.red : T.gold)}33`, paddingTop: 6, marginTop: 4 }}>
                               <span style={{ fontSize: 12, fontWeight: 700, color: T.text }}>Balance disponible</span>
-                              <span style={{ fontFamily: MONO, fontSize: 14.5, fontWeight: 800, color: bal >= 0 ? T.gold : T.red }}>{money(bal, c)}</span>
+                              <span style={{ fontFamily: MONO, fontSize: 14.5, fontWeight: 800, color: bal < -0.005 ? T.red : T.gold }}>{money(bal, c)}</span>
                             </div>
-                            <div style={{ fontSize: 10, color: T.mut2, marginTop: 4 }}>
-                              Transferencia interna entre proyectos · no afecta cuentas ni movimientos
-                            </div>
+                            {bal < -0.005 ? (
+                              <div style={{ marginTop: 7, borderTop: `1px solid ${T.red}33`, paddingTop: 7 }}>
+                                <div style={{ fontSize: 11.5, color: T.red, fontWeight: 700 }}>
+                                  ⚠️ Descubierto de {money(-bal, c)}
+                                </div>
+                                <div style={{ fontSize: 10.5, color: T.mut, marginTop: 2 }}>
+                                  Este proyecto no puede quedar en negativo: necesita un préstamo de otro proyecto para financiar sus operaciones.
+                                </div>
+                                {canLoan && (
+                                  <button onClick={() => abrirPrestamoPara(name, c, -bal)} style={{ ...btnGhost, color: T.gold, fontWeight: 700, fontSize: 12.5, marginTop: 5, paddingLeft: 0 }}>
+                                    Cubrir con préstamo →
+                                  </button>
+                                )}
+                              </div>
+                            ) : (
+                              <div style={{ fontSize: 10, color: T.mut2, marginTop: 4 }}>
+                                Transferencia interna entre proyectos · no afecta cuentas ni movimientos
+                              </div>
+                            )}
                           </div>
                         )}
                         {v.com > 0 && (
@@ -7075,9 +7414,20 @@ function ProjectsTab({ txns, projectsMeta, cur, onAdd, onEdit, canEdit = true, p
         <Field label="Proyecto que presta">
           <select value={loanForm.origen || ""} onChange={(e) => setLoanForm({ ...loanForm, origen: e.target.value })} style={selStyle}>
             <option value="">— elegir —</option>
-            {names.map((n) => <option key={n} value={n}>{n}</option>)}
+            {names.filter((n) => n !== loanForm.destino).map((n) => {
+              const d = dispDe(n, loanForm.currency || "usd");
+              return <option key={n} value={n}>{n} · disponible {money(d, loanForm.currency || "usd")}</option>;
+            })}
           </select>
         </Field>
+        {dispOrigenLoan != null && (
+          <div style={{ fontSize: 11.5, color: T.mut, marginTop: -6, marginBottom: 10 }}>
+            Disponible de {loanForm.origen}:{" "}
+            <span style={{ fontFamily: MONO, color: dispOrigenLoan >= 0 ? T.green : T.red, fontWeight: 700 }}>
+              {money(dispOrigenLoan, loanForm.currency || "usd")}
+            </span>
+          </div>
+        )}
         <Field label="Proyecto que recibe (queda debiendo)">
           <select value={loanForm.destino || ""} onChange={(e) => setLoanForm({ ...loanForm, destino: e.target.value })} style={selStyle}>
             <option value="">— elegir —</option>
@@ -7102,6 +7452,12 @@ function ProjectsTab({ txns, projectsMeta, cur, onAdd, onEdit, canEdit = true, p
         <Field label="Nota (opcional)">
           <input placeholder="Motivo del préstamo…" value={loanForm.nota || ""} onChange={(e) => setLoanForm({ ...loanForm, nota: e.target.value })} style={inputStyle} />
         </Field>
+        {loanDejaNegativo && (
+          <div style={{ fontSize: 11.5, color: T.gold, background: T.gold + "12", border: `1px solid ${T.gold}33`, borderRadius: 10, padding: "8px 10px", marginBottom: 10 }}>
+            ⚠ Este préstamo deja a <b>{loanForm.origen}</b> en negativo por{" "}
+            <span style={{ fontFamily: MONO }}>{money(montoLoan - dispOrigenLoan, loanForm.currency || "usd")}</span>. Podés guardarlo igual, pero {loanForm.origen} va a quedar con descubierto.
+          </div>
+        )}
         <button
           onClick={guardarPrestamo}
           disabled={!loanForm.origen || !loanForm.destino || loanForm.origen === loanForm.destino || !(parseFloat(loanForm.monto) > 0)}
@@ -7131,6 +7487,19 @@ function ProjectsTab({ txns, projectsMeta, cur, onAdd, onEdit, canEdit = true, p
             {parseFloat(devForm.monto) > pendienteDe(devSheet) + 0.005 && (
               <div style={{ fontSize: 12, color: T.gold, marginBottom: 8 }}>⚠ El monto es mayor que lo pendiente; el préstamo quedará saldado.</div>
             )}
+            {(() => {
+              const cD = devSheet.currency || "usd";
+              const m = parseFloat(devForm.monto);
+              if (!Number.isFinite(m) || m <= 0) return null;
+              const restante = dispDe(devSheet.destino, cD) - Math.min(m, pendienteDe(devSheet));
+              if (restante >= -0.005) return null;
+              return (
+                <div style={{ fontSize: 11.5, color: T.gold, background: T.gold + "12", border: `1px solid ${T.gold}33`, borderRadius: 10, padding: "8px 10px", marginBottom: 8 }}>
+                  ⚠ Después de esta devolución, <b>{devSheet.destino}</b> queda en negativo por{" "}
+                  <span style={{ fontFamily: MONO }}>{money(-restante, cD)}</span>. Todavía no generó lo suficiente para devolver este monto.
+                </div>
+              );
+            })()}
             <button
               onClick={guardarDevolucion}
               disabled={!(parseFloat(devForm.monto) > 0)}
