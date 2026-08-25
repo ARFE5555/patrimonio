@@ -6827,6 +6827,18 @@ function ProjectsTab({ txns, projectsMeta, cur, onAdd, onEdit, canEdit = true, p
     }
     return { debe: Object.entries(debe), cobra: Object.entries(cobra) };
   };
+  /* Efecto interno del préstamo en el balance del proyecto (NO genera movimientos).
+     Se usa el pendiente: recibir suma, prestar resta, y al devolverse vuelve a cero. */
+  const efectoPrestamos = (name) => {
+    const out = {};
+    const ens = (c) => { if (!out[c]) out[c] = { recibido: 0, prestado: 0 }; return out[c]; };
+    for (const p of activos) {
+      const pend = pendienteDe(p), c = p.currency || "usd";
+      if (p.destino === name) ens(c).recibido += pend;
+      if (p.origen === name) ens(c).prestado += pend;
+    }
+    return out;
+  };
 
   const renderPrestamo = (p, saldado) => {
     const pend = pendienteDe(p), c = p.currency || "usd";
@@ -6872,16 +6884,23 @@ function ProjectsTab({ txns, projectsMeta, cur, onAdd, onEdit, canEdit = true, p
     const m = {};
     const meta = metaFor(name);
     const opening = meta.opening || {};
+    const ens = (c) => { if (!m[c]) m[c] = { inc: 0, exp: 0, com: 0, open: 0, preIn: 0, preOut: 0 }; return m[c]; };
     Object.entries(opening).forEach(([c, v]) => {
-      if (v != null && !isNaN(v)) m[c] = { inc: 0, exp: 0, com: 0, open: v };
+      if (v != null && !isNaN(v)) ens(c).open = v;
     });
     txns.filter((t) => (t.project || "") === name).forEach((t) => {
       const c = t.currency || cur;
       const com = t.commission || 0;
-      if (!m[c]) m[c] = { inc: 0, exp: 0, com: 0, open: 0 };
-      if (t.kind === "income") m[c].inc += (t.amount || 0) - com;
-      else m[c].exp += (t.amount || 0) + com;
-      m[c].com += com;
+      const e = ens(c);
+      if (t.kind === "income") e.inc += (t.amount || 0) - com;
+      else e.exp += (t.amount || 0) + com;
+      e.com += com;
+    });
+    /* Préstamos entre proyectos: ingreso/egreso interno, sin registro de movimiento */
+    Object.entries(efectoPrestamos(name)).forEach(([c, v]) => {
+      const e = ens(c);
+      e.preIn = v.recibido;
+      e.preOut = v.prestado;
     });
     return Object.entries(m);
   };
@@ -6897,7 +6916,10 @@ function ProjectsTab({ txns, projectsMeta, cur, onAdd, onEdit, canEdit = true, p
       {/* ── Préstamos entre proyectos ── */}
       <div style={{ ...rowCard, flexDirection: "column", alignItems: "stretch", padding: "14px 15px", marginBottom: 16, borderLeft: `4px solid ${T.gold}` }}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-          <div style={{ fontSize: 15, fontWeight: 700, color: T.text }}>🤝 Préstamos entre proyectos</div>
+          <div>
+            <div style={{ fontSize: 15, fontWeight: 700, color: T.text }}>🤝 Préstamos entre proyectos</div>
+            <div style={{ fontSize: 10.5, color: T.mut2, marginTop: 2 }}>Ingreso interno: ajusta el balance sin generar movimientos.</div>
+          </div>
           {canLoan && prestamosListos && (
             <button onClick={() => { setLoanForm({ fecha: hoyISO(), currency: "usd" }); setLoanSheet(true); }} style={{ ...btnGhost, color: T.gold, fontWeight: 650 }}>+ Nuevo préstamo</button>
           )}
@@ -6942,13 +6964,29 @@ function ProjectsTab({ txns, projectsMeta, cur, onAdd, onEdit, canEdit = true, p
                   {rows.length === 0 ? (
                     <div style={{ fontSize: 12.5, color: T.mut }}>Sin movimientos asignados.</div>
                   ) : (
-                    rows.map(([c, v]) => (
+                    rows.map(([c, v]) => {
+                      const preIn = v.preIn || 0, preOut = v.preOut || 0;
+                      const neto = preIn - preOut;
+                      const bal = (v.open || 0) + v.inc - v.exp + neto;
+                      return (
                       <div key={c} style={{ borderTop: `1px solid ${T.lineSoft}`, paddingTop: 10, marginTop: 10 }}>
                         <div style={{ fontSize: 11.5, color: T.mut2, fontWeight: 600, marginBottom: 6 }}>{c.toUpperCase()}</div>
                         {(v.open || 0) !== 0 && (
                           <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11.5, color: T.mut, marginBottom: 8 }}>
                             <span>Saldo inicial</span>
                             <span style={{ fontFamily: MONO, color: T.text }}>{money(v.open || 0, c)}</span>
+                          </div>
+                        )}
+                        {preIn > 0.005 && (
+                          <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11.5, color: T.mut, marginBottom: 6 }}>
+                            <span>🤝 Préstamo recibido <span style={{ color: T.mut2 }}>(interno)</span></span>
+                            <span style={{ fontFamily: MONO, color: T.green }}>+{money(preIn, c)}</span>
+                          </div>
+                        )}
+                        {preOut > 0.005 && (
+                          <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11.5, color: T.mut, marginBottom: 6 }}>
+                            <span>🤝 Prestado a otro proyecto <span style={{ color: T.mut2 }}>(interno)</span></span>
+                            <span style={{ fontFamily: MONO, color: T.red }}>−{money(preOut, c)}</span>
                           </div>
                         )}
                         <div style={{ display: "flex", gap: 10 }}>
@@ -6962,33 +7000,52 @@ function ProjectsTab({ txns, projectsMeta, cur, onAdd, onEdit, canEdit = true, p
                           </div>
                           <div style={{ flex: 1 }}>
                             <div style={{ fontSize: 11, color: T.mut }}>Balance</div>
-                            <div style={{ fontFamily: MONO, fontSize: 13.5, fontWeight: 700, color: (v.open || 0) + v.inc - v.exp >= 0 ? T.text : T.red }}>
-                              {money((v.open || 0) + v.inc - v.exp, c)}
+                            <div style={{ fontFamily: MONO, fontSize: 13.5, fontWeight: 700, color: bal >= 0 ? T.text : T.red }}>
+                              {money(bal, c)}
                             </div>
                           </div>
                         </div>
+                        {Math.abs(neto) > 0.005 && (
+                          <div style={{ fontSize: 10.5, color: T.mut2, marginTop: 6 }}>
+                            Balance operativo (sin préstamos): <span style={{ fontFamily: MONO }}>{money((v.open || 0) + v.inc - v.exp, c)}</span>
+                          </div>
+                        )}
                         {v.com > 0 && (
                           <div style={{ fontSize: 11, color: T.mut2, marginTop: 6 }}>
                             Comisiones incluidas: <span style={{ fontFamily: MONO }}>{money(v.com, c)}</span>
                           </div>
                         )}
                       </div>
-                    ))
+                      );
+                    })
                   )}
                   {(debe.length > 0 || cobra.length > 0) && (
-                    <div style={{ borderTop: `1px dashed ${T.lineSoft}`, paddingTop: 10, marginTop: 10, display: "flex", flexDirection: "column", gap: 5 }}>
-                      {debe.map(([k, v]) => { const parts = k.split("|"); return (
-                        <div key={"d" + k} style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5 }}>
-                          <span style={{ color: T.red }}>🔻 Debe a {parts[0]} (préstamo)</span>
-                          <span style={{ fontFamily: MONO, color: T.red, fontWeight: 650 }}>{money(v, parts[1])}</span>
+                    <div style={{ borderTop: `1px dashed ${T.lineSoft}`, paddingTop: 10, marginTop: 10, display: "flex", flexDirection: "column", gap: 8 }}>
+                      {debe.length > 0 && (
+                        <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                          <div style={{ fontSize: 11, color: T.mut2, fontWeight: 700, letterSpacing: 0.3 }}>DEUDAS · lo que este proyecto debe</div>
+                          {debe.map(([k, v]) => { const parts = k.split("|"); return (
+                            <div key={"d" + k} style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5 }}>
+                              <span style={{ color: T.red }}>🔻 Debe a {metaFor(parts[0]).emoji || "📁"} {parts[0]}</span>
+                              <span style={{ fontFamily: MONO, color: T.red, fontWeight: 650 }}>{money(v, parts[1])}</span>
+                            </div>
+                          ); })}
                         </div>
-                      ); })}
-                      {cobra.map(([k, v]) => { const parts = k.split("|"); return (
-                        <div key={"c" + k} style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5 }}>
-                          <span style={{ color: T.green }}>🔸 {parts[0]} le debe (préstamo)</span>
-                          <span style={{ fontFamily: MONO, color: T.green, fontWeight: 650 }}>{money(v, parts[1])}</span>
+                      )}
+                      {cobra.length > 0 && (
+                        <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                          <div style={{ fontSize: 11, color: T.mut2, fontWeight: 700, letterSpacing: 0.3 }}>COBRANZAS · lo que le deben a este proyecto</div>
+                          {cobra.map(([k, v]) => { const parts = k.split("|"); return (
+                            <div key={"c" + k} style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5 }}>
+                              <span style={{ color: T.green }}>🔸 {metaFor(parts[0]).emoji || "📁"} {parts[0]} le debe</span>
+                              <span style={{ fontFamily: MONO, color: T.green, fontWeight: 650 }}>{money(v, parts[1])}</span>
+                            </div>
+                          ); })}
                         </div>
-                      ); })}
+                      )}
+                      <div style={{ fontSize: 10.5, color: T.mut2 }}>
+                        Los préstamos entre proyectos son internos: ajustan el balance sin generar movimientos.
+                      </div>
                     </div>
                   )}
                 </div>
