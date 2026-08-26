@@ -5427,6 +5427,8 @@ function CxCTab({ divisas, accounts = [], projects = [], canWrite = true, onAddA
   const [busyId, setBusyId] = useState(null);
   const [err, setErr] = useState("");
   const [viewer, setViewer] = useState(null);
+  const [q, setQ] = useState("");                      // buscador: cliente o referencia
+  const [refAmplio, setRefAmplio] = useState(false);   // aflojar la comparación de referencia
 
   const keyOf = (p) => String(p || "").trim().toLowerCase();
   const clientes = useMemo(() => {
@@ -5451,6 +5453,42 @@ function CxCTab({ divisas, accounts = [], projects = [], canWrite = true, onAddA
 
   const totalPendiente = clientes.reduce((s, c) => s + Math.max(0, c.pendiente), 0);
   const byDateDesc = (a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : (b.createdAt || 0) - (a.createdAt || 0));
+
+  /* ─────────────  Buscador: por cliente y por referencia del banco  ─────────────
+     Mismo criterio que en Movimientos y en Divisas, para que la búsqueda se
+     comporte igual en toda la app. Con un código de 4 a 12 dígitos se compara
+     contra el FINAL de la referencia —que es lo que el cliente dicta cuando
+     avisa que pagó— y con texto, contra el nombre, la nota y el proyecto.
+
+     La referencia vive en dos campos según de dónde venga la ficha: las
+     compras y ventas de Divisas la traen en `referencia`; los abonos que se
+     registran acá, en `ref`. Se miran los dos, así el mismo código encuentra
+     tanto la operación que originó la deuda como el pago que la cancela. */
+  const qn = q.trim().toLowerCase();
+  const qCodigo = codigoRef(q);
+  const matchOpCxC = (d) => {
+    if (!qn || !d) return false;
+    if (qCodigo) {
+      if (refCoincide([d.referencia, d.ref, d.note], qCodigo, refAmplio)) return true;
+      // Un número también puede ser el monto en USD del movimiento
+      const nq = numVE(q);
+      if (!isNaN(nq) && nq > 0 && Math.abs((d.usd || 0) - nq) < 0.005) return true;
+      return false;
+    }
+    return [d.referencia, d.ref, d.note, d.project].filter(Boolean).join(" ").toLowerCase().includes(qn);
+  };
+  const matchCliente = (c) => {
+    if (!qn) return true;
+    if (c.nombre.toLowerCase().includes(qn)) return true;
+    return [...c.compras, ...c.ventas, ...c.abonos].some(matchOpCxC);
+  };
+  const clientesFiltrados = useMemo(
+    () => (qn ? clientes.filter(matchCliente) : clientes),
+    [clientes, qn, qCodigo, refAmplio]
+  );
+  /* Con un solo cliente en pantalla la ficha se abre sola: buscar una
+     referencia es justamente querer ver a quién pertenece ese pago. */
+  const autoAbierto = !!qn && clientesFiltrados.length === 1;
 
   async function onReceiptFile(op, e) {
     const f = e.target.files && e.target.files[0];
@@ -5497,8 +5535,11 @@ function CxCTab({ divisas, accounts = [], projects = [], canWrite = true, onAddA
     setMonto(""); setNota(""); setFecha(todayISO());
     setMetodo(""); setProyecto(""); setNuevoProy(""); setRefAbono("");
   }
+  /* "__cerrado" es el estado explícito de "lo cerré yo": hace falta porque una
+     ficha abierta sola por la búsqueda no tiene su clave en openKey, y sin esto
+     el toque para cerrarla la volvería a abrir. */
   function abrirCliente(k) {
-    setOpenKey((prev) => (prev === k ? null : k));
+    setOpenKey((prev) => (prev === k || (autoAbierto && prev === null) ? "__cerrado" : k));
     limpiarFormulario();
     setErr("");
   }
@@ -5520,12 +5561,60 @@ function CxCTab({ divisas, accounts = [], projects = [], canWrite = true, onAddA
         <div style={{ fontSize: 12, color: T.mut2 }}>{clientes.filter((c) => c.pendiente > 0.01).length} cliente(s) con saldo abierto</div>
       </div>
 
+      {/* Buscador: ubicar al cliente por nombre, o el pago por su referencia */}
+      {clientes.length > 0 && (
+        <>
+          <div style={{ position: "relative", marginBottom: 12 }}>
+            <input
+              style={{ ...inputStyle, paddingLeft: 38, marginBottom: 0 }}
+              value={q}
+              onChange={(e) => { setQ(e.target.value); setRefAmplio(false); setOpenKey(null); }}
+              placeholder="Cliente, últimos 4 o 6 dígitos de la referencia, monto…"
+              inputMode="search"
+              autoCapitalize="none"
+            />
+            <span style={{ position: "absolute", left: 13, top: "50%", transform: "translateY(-50%)", color: T.mut2, fontSize: 15 }}>⌕</span>
+            {q && (
+              <button
+                onClick={() => { setQ(""); setRefAmplio(false); setOpenKey(null); }}
+                style={{ position: "absolute", right: 8, top: "50%", transform: "translateY(-50%)", ...btnGhost, color: T.mut2, fontSize: 18, lineHeight: 1 }}
+                aria-label="Limpiar búsqueda"
+              >×</button>
+            )}
+          </div>
+          {q && (
+            <div style={{ fontSize: 12.5, color: T.mut, marginBottom: 12 }}>
+              {qCodigo ? (
+                <>
+                  {clientesFiltrados.length} cliente(s) con referencia{" "}
+                  <b style={{ color: T.text }}>{refAmplio ? "que contiene" : "terminada en"} {qCodigo}</b>
+                  {/* Salida de emergencia: si dictaron dígitos del medio */}
+                  <button
+                    onClick={() => setRefAmplio((v) => !v)}
+                    style={{ ...btnGhost, color: T.gold, fontSize: 12.5, fontWeight: 600, padding: "0 0 0 8px" }}
+                  >
+                    {refAmplio ? "Solo por el final" : "Buscar en cualquier parte"}
+                  </button>
+                </>
+              ) : (
+                <>{clientesFiltrados.length} cliente(s) para “{q}”</>
+              )}
+            </div>
+          )}
+        </>
+      )}
+
       {clientes.length === 0 ? (
         <div style={emptyRow}>Las compras de divisas con cliente aparecen acá agrupadas.</div>
+      ) : clientesFiltrados.length === 0 ? (
+        <div style={emptyRow}>
+          Ningún cliente ni referencia coincide con “{q}”.
+          {qCodigo && !refAmplio ? " Probá “Buscar en cualquier parte”." : ""}
+        </div>
       ) : (
         <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-          {clientes.map((c) => {
-            const open = openKey === c.key;
+          {clientesFiltrados.map((c) => {
+            const open = openKey === c.key || (autoAbierto && openKey === null);
             const saldada = c.pendiente <= 0.01;
             return (
               <div key={c.key} style={{ ...rowCard, flexDirection: "column", alignItems: "stretch", padding: 0, overflow: "hidden" }}>
@@ -5552,9 +5641,10 @@ function CxCTab({ divisas, accounts = [], projects = [], canWrite = true, onAddA
                     <div style={{ ...sectionTitle, margin: "14px 0 8px" }}>Operaciones ({c.compras.length + c.ventas.length})</div>
                     <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
                       {[...c.compras, ...c.ventas].sort(byDateDesc).map((d) => (
-                        <div key={d.id} style={{ display: "flex", justifyContent: "space-between", background: T.bg2, border: `1px solid ${T.lineSoft}`, borderRadius: 10, padding: "8px 11px" }}>
+                        <div key={d.id} style={{ display: "flex", justifyContent: "space-between", background: T.bg2, border: `1px solid ${matchOpCxC(d) ? T.gold : T.lineSoft}`, borderRadius: 10, padding: "8px 11px" }}>
                           <span style={{ fontSize: 12, color: d.kind === "compra" ? T.text : T.mut }}>
                             {d.kind === "compra" ? "Compra" : "Venta"} · {fmtDate(d.date)}{d.referencia ? ` · ref ${d.referencia}` : ""}
+                            {matchOpCxC(d) && <span style={{ fontSize: 10, fontWeight: 700, color: T.gold, marginLeft: 6, letterSpacing: 0.3 }}>COINCIDE</span>}
                           </span>
                           <span style={{ fontSize: 12.5, fontFamily: MONO, fontWeight: 600, color: T.text }}>{fmtUsd(d.kind === "compra" ? (d.usd || 0) - comUsdOf(d) : d.usd)}</span>
                         </div>
@@ -5572,7 +5662,7 @@ function CxCTab({ divisas, accounts = [], projects = [], canWrite = true, onAddA
                     ) : (
                       <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
                         {c.abonos.slice().sort(byDateDesc).map((a) => (
-                          <div key={a.id} style={{ background: T.bg2, border: `1px solid ${T.lineSoft}`, borderRadius: 10, padding: "9px 11px" }}>
+                          <div key={a.id} style={{ background: T.bg2, border: `1px solid ${matchOpCxC(a) ? T.gold : T.lineSoft}`, borderRadius: 10, padding: "9px 11px" }}>
                             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}>
                               <div style={{ minWidth: 0 }}>
                                 <div style={{ fontSize: 13, fontWeight: 600, color: T.green, fontFamily: MONO }}>
@@ -5583,7 +5673,10 @@ function CxCTab({ divisas, accounts = [], projects = [], canWrite = true, onAddA
                                     </span>
                                   )}
                                 </div>
-                                <div style={{ fontSize: 11.5, color: T.mut, fontFamily: MONO }}>{fmtDate(a.date)}{a.note ? ` · ${a.note}` : ""}</div>
+                                <div style={{ fontSize: 11.5, color: T.mut, fontFamily: MONO }}>
+                                  {fmtDate(a.date)}{a.ref ? ` · ref ${a.ref}` : ""}{a.note ? ` · ${a.note}` : ""}
+                                  {matchOpCxC(a) && <span style={{ fontSize: 10, fontWeight: 700, color: T.gold, marginLeft: 6, letterSpacing: 0.3, fontFamily: FONT }}>COINCIDE</span>}
+                                </div>
                                 {(a.accountId || a.project) && (
                                   <div style={{ fontSize: 11, color: T.mut2, marginTop: 2 }}>
                                     {a.accountId ? nombreCuenta(a.accountId) : ""}
