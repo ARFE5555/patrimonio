@@ -3975,13 +3975,15 @@ function CierreDiarioTab({ txns, accounts, cur, onVerDia }) {
   const acctCur = (acct && acct.currency) || cur;
   const delta = (t) => (t.kind === "income" ? (t.amount || 0) : -(t.amount || 0)) - (t.commission || 0);
 
-  /* Orden dentro de un mismo día. stmtRow es el número de fila DENTRO del
-     archivo importado, y cada carga lo renumera desde 1: si un día quedó
-     armado con dos archivos (una carga diaria que se solapa con la anterior),
-     comparar solo stmtRow mezcla las dos. Primero manda la importación más
-     reciente, y dentro de ella la fila. */
-  const rank = (t) => [t.importedAt || 0, t.stmtRow || 0];
-  const cmpRank = (a, b) => { const x = rank(a), y = rank(b); return x[0] - y[0] || x[1] - y[1]; };
+  /* Orden dentro de un mismo día: el número de fila del estado de cuenta.
+     stmtRow se renumera desde 1 en cada archivo, así que un día armado con dos
+     cargas que se solapan puede elegir mal la última línea. NO se desempata
+     por la fecha de importación: la carga más reciente puede ser un archivo
+     PARCIAL (el estado de cuenta bajado a media mañana), y su última línea
+     trae un saldo intermedio, no el de cierre del día. Entre las dos formas de
+     equivocarse, esta es la que no rompe los días que ya cuadraban.
+     Los días armados con más de un archivo se marcan aparte, abajo. */
+  const cmpRank = (a, b) => (a.stmtRow || 0) - (b.stmtRow || 0);
 
   const dias = useMemo(() => {
     if (!acct) return [];
