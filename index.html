@@ -1744,7 +1744,7 @@ function AppMain({ session, role, signOut }) {
      Se guardan la referencia del banco (código validador) y su descripción tal cual,
      y quedan con pending:true hasta que se les asigne un motivo. El saldo de la
      cuenta se recalcula solo, porque se deriva de los movimientos. */
-  function importStatement(accountId, ops, meta) {
+  async function importStatement(accountId, ops, meta) {
     if (!accountId || !ops || ops.length === 0) return { added: 0 };
     // Si la cuenta se acaba de crear puede no estar todavía en este render:
     // se usa la moneda general como respaldo en lugar de abortar la carga.
@@ -1776,13 +1776,57 @@ function AppMain({ session, role, signOut }) {
       importFile: (meta && meta.fileName) || undefined,
     });
 
+    const clave = (x) => stmtKeyOf(accountId, { ref: x.ref, date: x.date, amount: x.amount, desc: x.desc != null ? x.desc : x.bankDesc }, esMerc);
+
+    /* ── Barrera 0: lo que YA ESTÁ EN LA NUBE ──
+       `txns` es el estado de ESTE dispositivo y puede estar viejo: si otro
+       usuario —o este mismo desde el teléfono— cargó el mismo estado de cuenta
+       hace un momento, esas filas están en el servidor pero todavía no
+       llegaron por realtime, y las barreras locales las dejarían pasar. Cada
+       fila lleva un id nuevo, así que el upsert no las colapsa: entran dos
+       veces y el cierre diario descuadra desde ese día en adelante.
+       Por eso se relee del servidor, antes de escribir nada, el rango de
+       fechas del archivo para esta cuenta. Si la lectura falla no se importa:
+       cargar a ciegas es justamente lo que duplica. */
+    let remotos = null;
+    if (CLOUD) {
+      const fechas = ops.map((o) => o.date).filter(Boolean).sort();
+      if (fechas.length) {
+        try {
+          const sb = await getSB();
+          const PAGE = 1000;
+          const acum = [];
+          for (let off = 0; ; off += PAGE) {
+            const { data, error } = await sb
+              .from(TABLES.txns)
+              .select("id,data")
+              .eq("data->>accountId", accountId)
+              .gte("data->>date", fechas[0])
+              .lte("data->>date", fechas[fechas.length - 1])
+              .range(off, off + PAGE - 1);
+            if (error) throw error;
+            acum.push(...(data || []).map((r) => ({ id: r.id, ...(r.data || {}) })));
+            if (!data || data.length < PAGE) break;
+          }
+          remotos = acum;
+        } catch (e) {
+          console.error("import: no se pudo releer la nube", e);
+          return { added: 0, omitidos: 0, traslados: 0, sinVerificar: true };
+        }
+      }
+    }
+
     /* ── Primera barrera anti-duplicado (la que se reporta) ──
-       El importador ya viene filtrando contra los movimientos del render, pero
-       se vuelve a filtrar acá por si esta función se llama desde otro lado.
+       Se coteja contra la unión de lo que hay en la nube y lo que hay en este
+       dispositivo, sin contar dos veces la misma fila (se cruzan por id).
        El presupuesto cuenta CUÁNTAS veces existe ya cada clave: si el archivo
        trae dos líneas idénticas y en la app hay una, entra la que falta. */
-    const budget = buildTxnIndex(txns, accounts);
-    const clave = (x) => stmtKeyOf(accountId, { ref: x.ref, date: x.date, amount: x.amount, desc: x.desc != null ? x.desc : x.bankDesc }, esMerc);
+    const unir = (locales) => {
+      if (!remotos) return locales || [];
+      const vistos = new Set(remotos.map((t) => t.id));
+      return [...remotos, ...(locales || []).filter((t) => !vistos.has(t.id))];
+    };
+    const budget = buildTxnIndex(unir(txns), accounts);
     const nuevos = [];
     let omitidos = 0;
     ops.forEach((op) => {
@@ -1803,7 +1847,7 @@ function AppMain({ session, role, signOut }) {
          mismo estado de cuenta desde otro dispositivo, o el botón pudo
          dispararse dos veces. `prev` es lo único garantizado al día: sin esta
          pasada, esos casos duplican el período completo. */
-      const bud = buildTxnIndex(prev, accounts);
+      const bud = buildTxnIndex(unir(prev), accounts);
       const limpios = [];
       nuevos.forEach((t) => {
         const k = clave(t);
@@ -3931,18 +3975,26 @@ function CierreDiarioTab({ txns, accounts, cur, onVerDia }) {
   const acctCur = (acct && acct.currency) || cur;
   const delta = (t) => (t.kind === "income" ? (t.amount || 0) : -(t.amount || 0)) - (t.commission || 0);
 
+  /* Orden dentro de un mismo día. stmtRow es el número de fila DENTRO del
+     archivo importado, y cada carga lo renumera desde 1: si un día quedó
+     armado con dos archivos (una carga diaria que se solapa con la anterior),
+     comparar solo stmtRow mezcla las dos. Primero manda la importación más
+     reciente, y dentro de ella la fila. */
+  const rank = (t) => [t.importedAt || 0, t.stmtRow || 0];
+  const cmpRank = (a, b) => { const x = rank(a), y = rank(b); return x[0] - y[0] || x[1] - y[1]; };
+
   const dias = useMemo(() => {
     if (!acct) return [];
     const propios = txns.filter((t) => t.accountId === acct.id && t.date);
     const ordenados = propios.slice().sort((a, b) =>
-      a.date < b.date ? -1 : a.date > b.date ? 1 : (a.stmtRow || 0) - (b.stmtRow || 0)
+      a.date < b.date ? -1 : a.date > b.date ? 1 : cmpRank(a, b)
     );
     const m = new Map();
     let acumulado = acct.opening || 0;
     ordenados.forEach((t) => {
       acumulado += delta(t);
       if (!m.has(t.date)) {
-        m.set(t.date, { date: t.date, items: [], ingresos: 0, egresos: 0, comisiones: 0, pendientes: 0, bank: null, bankRow: -1 });
+        m.set(t.date, { date: t.date, items: [], ingresos: 0, egresos: 0, comisiones: 0, pendientes: 0, bank: null, bankRef: null });
       }
       const d = m.get(t.date);
       d.items.push(t);
@@ -3951,14 +4003,28 @@ function CierreDiarioTab({ txns, accounts, cur, onVerDia }) {
       d.comisiones += t.commission || 0;
       if (t.pending) d.pendientes++;
       // El saldo del banco del día es el de la última línea del estado de cuenta
-      if (t.bankBalance != null && (t.stmtRow || 0) >= d.bankRow) { d.bank = t.bankBalance; d.bankRow = t.stmtRow || 0; }
+      if (t.bankBalance != null && (d.bankRef == null || cmpRank(t, d.bankRef) >= 0)) { d.bank = t.bankBalance; d.bankRef = t; }
       d.saldoApp = acumulado;
     });
-    return Array.from(m.values()).sort((a, b) => (a.date < b.date ? 1 : -1));
+
+    /* El saldo es corrido: una diferencia de un día se arrastra a todos los
+       siguientes. Sin separar las dos cosas, un solo movimiento duplicado
+       pinta de rojo el mes entero y esconde dónde está el problema real.
+       `nuevo` es lo que se descuadró ESE día, ya descontado el arrastre. */
+    const lista = Array.from(m.values()).sort((a, b) => (a.date < b.date ? -1 : 1));
+    let arrastre = 0;
+    lista.forEach((d) => {
+      if (d.bank == null) { d.dif = null; d.nuevo = null; return; }
+      d.dif = d.saldoApp - d.bank;
+      d.nuevo = d.dif - arrastre;
+      arrastre = d.dif;
+    });
+    return lista.reverse();
   }, [txns, acct]);
 
   const conDato = dias.filter((d) => d.bank != null);
-  const descuadrados = conDato.filter((d) => Math.abs(d.saldoApp - d.bank) > 0.01);
+  const descuadrados = conDato.filter((d) => Math.abs(d.dif) > 0.01);
+  const culpables = conDato.filter((d) => Math.abs(d.nuevo) > 0.01);
   const selStyle = { ...inputStyle, appearance: "none", fontSize: 14, padding: "11px 12px" };
 
   if (bancos.length === 0) return <div style={emptyRow}>Creá una cuenta de banco para ver el cierre diario.</div>;
@@ -3973,7 +4039,7 @@ function CierreDiarioTab({ txns, accounts, cur, onVerDia }) {
 
       <div style={{ background: `linear-gradient(160deg, ${T.card2}, ${T.card})`, border: `1px solid ${T.line}`, borderRadius: 18, padding: 18, marginBottom: 16 }}>
         <div style={{ fontSize: 13, color: T.mut, fontWeight: 500 }}>Días cuadrados contra el banco</div>
-        <div style={{ fontFamily: MONO, fontVariantNumeric: "tabular-nums", fontSize: 30, fontWeight: 600, letterSpacing: -0.5, color: descuadrados.length ? T.gold : T.green, margin: "4px 0 2px" }}>
+        <div style={{ fontFamily: MONO, fontVariantNumeric: "tabular-nums", fontSize: 30, fontWeight: 600, letterSpacing: -0.5, color: culpables.length ? T.gold : T.green, margin: "4px 0 2px" }}>
           {conDato.length - descuadrados.length} / {conDato.length}
         </div>
         <div style={{ fontSize: 12, color: T.mut2, lineHeight: 1.5 }}>
@@ -3981,9 +4047,11 @@ function CierreDiarioTab({ txns, accounts, cur, onVerDia }) {
             ? (dias.length === 0
                 ? "Importá un estado de cuenta para poder cuadrar: el saldo del banco sale de ahí."
                 : "El estado de cuenta de este banco no trae la columna de saldo, así que no se puede cuadrar día por día. El saldo total sí se verifica al importar, contra el saldo final del archivo.")
-            : descuadrados.length === 0
-              ? "Todos los días con dato del banco cuadran al céntimo."
-              : `${descuadrados.length} día(s) con diferencia. Suele ser un movimiento sin cargar.`}
+            : culpables.length === 0
+              ? (descuadrados.length === 0
+                  ? "Todos los días con dato del banco cuadran al céntimo."
+                  : "Ningún día se descuadra por sí mismo: la diferencia viene arrastrada de antes. Revisá el saldo inicial de la cuenta.")
+              : `${culpables.length} día(s) para revisar. El resto solo arrastra esa diferencia.`}
         </div>
       </div>
 
@@ -3992,12 +4060,17 @@ function CierreDiarioTab({ txns, accounts, cur, onVerDia }) {
       ) : (
         <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
           {dias.map((d) => {
-            const dif = d.bank != null ? d.saldoApp - d.bank : null;
+            const dif = d.dif;
             const cuadra = dif != null && Math.abs(dif) <= 0.01;
+            // Un día que heredó la diferencia pero no agregó nada propio no es
+            // el que hay que revisar: se marca aparte para no mandar a buscar
+            // el error donde no está.
+            const soloArrastre = dif != null && !cuadra && Math.abs(d.nuevo) <= 0.01;
             const open = abierto === d.date;
-            const color = dif == null ? T.mut2 : cuadra ? T.green : T.red;
+            const color = dif == null ? T.mut2 : cuadra ? T.green : soloArrastre ? T.mut : T.red;
+            const borde = dif == null || cuadra || soloArrastre ? T.lineSoft : T.red;
             return (
-              <div key={d.date} style={{ background: T.card, border: `1px solid ${cuadra ? T.lineSoft : dif == null ? T.lineSoft : T.red}`, borderRadius: 14, overflow: "hidden" }}>
+              <div key={d.date} style={{ background: T.card, border: `1px solid ${borde}`, borderRadius: 14, overflow: "hidden" }}>
                 <button
                   onClick={() => setAbierto(open ? null : d.date)}
                   style={{ width: "100%", background: "transparent", border: "none", padding: "13px 15px", cursor: "pointer", fontFamily: FONT, textAlign: "left" }}
@@ -4011,7 +4084,7 @@ function CierreDiarioTab({ txns, accounts, cur, onVerDia }) {
                         </span>
                       )}
                       <span style={{ fontSize: 11.5, fontWeight: 700, color, letterSpacing: 0.3 }}>
-                        {dif == null ? "SIN DATO" : cuadra ? "CUADRA" : "DIFERENCIA"}
+                        {dif == null ? "SIN DATO" : cuadra ? "CUADRA" : soloArrastre ? "ARRASTRE" : "DIFERENCIA"}
                       </span>
                     </span>
                   </div>
@@ -4021,8 +4094,10 @@ function CierreDiarioTab({ txns, accounts, cur, onVerDia }) {
                     {d.comisiones > 0 && <span style={{ color: T.gold }}>com. {money(d.comisiones, acctCur)}</span>}
                   </div>
                   {dif != null && !cuadra && (
-                    <div style={{ fontSize: 12, color: T.red, marginTop: 5 }}>
-                      Diferencia de {money(Math.abs(dif), acctCur)} · {dif > 0 ? "la app tiene de más" : "la app tiene de menos"}
+                    <div style={{ fontSize: 12, color: soloArrastre ? T.mut2 : T.red, marginTop: 5 }}>
+                      {soloArrastre
+                        ? `Arrastra ${money(Math.abs(dif), acctCur)} de un día anterior · este día está bien`
+                        : `Se descuadra ${money(Math.abs(d.nuevo), acctCur)} acá · ${d.nuevo > 0 ? "la app tiene de más" : "la app tiene de menos"}`}
                     </div>
                   )}
                 </button>
@@ -4033,12 +4108,20 @@ function CierreDiarioTab({ txns, accounts, cur, onVerDia }) {
                       <span>Saldo según la app</span>
                       <span style={{ fontFamily: MONO, color: T.text }}>{money(d.saldoApp, acctCur)}</span>
                     </div>
-                    <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5, color: T.mut, marginBottom: 10 }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5, color: T.mut, marginBottom: d.dif != null && !cuadra ? 4 : 10 }}>
                       <span>Saldo según el banco</span>
                       <span style={{ fontFamily: MONO, color: d.bank == null ? T.mut2 : T.text }}>
                         {d.bank == null ? "no vino en el archivo" : money(d.bank, acctCur)}
                       </span>
                     </div>
+                    {d.dif != null && !cuadra && (
+                      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5, color: T.mut, marginBottom: 10 }}>
+                        <span>{soloArrastre ? "Viene arrastrado" : "Nace en este día"}</span>
+                        <span style={{ fontFamily: MONO, color: soloArrastre ? T.mut2 : T.red }}>
+                          {money(soloArrastre ? d.dif - d.nuevo : d.nuevo, acctCur)}
+                        </span>
+                      </div>
+                    )}
                     <div style={{ fontSize: 12, color: T.mut2, marginBottom: 10 }}>{d.items.length} movimiento(s) ese día</div>
                     <div style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: 10 }}>
                       {d.items.slice(0, 12).map((t) => (
@@ -4257,11 +4340,23 @@ function StatementImportSheet({ open, onClose, accounts, cur, txns, onImport, on
     setMap((m) => ({ ...m, [field]: value }));
   }
 
-  function doImport() {
+  async function doImport() {
     if (!accountId || analysis.nuevas.length === 0) return;
     if (importando.current) return;
     importando.current = true;
-    const res = onImport(accountId, analysis.nuevas, { fileName });
+    setBusy(true); setErr(""); setMsg("Verificando contra lo ya cargado…");
+    const res = await onImport(accountId, analysis.nuevas, { fileName });
+    setBusy(false);
+
+    /* La verificación contra el servidor no se pudo hacer: no se cargó nada.
+       Importar sin poder cotejar es lo que mete el mismo estado de cuenta dos
+       veces cuando alguien más lo subió desde otro equipo. */
+    if (res && res.sinVerificar) {
+      importando.current = false;
+      setMsg("");
+      setErr("No se pudo verificar contra lo que ya está cargado (sin conexión o sesión vencida). No se importó nada: probá de nuevo en un momento.");
+      return;
+    }
 
     /* Comprobación contra el saldo de cierre del archivo. Es la única forma de
        validar bancos que no traen columna de saldo corrido: si el resultado no
@@ -4615,8 +4710,9 @@ function StatementImportSheet({ open, onClose, accounts, cur, txns, onImport, on
                 )}
               </div>
 
-              <PrimaryBtn color={T.green} disabled={analysis.nuevas.length === 0 || !accountId || creando} onClick={doImport}>
-                {!accountId ? "Elegí la cuenta destino"
+              <PrimaryBtn color={T.green} disabled={busy || analysis.nuevas.length === 0 || !accountId || creando} onClick={doImport}>
+                {busy ? "Verificando…"
+                  : !accountId ? "Elegí la cuenta destino"
                   : analysis.nuevas.length === 0 ? "Nada nuevo para importar"
                   : `Importar ${analysis.nuevas.length} movimiento(s) en ${acct ? acct.name : ""}`}
               </PrimaryBtn>
