@@ -33,7 +33,7 @@ const { useState, useEffect, useRef, useMemo } = React;
 
 /* Versión de compilación. Sirve para confirmar de un vistazo qué build está
    corriendo en pantalla (útil para detectar caché vieja de la PWA). */
-const BUILD = "v5.6 · Bancarizaciones: operaciones, comisiones, cruce de cuentas y rentabilidad · 2026-08-27";
+const BUILD = "v5.7 · Verificación de duplicados y doble barrera anti-duplicado al importar · 2026-09-21";
 try { console.log("[Patrimonio] build:", BUILD); } catch (e) {}
 
 /* ─────────────────────────────  Tokens de diseño  ───────────────────────────── */
@@ -1749,8 +1749,9 @@ function AppMain({ session, role, signOut }) {
     // Si la cuenta se acaba de crear puede no estar todavía en este render:
     // se usa la moneda general como respaldo en lugar de abortar la carga.
     const acc = accounts.find((a) => a.id === accountId) || { currency: cur };
+    const esMerc = cuentaEsMercantil(accounts, accountId);
     const importedAt = Date.now();
-    const nuevos = ops.map((op, i) => ({
+    const construir = (op, i) => ({
       id: uid(),
       createdAt: importedAt - i,
       kind: op.kind,
@@ -1773,19 +1774,71 @@ function AppMain({ session, role, signOut }) {
       source: "bank",
       importedAt,
       importFile: (meta && meta.fileName) || undefined,
-    }));
+    });
+
+    /* ── Primera barrera anti-duplicado (la que se reporta) ──
+       El importador ya viene filtrando contra los movimientos del render, pero
+       se vuelve a filtrar acá por si esta función se llama desde otro lado.
+       El presupuesto cuenta CUÁNTAS veces existe ya cada clave: si el archivo
+       trae dos líneas idénticas y en la app hay una, entra la que falta. */
+    const budget = buildTxnIndex(txns, accounts);
+    const clave = (x) => stmtKeyOf(accountId, { ref: x.ref, date: x.date, amount: x.amount, desc: x.desc != null ? x.desc : x.bankDesc }, esMerc);
+    const nuevos = [];
+    let omitidos = 0;
+    ops.forEach((op) => {
+      const k = clave(op);
+      const left = budget.get(k) || 0;
+      if (left > 0) { budget.set(k, left - 1); omitidos++; return; }
+      nuevos.push(construir(op, nuevos.length));
+    });
+    if (nuevos.length === 0) return { added: 0, omitidos, traslados: 0 };
+
     /* Traslados entre cuentas: si alguna de las líneas recién cargadas comparte
        referencia con un movimiento de OTRA cuenta, las dos patas se justifican
        solas como traslado y se quedan sin proyecto. Así la bandeja de "por
        justificar" queda solo con movimientos reales. */
     setTxns((prev) => {
-      const combinado = [...nuevos, ...prev];
+      /* ── Segunda barrera, contra la lista MÁS FRESCA ──
+         Entre que se analizó el archivo y se apretó Importar pudo entrar el
+         mismo estado de cuenta desde otro dispositivo, o el botón pudo
+         dispararse dos veces. `prev` es lo único garantizado al día: sin esta
+         pasada, esos casos duplican el período completo. */
+      const bud = buildTxnIndex(prev, accounts);
+      const limpios = [];
+      nuevos.forEach((t) => {
+        const k = clave(t);
+        const left = bud.get(k) || 0;
+        if (left > 0) { bud.set(k, left - 1); return; }
+        limpios.push(t);
+      });
+      if (limpios.length === 0) return prev;
+      const combinado = [...limpios, ...prev];
       const auto = autoTraslados(combinado, accounts);
       return auto.tocados ? auto.lista : combinado;
     });
     // Solo para el resumen de la importación
     const previstos = autoTraslados([...nuevos, ...txns], accounts).tocados;
-    return { added: nuevos.length, traslados: previstos };
+    return { added: nuevos.length, omitidos, traslados: previstos };
+  }
+
+  /* Borrado en lote, para la verificación de duplicados. Arrastra lo mismo que
+     deleteTxn: la operación de Divisas y el abono de Cuentas por cobrar que el
+     movimiento hubiera generado, porque dejarlos sueltos descuadra las dos
+     pestañas. */
+  function eliminarTxns(ids) {
+    const set = new Set(ids || []);
+    if (!set.size) return;
+    const ligados = new Set();
+    (txns || []).forEach((t) => {
+      if (!set.has(t.id)) return;
+      if (t.divisaId) ligados.add(t.divisaId);
+      if (t.abonoId) ligados.add(t.abonoId);
+    });
+    setTxns((prev) => prev.filter((t) => !set.has(t.id)));
+    if (ligados.size) {
+      setDivisas((prev) => prev.filter((d) => !ligados.has(d.id)));
+      ligados.forEach((id) => receiptDel(id));
+    }
   }
 
   /* Justifica como traslado los grupos que se aprueben desde la bandeja.
@@ -2240,6 +2293,7 @@ function AppMain({ session, role, signOut }) {
                 onAdd={() => setTxnSheet(true)}
                 onEdit={(t) => setTxnSheet(t)}
                 onDelete={deleteTxn}
+                onDeleteMany={eliminarTxns}
                 onBulkImport={bulkImportTxns}
                 onImportStatement={() => setStmtSheet(true)}
                 onJustify={(list) => setJustifySheet({ list })}
@@ -2976,7 +3030,7 @@ function AccountsTab({ accounts, prices, cur, settings, vesRate, onSetRate, onAd
 }
 
 /* ─────────────────────────────  Tab: Movimientos  ───────────────────────────── */
-function TxnsTab({ txns, accounts, cur, onAdd, onEdit, onDelete, onBulkImport, onImportStatement, onJustify, onTraslados, onNoTraslado, onTrasladoManual, onNoSugerencia, canWrite = true, diaFijado = "", onLimpiarDia }) {
+function TxnsTab({ txns, accounts, cur, onAdd, onEdit, onDelete, onDeleteMany, onBulkImport, onImportStatement, onJustify, onTraslados, onNoTraslado, onTrasladoManual, onNoSugerencia, canWrite = true, diaFijado = "", onLimpiarDia }) {
   const acct = (id) => accounts.find((a) => a.id === id);
   const acctName = (id) => (acct(id) || {}).name || "—";
   const acctCur = (t) => t.currency || (acct(t.accountId) || {}).currency || cur;
@@ -3010,6 +3064,54 @@ function TxnsTab({ txns, accounts, cur, onAdd, onEdit, onDelete, onBulkImport, o
      pegadas. Se proponen, nunca se aplican solos. */
   const posiblesTraslados = useMemo(() => sugerirTraslados(txns, accounts), [txns, accounts]);
   const [verPosibles, setVerPosibles] = useState(false);
+
+  /* ─────────────  Verificación de duplicados (a pedido)  ─────────────
+     No corre sola: se dispara con el botón. Así no se paga el recorrido
+     completo en cada render y —sobre todo— el resultado no se mueve debajo de
+     la mano mientras se está eligiendo qué borrar. */
+  const [dupModo, setDupModo] = useState("exacto");
+  const [dupGrupos, setDupGrupos] = useState(null);   // null = todavía no se corrió
+  const [dupSel, setDupSel] = useState({});           // id -> true (se va a borrar)
+  const [dupConfirm, setDupConfirm] = useState(false);
+  const [dupResumen, setDupResumen] = useState("");
+
+  function correrVerificacion(modo) {
+    const m = modo || dupModo;
+    const grupos = detectarDuplicados(txns, accounts, { modo: m });
+    // Preselección: se marca todo MENOS la copia que conviene conservar.
+    const sel = {};
+    grupos.forEach((g) => g.sobranIds.forEach((id) => { sel[id] = true; }));
+    setDupModo(m);
+    setDupGrupos(grupos);
+    setDupSel(sel);
+    setDupConfirm(false);
+    setDupResumen("");
+  }
+
+  const dupMarcados = useMemo(
+    () => (dupGrupos || []).reduce((s, g) => s.concat(g.ids.filter((id) => dupSel[id])), []),
+    [dupGrupos, dupSel]
+  );
+  /* Nunca se deja borrar un grupo entero: si están todas marcadas, el
+     movimiento desaparecería en vez de quedar una sola vez. */
+  const dupGrupoVacio = useMemo(
+    () => (dupGrupos || []).some((g) => g.ids.length > 0 && g.ids.every((id) => dupSel[id])),
+    [dupGrupos, dupSel]
+  );
+  const dupAtados = useMemo(
+    () => (dupGrupos || []).reduce((n, g) => n + g.items.filter((t) => dupSel[t.id] && (t.divisaId || t.abonoId)).length, 0),
+    [dupGrupos, dupSel]
+  );
+
+  function borrarDuplicados() {
+    if (!onDeleteMany || dupMarcados.length === 0 || dupGrupoVacio) return;
+    const n = dupMarcados.length;
+    onDeleteMany(dupMarcados);
+    setDupGrupos(null);
+    setDupSel({});
+    setDupConfirm(false);
+    setDupResumen(`Se eliminaron ${n} movimiento(s) duplicado(s). Volvé a verificar para confirmar que no quedó nada.`);
+  }
 
   /* Búsqueda: referencia del banco (código validador), motivo, descripción, cuenta,
      proyecto y monto. La referencia se compara normalizada, así da igual si la
@@ -3371,6 +3473,174 @@ function TxnsTab({ txns, accounts, cur, onAdd, onEdit, onDelete, onBulkImport, o
           <button onClick={onImportStatement} style={{ ...rowCard, flex: 1.4, cursor: "pointer", justifyContent: "center", gap: 8, color: T.blue, fontWeight: 600, fontSize: 14.5 }}>
             ⇩ Importar del banco
           </button>
+        </div>
+      )}
+
+      {/* ─────────────  Verificar duplicados  ─────────────
+          Repasa TODOS los movimientos buscando el mismo movimiento cargado dos
+          veces. No borra nada solo: propone cuál conservar y hay que confirmar. */}
+      {canWrite && onDeleteMany && (
+        <div style={{ marginBottom: 12 }}>
+          <button
+            onClick={() => (dupGrupos === null ? correrVerificacion() : setDupGrupos(null))}
+            style={{ ...rowCard, width: "100%", cursor: "pointer", justifyContent: "center", gap: 8, color: T.violet, fontWeight: 600, fontSize: 14 }}
+          >
+            {dupGrupos === null ? "⟳ Verificar duplicados" : "Cerrar verificación"}
+          </button>
+
+          {dupResumen && dupGrupos === null && (
+            <div style={{ fontSize: 12.5, color: T.green, lineHeight: 1.5, marginTop: 8, padding: "0 2px" }}>
+              {dupResumen}
+            </div>
+          )}
+
+          {dupGrupos !== null && (
+            <div style={{ background: T.bg2, border: `1px solid ${dupGrupos.length ? T.red : T.green}`, borderRadius: 14, padding: "13px 15px", marginTop: 8 }}>
+              <div style={{ fontSize: 14, fontWeight: 700, color: dupGrupos.length ? T.red : T.green, marginBottom: 4 }}>
+                {dupGrupos.length === 0
+                  ? "Sin duplicados con este criterio"
+                  : `${dupGrupos.length} grupo(s) duplicado(s) · ${dupGrupos.reduce((n, g) => n + g.sobranIds.length, 0)} de más`}
+              </div>
+              <div style={{ fontSize: 12, color: T.mut, lineHeight: 1.5, marginBottom: 10 }}>
+                Se revisaron {txns.length} movimiento(s). Nada se borra hasta que lo confirmes.
+              </div>
+
+              {/* Criterio de comparación: de más estricto a más laxo */}
+              <div style={{ display: "flex", gap: 6, marginBottom: 10, flexWrap: "wrap" }}>
+                {[
+                  { k: "exacto", label: "Referencia exacta" },
+                  { k: "ref6", label: "Últimos 6 de la ref" },
+                  { k: "monto", label: "Solo monto y fecha" },
+                ].map((m) => (
+                  <button
+                    key={m.k}
+                    onClick={() => correrVerificacion(m.k)}
+                    style={{
+                      flex: "1 1 auto", background: dupModo === m.k ? T.violet : "transparent",
+                      color: dupModo === m.k ? "#0B0E14" : T.mut,
+                      border: `1px solid ${dupModo === m.k ? T.violet : T.line}`,
+                      borderRadius: 10, padding: "8px 10px", fontSize: 12, fontWeight: 600,
+                      fontFamily: FONT, cursor: "pointer", whiteSpace: "nowrap",
+                    }}
+                  >
+                    {m.label}
+                  </button>
+                ))}
+              </div>
+              <div style={{ fontSize: 11.5, color: T.mut2, lineHeight: 1.5, marginBottom: dupGrupos.length ? 12 : 0 }}>
+                {dupModo === "exacto"
+                  ? "Cuenta + referencia del banco + monto + fecha. Es la misma regla con la que el importador descarta lo repetido."
+                  : dupModo === "ref6"
+                  ? "Igual, pero comparando solo los últimos 6 dígitos de la referencia en todas las cuentas. Encuentra el mismo movimiento cuando el banco escribió la referencia de dos formas distintas."
+                  : "Cuenta + monto + fecha, ignorando la referencia. Encuentra el movimiento que se cargó a mano y después llegó otra vez en el estado de cuenta. Revisá uno por uno: acá sí pueden aparecer dos cobros distintos del mismo monto el mismo día."}
+              </div>
+
+              {dupGrupos.map((g) => {
+                const cur2 = acctCur(g.items[0]);
+                return (
+                  <div key={g.key} style={{ background: T.card, border: `1px solid ${T.lineSoft}`, borderRadius: 12, padding: "11px 13px", marginBottom: 9 }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", gap: 10, marginBottom: 7 }}>
+                      <span style={{ minWidth: 0 }}>
+                        <span style={{ display: "block", fontSize: 12.5, color: T.text, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                          {acctName(g.accountId)} · {fmtDate(g.fecha)}
+                        </span>
+                        <span style={{ display: "block", fontSize: 11.5, color: T.mut2, fontFamily: MONO }}>
+                          {g.ref ? `ref ${g.ref}` : "sin referencia"} · {g.items.length} copias
+                        </span>
+                      </span>
+                      <span style={{ fontFamily: MONO, fontSize: 13, fontWeight: 600, flexShrink: 0, color: g.kind === "income" ? T.green : T.red }}>
+                        {g.kind === "income" ? "+" : "−"}{money(g.amount, cur2)}
+                      </span>
+                    </div>
+
+                    {g.mismaCarga && (
+                      <div style={{ fontSize: 11, color: T.gold, marginBottom: 6 }}>
+                        Las {g.items.length} entraron en la misma carga: el archivo traía la línea repetida.
+                      </div>
+                    )}
+
+                    {g.items.map((t) => {
+                      const marcado = !!dupSel[t.id];
+                      const atado = !!(t.divisaId || t.abonoId);
+                      return (
+                        <button
+                          key={t.id}
+                          onClick={() => setDupSel((prev) => ({ ...prev, [t.id]: !prev[t.id] }))}
+                          style={{
+                            width: "100%", display: "flex", alignItems: "flex-start", gap: 9, textAlign: "left",
+                            background: marcado ? T.redSoft : "transparent",
+                            border: `1px solid ${marcado ? T.red : T.lineSoft}`,
+                            borderRadius: 10, padding: "8px 10px", marginTop: 6,
+                            fontFamily: FONT, cursor: "pointer", boxSizing: "border-box",
+                          }}
+                        >
+                          <span style={{ fontSize: 13, color: marcado ? T.red : T.mut2, flexShrink: 0, lineHeight: 1.4 }}>
+                            {marcado ? "✕" : "✓"}
+                          </span>
+                          <span style={{ minWidth: 0, flex: 1 }}>
+                            <span style={{ display: "block", fontSize: 12.5, color: marcado ? T.red : T.text, fontWeight: 600 }}>
+                              {marcado ? "Eliminar" : "Conservar"}
+                              {t.id === g.conservarId && !marcado ? " (sugerida)" : ""}
+                            </span>
+                            <span style={{ display: "block", fontSize: 11.5, color: T.mut, lineHeight: 1.5, marginTop: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                              {t.pending ? "Por justificar" : (t.motivo || "Justificado")}
+                              {t.project ? ` · ${t.project}` : ""}
+                            </span>
+                            <span style={{ display: "block", fontSize: 11, color: T.mut2, lineHeight: 1.5, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                              {t.source === "bank" ? "Del estado de cuenta" : "Cargado a mano"}
+                              {t.importFile ? ` · ${t.importFile}` : ""}
+                              {t.bankDesc ? ` · ${t.bankDesc}` : ""}
+                            </span>
+                            {atado && (
+                              <span style={{ display: "block", fontSize: 11, color: T.gold, lineHeight: 1.5, whiteSpace: "normal" }}>
+                                Tiene una operación de Divisas / abono asociada: al borrarla se va también.
+                              </span>
+                            )}
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                );
+              })}
+
+              {dupGrupos.length > 0 && (
+                <>
+                  {dupGrupoVacio && (
+                    <div style={{ fontSize: 12, color: T.gold, lineHeight: 1.5, marginBottom: 9 }}>
+                      Hay un grupo con todas las copias marcadas: dejá al menos una sin marcar, o el
+                      movimiento desaparece en vez de quedar una sola vez.
+                    </div>
+                  )}
+                  {dupAtados > 0 && !dupGrupoVacio && (
+                    <div style={{ fontSize: 12, color: T.gold, lineHeight: 1.5, marginBottom: 9 }}>
+                      {dupAtados} de las marcadas arrastran una ficha de Divisas o un abono de Cuentas por
+                      cobrar, que se borra junto con el movimiento.
+                    </div>
+                  )}
+                  {!dupConfirm ? (
+                    <PrimaryBtn color={T.red} disabled={dupMarcados.length === 0 || dupGrupoVacio} onClick={() => setDupConfirm(true)}>
+                      {dupMarcados.length === 0 ? "No hay nada marcado" : `Eliminar ${dupMarcados.length} duplicado(s)`}
+                    </PrimaryBtn>
+                  ) : (
+                    <div style={{ display: "flex", gap: 8 }}>
+                      <button
+                        onClick={() => setDupConfirm(false)}
+                        style={{ flex: 1, background: "transparent", color: T.mut, border: `1px solid ${T.line}`, borderRadius: 13, padding: "15px", fontSize: 14, fontWeight: 600, fontFamily: FONT, cursor: "pointer" }}
+                      >
+                        Cancelar
+                      </button>
+                      <div style={{ flex: 1.4 }}>
+                        <PrimaryBtn color={T.red} onClick={borrarDuplicados}>
+                          Sí, eliminar {dupMarcados.length}
+                        </PrimaryBtn>
+                      </div>
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
+          )}
         </div>
       )}
 
@@ -3778,13 +4048,17 @@ function StatementImportSheet({ open, onClose, accounts, cur, txns, onImport, on
   const [msg, setMsg] = useState("");
   const [err, setErr] = useState("");
   const [done, setDone] = useState(null);
+  /* Un solo disparo por archivo. Sin esto, un doble toque en el botón —o un
+     toque mientras React todavía no volvió a renderizar— manda el mismo lote
+     dos veces y duplica el período completo. */
+  const importando = useRef(false);
 
   useEffect(() => {
     if (open) {
       setFileName(""); setRows(null); setSheetNames([]); setWbRef(null);
       setHeaderIdx(0); setMap(null); setSignMode("cols"); setMergeCom(true);
       setAccountId(usable[0] ? usable[0].id : "");
-      setBusy(false); setMsg(""); setErr(""); setDone(null);
+      setBusy(false); setMsg(""); setErr(""); setDone(null); importando.current = false;
       // Si todavía no hay ninguna cuenta, se abre directo el formulario para crearla.
       setCreando(usable.length === 0);
       setNuevoNombre(""); setNuevaMoneda("ves"); setNuevoSaldo("");
@@ -3815,7 +4089,7 @@ function StatementImportSheet({ open, onClose, accounts, cur, txns, onImport, on
     const f = e.target.files && e.target.files[0];
     e.target.value = "";
     if (!f) return;
-    setBusy(true); setErr(""); setMsg("Leyendo archivo…"); setDone(null);
+    setBusy(true); setErr(""); setMsg("Leyendo archivo…"); setDone(null); importando.current = false;
     try {
       const buf = await f.arrayBuffer();
       // Solo se decodifica el arranque para saber de qué tipo es el archivo:
@@ -3941,6 +4215,8 @@ function StatementImportSheet({ open, onClose, accounts, cur, txns, onImport, on
 
   function doImport() {
     if (!accountId || analysis.nuevas.length === 0) return;
+    if (importando.current) return;
+    importando.current = true;
     const res = onImport(accountId, analysis.nuevas, { fileName });
 
     /* Comprobación contra el saldo de cierre del archivo. Es la única forma de
@@ -4051,6 +4327,14 @@ function StatementImportSheet({ open, onClose, accounts, cur, txns, onImport, on
             <div style={{ fontSize: 13.5, color: T.text, lineHeight: 1.6 }}>
               {done.added} movimiento(s) cargado(s) en <b>{(acct || {}).name}</b>.<br />
               Quedaron marcados como <b>por justificar</b>: asignales el motivo desde la lista de movimientos.
+              {done.omitidos > 0 && (
+                <>
+                  <br />
+                  <span style={{ color: T.gold }}>
+                    {done.omitidos} línea(s) se descartaron porque ya estaban registradas.
+                  </span>
+                </>
+              )}
               {done.traslados > 0 && (
                 <>
                   <br />
@@ -7445,6 +7729,91 @@ function buildTxnIndex(txns, accounts) {
     m.set(k, (m.get(k) || 0) + 1);
   });
   return m;
+}
+
+/* ─────────────────────────  Verificación de duplicados  ─────────────────────────
+   El importador ya descarta lo que reconoce como repetido, pero hay formas de
+   que un movimiento entre dos veces igual:
+
+     · el mismo movimiento cargado a mano y después traído por el estado de
+       cuenta (el archivo no sabe nada del que se tecleó);
+     · el banco escribe la referencia de dos maneras distintas según el formato
+       del archivo, así que las dos claves no coinciden;
+     · una carga que se disparó dos veces, o la misma carga hecha en paralelo
+       desde otro dispositivo.
+
+   Esta verificación se corre A MANO desde la pestaña Movimientos y no borra
+   nada por su cuenta: agrupa, propone cuál conservar y espera confirmación.
+
+   Modos (de más estricto a más laxo):
+     "exacto" → cuenta + referencia + monto + fecha  (la misma regla del importador)
+     "ref6"   → igual, pero comparando los ÚLTIMOS 6 dígitos de la referencia
+                en TODAS las cuentas, no solo en las Mercantil
+     "monto"  → cuenta + monto + fecha, ignorando referencia y descripción
+
+   El tipo (ingreso/egreso) SIEMPRE forma parte de la clave: un cargo y su
+   reverso comparten referencia, monto y fecha, y no son un duplicado. */
+function txnDupKey(t, accounts, modo) {
+  if (!t || !t.accountId) return "";
+  const signo = t.kind === "income" ? "i" : "e";
+  const cents = Math.round((t.amount || 0) * 100);
+  if (modo === "monto") return `${t.accountId}|m|${signo}|${t.date}|${cents}`;
+  const base = stmtKeyOf(
+    t.accountId,
+    { ref: t.ref, date: t.date, amount: t.amount, desc: t.bankDesc || t.motivo },
+    modo === "ref6" ? true : cuentaEsMercantil(accounts, t.accountId)
+  );
+  return base ? `${base}|${signo}` : "";
+}
+
+/* Cuál de las copias conviene conservar: la que tiene trabajo encima.
+   Una ficha de Divisas o un abono de Cuentas por cobrar pesan más que un
+   proyecto, y un proyecto más que un motivo escrito. A igual puntaje gana la
+   más vieja, que es la que el resto de la app ya venía referenciando. */
+function dupPuntaje(t) {
+  return (t.divisaId || t.abonoId ? 8 : 0) + (t.project ? 4 : 0) + (!t.pending && t.motivo ? 2 : 0) + (t.traslado ? 1 : 0);
+}
+
+function detectarDuplicados(lista, accounts, opts) {
+  const o = opts || {};
+  const modo = o.modo || "exacto";
+  const bolsas = new Map();
+  (lista || []).forEach((t) => {
+    const k = txnDupKey(t, accounts, modo);
+    if (!k) return;
+    if (!bolsas.has(k)) bolsas.set(k, []);
+    bolsas.get(k).push(t);
+  });
+
+  const grupos = [];
+  bolsas.forEach((items, key) => {
+    if (items.length < 2) return;
+    const orden = items.slice().sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0) || String(a.id).localeCompare(String(b.id)));
+    let conservar = orden[0];
+    orden.forEach((t) => { if (dupPuntaje(t) > dupPuntaje(conservar)) conservar = t; });
+    const conRef = orden.find((t) => t.ref);
+    grupos.push({
+      key,
+      items: orden,
+      ids: orden.map((t) => t.id),
+      conservarId: conservar.id,
+      sobranIds: orden.filter((t) => t.id !== conservar.id).map((t) => t.id),
+      accountId: orden[0].accountId,
+      fecha: orden[0].date,
+      amount: orden[0].amount,
+      kind: orden[0].kind,
+      ref: conRef ? conRef.ref : "",
+      // Copias que arrastran una ficha de Divisas o un abono: borrarlas se
+      // lleva también esa ficha, así que se avisa antes.
+      atadas: orden.filter((t) => t.divisaId || t.abonoId).length,
+      // Todas las copias vinieron del mismo archivo/carga: señal de que el
+      // estado de cuenta se subió dos veces.
+      mismaCarga: orden.every((t) => t.importedAt && t.importedAt === orden[0].importedAt),
+    });
+  });
+
+  grupos.sort((a, b) => String(b.fecha).localeCompare(String(a.fecha)) || String(a.key).localeCompare(String(b.key)));
+  return grupos;
 }
 
 function parseBankRows(rows) {
