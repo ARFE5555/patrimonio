@@ -33,7 +33,7 @@ const { useState, useEffect, useRef, useMemo } = React;
 
 /* Versión de compilación. Sirve para confirmar de un vistazo qué build está
    corriendo en pantalla (útil para detectar caché vieja de la PWA). */
-const BUILD = "v5.7 · Verificación de duplicados (respeta traslados y reversos) y doble barrera al importar · 2026-09-21";
+const BUILD = "v5.7 · Duplicados: banco + referencia + tipo + fecha, respetando traslados y reversos · 2026-09-21";
 try { console.log("[Patrimonio] build:", BUILD); } catch (e) {}
 
 /* ─────────────────────────────  Tokens de diseño  ───────────────────────────── */
@@ -3069,7 +3069,7 @@ function TxnsTab({ txns, accounts, cur, onAdd, onEdit, onDelete, onDeleteMany, o
      No corre sola: se dispara con el botón. Así no se paga el recorrido
      completo en cada render y —sobre todo— el resultado no se mueve debajo de
      la mano mientras se está eligiendo qué borrar. */
-  const [dupModo, setDupModo] = useState("exacto");
+  const [dupModo, setDupModo] = useState("ref");
   const [dupScan, setDupScan] = useState(null);       // null = todavía no se corrió
   const [dupSel, setDupSel] = useState({});           // id -> true (se va a borrar)
   const [dupConfirm, setDupConfirm] = useState(false);
@@ -3079,9 +3079,12 @@ function TxnsTab({ txns, accounts, cur, onAdd, onEdit, onDelete, onDeleteMany, o
   function correrVerificacion(modo) {
     const m = modo || dupModo;
     const scan = detectarDuplicados(txns, accounts, { modo: m });
-    // Preselección: se marca todo MENOS la copia que conviene conservar.
+    /* Preselección: se marca todo MENOS la copia que conviene conservar. Los
+       grupos con montos distintos NO se preseleccionan: comparten referencia y
+       fecha, pero la diferencia de importe puede ser la comisión del banco
+       viajando con la referencia de su transferencia. */
     const sel = {};
-    scan.grupos.forEach((g) => g.sobranIds.forEach((id) => { sel[id] = true; }));
+    scan.grupos.forEach((g) => { if (!g.montosDistintos) g.sobranIds.forEach((id) => { sel[id] = true; }); });
     setDupModo(m);
     setDupScan(scan);
     setDupSel(sel);
@@ -3524,9 +3527,10 @@ function TxnsTab({ txns, accounts, cur, onAdd, onEdit, onDelete, onDeleteMany, o
               {/* Criterio de comparación: de más estricto a más laxo */}
               <div style={{ display: "flex", gap: 6, marginBottom: 10, flexWrap: "wrap" }}>
                 {[
-                  { k: "exacto", label: "Referencia exacta" },
-                  { k: "ref6", label: "Últimos 6 de la ref" },
-                  { k: "monto", label: "Solo monto y fecha" },
+                  { k: "ref", label: "Referencia" },
+                  { k: "ref6", label: "Últimos 6 dígitos" },
+                  { k: "exacto", label: "Ref + mismo monto" },
+                  { k: "monto", label: "Sin referencia" },
                 ].map((m) => (
                   <button
                     key={m.k}
@@ -3544,11 +3548,13 @@ function TxnsTab({ txns, accounts, cur, onAdd, onEdit, onDelete, onDeleteMany, o
                 ))}
               </div>
               <div style={{ fontSize: 11.5, color: T.mut2, lineHeight: 1.5, marginBottom: dupGrupos.length ? 12 : 0 }}>
-                {dupModo === "exacto"
-                  ? "Cuenta + referencia del banco + monto + fecha. Es la misma regla con la que el importador descarta lo repetido."
+                {dupModo === "ref"
+                  ? "Banco + referencia + tipo de movimiento + fecha. El monto no entra: si el banco repitió la línea con otro importe, sigue siendo la misma operación. Las líneas sin referencia se comparan por su descripción y su monto, que es lo único que las distingue."
                   : dupModo === "ref6"
-                  ? "Igual, pero comparando solo los últimos 6 dígitos de la referencia en todas las cuentas. Encuentra el mismo movimiento cuando el banco escribió la referencia de dos formas distintas."
-                  : "Cuenta + monto + fecha, ignorando la referencia. Encuentra el movimiento que se cargó a mano y después llegó otra vez en el estado de cuenta. Revisá uno por uno: acá sí pueden aparecer dos cobros distintos del mismo monto el mismo día."}
+                  ? "Igual, pero comparando solo los últimos 6 dígitos de la referencia en todas las cuentas. Encuentra el mismo movimiento cuando el banco escribió la referencia de dos formas distintas — el caso típico de Mercantil."
+                  : dupModo === "exacto"
+                  ? "El criterio anterior MÁS el monto. Es la regla con la que el importador descarta lo repetido: la más estricta, y la que menos falsos positivos da."
+                  : "Banco + tipo + monto + fecha, ignorando la referencia. Encuentra el movimiento que se cargó a mano y después llegó otra vez en el estado de cuenta. Revisá uno por uno: acá sí pueden aparecer dos cobros distintos del mismo monto el mismo día."}
               </div>
 
               {dupGrupos.map((g) => {
@@ -3567,14 +3573,27 @@ function TxnsTab({ txns, accounts, cur, onAdd, onEdit, onDelete, onDeleteMany, o
                           Las {g.items.length} en la misma cuenta y {g.kind === "income" ? "las dos entrando" : "las dos saliendo"}: no es un traslado.
                         </span>
                       </span>
-                      <span style={{ fontFamily: MONO, fontSize: 13, fontWeight: 600, flexShrink: 0, color: g.kind === "income" ? T.green : T.red }}>
-                        {g.kind === "income" ? "+" : "−"}{money(g.amount, cur2)}
+                      <span style={{ fontFamily: MONO, fontSize: 13, fontWeight: 600, flexShrink: 0, textAlign: "right", color: g.kind === "income" ? T.green : T.red }}>
+                        {g.montosDistintos
+                          ? g.items.map((t) => (
+                              <span key={t.id} style={{ display: "block" }}>
+                                {g.kind === "income" ? "+" : "−"}{money(t.amount, cur2)}
+                              </span>
+                            ))
+                          : <>{g.kind === "income" ? "+" : "−"}{money(g.amount, cur2)}</>}
                       </span>
                     </div>
 
                     {g.mismaCarga && (
                       <div style={{ fontSize: 11, color: T.gold, marginBottom: 6 }}>
                         Las {g.items.length} entraron en la misma carga: el archivo traía la línea repetida.
+                      </div>
+                    )}
+                    {g.montosDistintos && (
+                      <div style={{ fontSize: 11, color: T.gold, marginBottom: 6, lineHeight: 1.5 }}>
+                        Los montos no coinciden. Comparten referencia, banco, tipo y fecha, pero el
+                        importe cambia: en Banesco la comisión viaja con la MISMA referencia que su
+                        transferencia. Revisalo antes de borrar — por eso no viene marcado.
                       </div>
                     )}
                     {g.patasTraslado > 0 && (
@@ -7770,25 +7789,47 @@ function buildTxnIndex(txns, accounts) {
    Esta verificación se corre A MANO desde la pestaña Movimientos y no borra
    nada por su cuenta: agrupa, propone cuál conservar y espera confirmación.
 
-   Modos (de más estricto a más laxo):
-     "exacto" → cuenta + referencia + monto + fecha  (la misma regla del importador)
+   Modos:
+     "ref"    → banco + referencia + tipo + fecha            ← el criterio de la casa
      "ref6"   → igual, pero comparando los ÚLTIMOS 6 dígitos de la referencia
                 en TODAS las cuentas, no solo en las Mercantil
-     "monto"  → cuenta + monto + fecha, ignorando referencia y descripción
+     "exacto" → el anterior MÁS el monto (la misma regla del importador)
+     "monto"  → banco + tipo + monto + fecha, ignorando la referencia
 
-   El tipo (ingreso/egreso) SIEMPRE forma parte de la clave: un cargo y su
-   reverso comparten referencia, monto y fecha, y no son un duplicado. */
+   El BANCO y el TIPO (ingreso/egreso) están en la clave en los cuatro modos: un
+   traslado entre cuentas comparte referencia y fecha con su contraparte, pero
+   sale de una cuenta y entra en otra, y un reverso comparte todo menos el signo.
+   Ninguno de los dos es un duplicado. */
+
+/* Descripción del banco reducida a algo comparable. Solo se usa cuando la línea
+   no trae referencia utilizable: ahí es lo único que distingue un movimiento
+   de otro. */
+function descKeyDeTxn(t) {
+  return stmtNorm(t.bankDesc || t.motivo).replace(/\s+/g, " ").slice(0, 40);
+}
 function txnDupKey(t, accounts, modo) {
   if (!t || !t.accountId) return "";
+  // El id de cuenta abre la clave y el signo la cierra, en los cuatro modos: el
+  // diagnóstico de traslados los recorta de las puntas para reagrupar.
   const signo = t.kind === "income" ? "i" : "e";
   const cents = Math.round((t.amount || 0) * 100);
-  // El signo va SIEMPRE al final de la clave, igual que en los otros modos:
-  // el diagnóstico de traslados lo recorta de ahí para reagrupar.
   if (modo === "monto") return `${t.accountId}|m|${t.date}|${cents}|${signo}`;
+
+  const esMerc = modo === "ref6" ? true : cuentaEsMercantil(accounts, t.accountId);
+
+  if (modo === "ref" || modo === "ref6") {
+    const rk = refKeyDeCuenta(t.ref, esMerc);
+    // Sin referencia utilizable no hay nada que comparar, así que la identidad
+    // pasa a ser la descripción del banco y ahí el monto sí hace falta: dos
+    // comisiones distintas del mismo día quedarían pegadas sin él.
+    if (!rk) return `${t.accountId}|h|${t.date}|${cents}|${descKeyDeTxn(t)}|${signo}`;
+    return `${t.accountId}|r|${rk}|${t.date}|${signo}`;
+  }
+
   const base = stmtKeyOf(
     t.accountId,
     { ref: t.ref, date: t.date, amount: t.amount, desc: t.bankDesc || t.motivo },
-    modo === "ref6" ? true : cuentaEsMercantil(accounts, t.accountId)
+    esMerc
   );
   return base ? `${base}|${signo}` : "";
 }
@@ -7820,7 +7861,7 @@ function esParDeTraslado(a, b) {
    para que se vea que se miraron y se descartaron a propósito. */
 function detectarDuplicados(lista, accounts, opts) {
   const o = opts || {};
-  const modo = o.modo || "exacto";
+  const modo = o.modo || "ref";
   const bolsas = new Map();
   (lista || []).forEach((t) => {
     const k = txnDupKey(t, accounts, modo);
@@ -7883,6 +7924,11 @@ function detectarDuplicados(lista, accounts, opts) {
       amount: orden[0].amount,
       kind: orden[0].kind,
       ref: conRef ? conRef.ref : "",
+      // Montos distintos dentro del grupo: comparten referencia y fecha pero no
+      // el importe. En Banesco la comisión de una transferencia viaja con la
+      // MISMA referencia que la transferencia, así que esto puede no ser un
+      // duplicado. No se preselecciona: lo decide el usuario.
+      montosDistintos: new Set(orden.map((t) => Math.round((t.amount || 0) * 100))).size > 1,
       // Copias que arrastran una ficha de Divisas o un abono: borrarlas se
       // lleva también esa ficha, así que se avisa antes.
       atadas: orden.filter((t) => t.divisaId || t.abonoId).length,
