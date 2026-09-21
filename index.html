@@ -33,7 +33,7 @@ const { useState, useEffect, useRef, useMemo } = React;
 
 /* Versión de compilación. Sirve para confirmar de un vistazo qué build está
    corriendo en pantalla (útil para detectar caché vieja de la PWA). */
-const BUILD = "v5.7 · Verificación de duplicados y doble barrera anti-duplicado al importar · 2026-09-21";
+const BUILD = "v5.7 · Verificación de duplicados (respeta traslados y reversos) y doble barrera al importar · 2026-09-21";
 try { console.log("[Patrimonio] build:", BUILD); } catch (e) {}
 
 /* ─────────────────────────────  Tokens de diseño  ───────────────────────────── */
@@ -3070,19 +3070,20 @@ function TxnsTab({ txns, accounts, cur, onAdd, onEdit, onDelete, onDeleteMany, o
      completo en cada render y —sobre todo— el resultado no se mueve debajo de
      la mano mientras se está eligiendo qué borrar. */
   const [dupModo, setDupModo] = useState("exacto");
-  const [dupGrupos, setDupGrupos] = useState(null);   // null = todavía no se corrió
+  const [dupScan, setDupScan] = useState(null);       // null = todavía no se corrió
   const [dupSel, setDupSel] = useState({});           // id -> true (se va a borrar)
   const [dupConfirm, setDupConfirm] = useState(false);
   const [dupResumen, setDupResumen] = useState("");
+  const dupGrupos = dupScan ? dupScan.grupos : null;
 
   function correrVerificacion(modo) {
     const m = modo || dupModo;
-    const grupos = detectarDuplicados(txns, accounts, { modo: m });
+    const scan = detectarDuplicados(txns, accounts, { modo: m });
     // Preselección: se marca todo MENOS la copia que conviene conservar.
     const sel = {};
-    grupos.forEach((g) => g.sobranIds.forEach((id) => { sel[id] = true; }));
+    scan.grupos.forEach((g) => g.sobranIds.forEach((id) => { sel[id] = true; }));
     setDupModo(m);
-    setDupGrupos(grupos);
+    setDupScan(scan);
     setDupSel(sel);
     setDupConfirm(false);
     setDupResumen("");
@@ -3107,7 +3108,7 @@ function TxnsTab({ txns, accounts, cur, onAdd, onEdit, onDelete, onDeleteMany, o
     if (!onDeleteMany || dupMarcados.length === 0 || dupGrupoVacio) return;
     const n = dupMarcados.length;
     onDeleteMany(dupMarcados);
-    setDupGrupos(null);
+    setDupScan(null);
     setDupSel({});
     setDupConfirm(false);
     setDupResumen(`Se eliminaron ${n} movimiento(s) duplicado(s). Volvé a verificar para confirmar que no quedó nada.`);
@@ -3482,27 +3483,42 @@ function TxnsTab({ txns, accounts, cur, onAdd, onEdit, onDelete, onDeleteMany, o
       {canWrite && onDeleteMany && (
         <div style={{ marginBottom: 12 }}>
           <button
-            onClick={() => (dupGrupos === null ? correrVerificacion() : setDupGrupos(null))}
+            onClick={() => (dupScan === null ? correrVerificacion() : setDupScan(null))}
             style={{ ...rowCard, width: "100%", cursor: "pointer", justifyContent: "center", gap: 8, color: T.violet, fontWeight: 600, fontSize: 14 }}
           >
-            {dupGrupos === null ? "⟳ Verificar duplicados" : "Cerrar verificación"}
+            {dupScan === null ? "⟳ Verificar duplicados" : "Cerrar verificación"}
           </button>
 
-          {dupResumen && dupGrupos === null && (
+          {dupResumen && dupScan === null && (
             <div style={{ fontSize: 12.5, color: T.green, lineHeight: 1.5, marginTop: 8, padding: "0 2px" }}>
               {dupResumen}
             </div>
           )}
 
-          {dupGrupos !== null && (
+          {dupScan !== null && (
             <div style={{ background: T.bg2, border: `1px solid ${dupGrupos.length ? T.red : T.green}`, borderRadius: 14, padding: "13px 15px", marginTop: 8 }}>
               <div style={{ fontSize: 14, fontWeight: 700, color: dupGrupos.length ? T.red : T.green, marginBottom: 4 }}>
                 {dupGrupos.length === 0
                   ? "Sin duplicados con este criterio"
                   : `${dupGrupos.length} grupo(s) duplicado(s) · ${dupGrupos.reduce((n, g) => n + g.sobranIds.length, 0)} de más`}
               </div>
-              <div style={{ fontSize: 12, color: T.mut, lineHeight: 1.5, marginBottom: 10 }}>
+              <div style={{ fontSize: 12, color: T.mut, lineHeight: 1.5, marginBottom: 8 }}>
                 Se revisaron {txns.length} movimiento(s). Nada se borra hasta que lo confirmes.
+              </div>
+
+              {/* Lo que comparte referencia pero NO es un duplicado. Se informa
+                  siempre —incluso en cero— para que quede claro que el chequeo
+                  distingue un traslado de una carga repetida. */}
+              <div style={{ background: T.card, border: `1px solid ${T.lineSoft}`, borderRadius: 11, padding: "9px 11px", marginBottom: 10 }}>
+                <div style={{ fontSize: 11.5, color: T.blue, lineHeight: 1.5 }}>
+                  ⇄ {dupScan.traslados} traslado(s) entre cuentas quedaron fuera
+                  {dupScan.reversos > 0 ? `, y ${dupScan.reversos} reverso(s) del banco` : ""}.
+                </div>
+                <div style={{ fontSize: 11, color: T.mut2, lineHeight: 1.5, marginTop: 3 }}>
+                  Comparten referencia, fecha y monto, pero uno sale y el otro entra. La cuenta y el
+                  signo forman parte de la comparación, así que las dos patas de un traslado nunca
+                  caen en el mismo grupo: un duplicado es la MISMA cuenta y el MISMO signo.
+                </div>
               </div>
 
               {/* Criterio de comparación: de más estricto a más laxo */}
@@ -3547,6 +3563,9 @@ function TxnsTab({ txns, accounts, cur, onAdd, onEdit, onDelete, onDeleteMany, o
                         <span style={{ display: "block", fontSize: 11.5, color: T.mut2, fontFamily: MONO }}>
                           {g.ref ? `ref ${g.ref}` : "sin referencia"} · {g.items.length} copias
                         </span>
+                        <span style={{ display: "block", fontSize: 11, color: T.mut2, lineHeight: 1.5, marginTop: 2 }}>
+                          Las {g.items.length} en la misma cuenta y {g.kind === "income" ? "las dos entrando" : "las dos saliendo"}: no es un traslado.
+                        </span>
                       </span>
                       <span style={{ fontFamily: MONO, fontSize: 13, fontWeight: 600, flexShrink: 0, color: g.kind === "income" ? T.green : T.red }}>
                         {g.kind === "income" ? "+" : "−"}{money(g.amount, cur2)}
@@ -3556,6 +3575,12 @@ function TxnsTab({ txns, accounts, cur, onAdd, onEdit, onDelete, onDeleteMany, o
                     {g.mismaCarga && (
                       <div style={{ fontSize: 11, color: T.gold, marginBottom: 6 }}>
                         Las {g.items.length} entraron en la misma carga: el archivo traía la línea repetida.
+                      </div>
+                    )}
+                    {g.patasTraslado > 0 && (
+                      <div style={{ fontSize: 11, color: T.blue, marginBottom: 6, lineHeight: 1.5 }}>
+                        Copia(s) justificada(s) como {TRASLADO_MOTIVO}: dejá una, que es la que empareja
+                        con la otra cuenta.
                       </div>
                     )}
 
@@ -7757,7 +7782,9 @@ function txnDupKey(t, accounts, modo) {
   if (!t || !t.accountId) return "";
   const signo = t.kind === "income" ? "i" : "e";
   const cents = Math.round((t.amount || 0) * 100);
-  if (modo === "monto") return `${t.accountId}|m|${signo}|${t.date}|${cents}`;
+  // El signo va SIEMPRE al final de la clave, igual que en los otros modos:
+  // el diagnóstico de traslados lo recorta de ahí para reagrupar.
+  if (modo === "monto") return `${t.accountId}|m|${t.date}|${cents}|${signo}`;
   const base = stmtKeyOf(
     t.accountId,
     { ref: t.ref, date: t.date, amount: t.amount, desc: t.bankDesc || t.motivo },
@@ -7774,6 +7801,23 @@ function dupPuntaje(t) {
   return (t.divisaId || t.abonoId ? 8 : 0) + (t.project ? 4 : 0) + (!t.pending && t.motivo ? 2 : 0) + (t.traslado ? 1 : 0);
 }
 
+/* ¿Estos dos movimientos son las dos patas de un traslado entre cuentas?
+   Un traslado comparte referencia, fecha y monto con su contraparte, pero sale
+   de UNA cuenta y entra en OTRA. Es exactamente el perfil que un chequeo
+   ingenuo confundiría con un duplicado, y es lo que esta función impide. */
+function esParDeTraslado(a, b) {
+  if (!a || !b) return false;
+  if (a.accountId === b.accountId) return false;   // el traslado cruza cuentas
+  if (a.kind === b.kind) return false;             // una pata sale, la otra entra
+  return true;
+}
+
+/* Devuelve { grupos, descartados }.
+
+   `descartados` cuenta las parejas que comparten referencia, fecha y monto pero
+   NO son duplicados: traslados entre cuentas (cuentas distintas, signos
+   opuestos) y reversos (misma cuenta, signos opuestos). Se informan en pantalla
+   para que se vea que se miraron y se descartaron a propósito. */
 function detectarDuplicados(lista, accounts, opts) {
   const o = opts || {};
   const modo = o.modo || "exacto";
@@ -7785,10 +7829,46 @@ function detectarDuplicados(lista, accounts, opts) {
     bolsas.get(k).push(t);
   });
 
+  /* ─────────  Lo que se descarta a propósito  ─────────
+     Se reagrupa ignorando cuenta y signo: lo que cae junto acá pero quedó
+     separado arriba es justamente un traslado o un reverso. */
+  const sinCuentaNiSigno = new Map();
+  (lista || []).forEach((t) => {
+    if (!t || !t.accountId) return;
+    const k = txnDupKey(t, accounts, modo);
+    if (!k) return;
+    // Se le sacan a la clave el id de cuenta (delante) y el signo (al final).
+    const laxa = k.split("|").slice(1, -1).join("|");
+    if (!sinCuentaNiSigno.has(laxa)) sinCuentaNiSigno.set(laxa, []);
+    sinCuentaNiSigno.get(laxa).push(t);
+  });
+  let traslados = 0, reversos = 0;
+  sinCuentaNiSigno.forEach((items) => {
+    if (items.length < 2) return;
+    const vistos = new Set();
+    for (let i = 0; i < items.length; i++) {
+      for (let j = i + 1; j < items.length; j++) {
+        const a = items[i], b = items[j];
+        if (vistos.has(a.id) || vistos.has(b.id)) continue;
+        if (a.kind === b.kind) continue;             // mismo signo: no es ni traslado ni reverso
+        vistos.add(a.id); vistos.add(b.id);
+        if (esParDeTraslado(a, b)) traslados++; else reversos++;
+      }
+    }
+  });
+
   const grupos = [];
   bolsas.forEach((items, key) => {
     if (items.length < 2) return;
-    const orden = items.slice().sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0) || String(a.id).localeCompare(String(b.id)));
+    /* Red de seguridad explícita. La clave ya incluye cuenta y signo, así que
+       esto no debería recortar nada; está para que un cambio futuro en la clave
+       no pueda, en silencio, proponer borrar la pata de un traslado. */
+    const ref0 = items[0];
+    const mismos = items.filter((t) => t.accountId === ref0.accountId && t.kind === ref0.kind);
+    if (mismos.length < 2) return;
+    if (mismos.some((t) => esParDeTraslado(t, ref0))) return;
+
+    const orden = mismos.slice().sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0) || String(a.id).localeCompare(String(b.id)));
     let conservar = orden[0];
     orden.forEach((t) => { if (dupPuntaje(t) > dupPuntaje(conservar)) conservar = t; });
     const conRef = orden.find((t) => t.ref);
@@ -7806,6 +7886,9 @@ function detectarDuplicados(lista, accounts, opts) {
       // Copias que arrastran una ficha de Divisas o un abono: borrarlas se
       // lleva también esa ficha, así que se avisa antes.
       atadas: orden.filter((t) => t.divisaId || t.abonoId).length,
+      // Copias que ya están justificadas como traslado: borrar una deja a la
+      // otra pata sin pareja, así que se avisa.
+      patasTraslado: orden.filter((t) => t.traslado).length,
       // Todas las copias vinieron del mismo archivo/carga: señal de que el
       // estado de cuenta se subió dos veces.
       mismaCarga: orden.every((t) => t.importedAt && t.importedAt === orden[0].importedAt),
@@ -7813,7 +7896,7 @@ function detectarDuplicados(lista, accounts, opts) {
   });
 
   grupos.sort((a, b) => String(b.fecha).localeCompare(String(a.fecha)) || String(a.key).localeCompare(String(b.key)));
-  return grupos;
+  return { grupos, traslados, reversos };
 }
 
 function parseBankRows(rows) {
