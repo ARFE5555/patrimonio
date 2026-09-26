@@ -1826,16 +1826,15 @@ function AppMain({ session, role, signOut }) {
       const vistos = new Set(remotos.map((t) => t.id));
       return [...remotos, ...(locales || []).filter((t) => !vistos.has(t.id))];
     };
-    const budget = buildTxnIndex(unir(txns), accounts);
-    const nuevos = [];
-    let omitidos = 0;
-    ops.forEach((op) => {
-      const k = clave(op);
-      const left = budget.get(k) || 0;
-      if (left > 0) { budget.set(k, left - 1); omitidos++; return; }
-      nuevos.push(construir(op, nuevos.length));
+    const plan = planStatementImport(unir(txns), ops, accountId, esMerc, accounts);
+    const nuevos = plan.nuevas.map((op, i) => construir(op, i));
+    const omitidos = plan.repetidas;
+    // Líneas ya registradas cuyo saldo/fila se corrige con este archivo (día completo)
+    const parches = new Map();
+    plan.refresh.forEach((r) => {
+      parches.set(r.id, { bankBalance: r.bankBalance, stmtRow: r.stmtRow, importFile: (meta && meta.fileName) || undefined });
     });
-    if (nuevos.length === 0) return { added: 0, omitidos, traslados: 0 };
+    if (nuevos.length === 0 && parches.size === 0) return { added: 0, omitidos, traslados: 0, saldosActualizados: 0 };
 
     /* Traslados entre cuentas: si alguna de las líneas recién cargadas comparte
        referencia con un movimiento de OTRA cuenta, las dos patas se justifican
@@ -1855,14 +1854,24 @@ function AppMain({ session, role, signOut }) {
         if (left > 0) { bud.set(k, left - 1); return; }
         limpios.push(t);
       });
-      if (limpios.length === 0) return prev;
-      const combinado = [...limpios, ...prev];
+      let base = prev;
+      let parchados = 0;
+      if (parches.size) {
+        base = prev.map((t) => {
+          const p = parches.get(t.id);
+          if (!p) return t;
+          parchados++;
+          return { ...t, ...p };
+        });
+      }
+      if (limpios.length === 0) return parchados ? base : prev;
+      const combinado = [...limpios, ...base];
       const auto = autoTraslados(combinado, accounts);
       return auto.tocados ? auto.lista : combinado;
     });
     // Solo para el resumen de la importación
-    const previstos = autoTraslados([...nuevos, ...txns], accounts).tocados;
-    return { added: nuevos.length, omitidos, traslados: previstos };
+    const previstos = nuevos.length ? autoTraslados([...nuevos, ...txns], accounts).tocados : 0;
+    return { added: nuevos.length, omitidos, traslados: previstos, saldosActualizados: parches.size };
   }
 
   /* Borrado en lote, para la verificación de duplicados. Arrastra lo mismo que
@@ -4280,26 +4289,20 @@ function StatementImportSheet({ open, onClose, accounts, cur, txns, onImport, on
   const comUnidas = useMemo(() => ops.reduce((s, o) => s + (o.comLines || 0), 0), [ops]);
   const refCompartidas = useMemo(() => ops.filter((o) => o.refCompartida).length, [ops]);
 
-  const existing = useMemo(() => buildTxnIndex(txns, accounts), [txns, accounts]);
   // Mercantil: la referencia se valida por los últimos 6 dígitos (el banco la
   // escribe de dos formas distintas y si no, la misma línea entra dos veces).
   const esMerc = useMemo(() => cuentaEsMercantil(accounts, accountId), [accounts, accountId]);
   const analysis = useMemo(() => {
-    if (!accountId) return { nuevas: [], repetidas: 0, sinRef: 0 };
-    // Presupuesto por clave: cuántas veces ya está registrada. Cada línea del
-    // archivo consume una; cuando se agota, la línea es genuinamente nueva.
-    const budget = new Map(existing);
-    const nuevas = [];
-    let repetidas = 0;
+    if (!accountId) return { nuevas: [], repetidas: 0, sinRef: 0, refresh: [] };
+    // Cada línea del archivo consume una ya registrada con la misma clave;
+    // cuando se agotan, la línea es genuinamente nueva. Las repetidas de días
+    // completos pueden traer el saldo correcto del banco (ver planStatementImport).
     const sinRef = ops.filter((o) => !o.refKey).length;
-    ops.forEach((op) => {
-      const k = stmtKeyOf(accountId, op, esMerc);
-      const left = budget.get(k) || 0;
-      if (left > 0) { budget.set(k, left - 1); repetidas++; return; }
-      nuevas.push(op);
-    });
-    return { nuevas, repetidas, sinRef };
-  }, [ops, accountId, existing, esMerc]);
+    const plan = planStatementImport(txns, ops, accountId, esMerc, accounts);
+    return { nuevas: plan.nuevas, repetidas: plan.repetidas, sinRef, refresh: plan.refresh };
+  }, [ops, accountId, txns, accounts, esMerc]);
+  const hayAlgo = analysis.nuevas.length > 0 || analysis.refresh.length > 0;
+  const diasRefresh = useMemo(() => new Set(analysis.refresh.map((r) => r.date)).size, [analysis.refresh]);
 
   const acct = usable.find((a) => a.id === accountId);
   const acctCur = (acct && acct.currency) || cur;
@@ -4343,11 +4346,13 @@ function StatementImportSheet({ open, onClose, accounts, cur, txns, onImport, on
   }
 
   async function doImport() {
-    if (!accountId || analysis.nuevas.length === 0) return;
+    if (!accountId || !hayAlgo) return;
     if (importando.current) return;
     importando.current = true;
     setBusy(true); setErr(""); setMsg("Verificando contra lo ya cargado…");
-    const res = await onImport(accountId, analysis.nuevas, { fileName });
+    // Se manda el archivo entero: importStatement vuelve a separar lo nuevo de lo
+    // repetido contra la nube, y a lo repetido de días completos le corrige el saldo.
+    const res = await onImport(accountId, ops, { fileName });
     setBusy(false);
 
     /* La verificación contra el servidor no se pudo hacer: no se cargó nada.
@@ -4365,7 +4370,7 @@ function StatementImportSheet({ open, onClose, accounts, cur, txns, onImport, on
        coincide, falta cargar algo (casi siempre el saldo inicial de la cuenta). */
     const delta = (t) => (t.kind === "income" ? (t.amount || 0) : -(t.amount || 0)) - (t.commission || 0);
     const previos = (txns || []).filter((t) => t.accountId === accountId).reduce((s, t) => s + delta(t), 0);
-    const entrantes = analysis.nuevas.reduce((s, o) => s + delta(o), 0);
+    const entrantes = (res && res.added ? analysis.nuevas : []).reduce((s, o) => s + delta(o), 0);
     setDone({
       ...res,
       saldoResultante: ((acct && acct.opening) || 0) + previos + entrantes,
@@ -4473,6 +4478,14 @@ function StatementImportSheet({ open, onClose, accounts, cur, txns, onImport, on
                   <br />
                   <span style={{ color: T.gold }}>
                     {done.omitidos} línea(s) se descartaron porque ya estaban registradas.
+                  </span>
+                </>
+              )}
+              {done.saldosActualizados > 0 && (
+                <>
+                  <br />
+                  <span style={{ color: T.blue }}>
+                    Se corrigió el saldo del banco de {done.saldosActualizados} línea(s) ya registradas, con el de este archivo (días completos). El Cierre diario queda comparando contra el saldo real de cierre.
                   </span>
                 </>
               )}
@@ -4628,6 +4641,9 @@ function StatementImportSheet({ open, onClose, accounts, cur, txns, onImport, on
                   Movimientos resultantes: <b style={{ color: T.text }}>{ops.length}</b><br />
                   Nuevos a importar: <b style={{ color: T.green }}>{analysis.nuevas.length}</b><br />
                   Ya registrados (se omiten): <b style={{ color: T.mut2 }}>{analysis.repetidas}</b>
+                  {analysis.refresh.length > 0 && (
+                    <><br />Saldos del banco a corregir: <b style={{ color: T.blue }}>{analysis.refresh.length}</b> en {diasRefresh} día(s)</>
+                  )}
                   {analysis.sinRef > 0 && (<><br />Sin referencia del banco: <b style={{ color: T.gold }}>{analysis.sinRef}</b></>)}
                   {esMerc && (
                     <>
@@ -4712,10 +4728,11 @@ function StatementImportSheet({ open, onClose, accounts, cur, txns, onImport, on
                 )}
               </div>
 
-              <PrimaryBtn color={T.green} disabled={busy || analysis.nuevas.length === 0 || !accountId || creando} onClick={doImport}>
+              <PrimaryBtn color={T.green} disabled={busy || !hayAlgo || !accountId || creando} onClick={doImport}>
                 {busy ? "Verificando…"
                   : !accountId ? "Elegí la cuenta destino"
-                  : analysis.nuevas.length === 0 ? "Nada nuevo para importar"
+                  : !hayAlgo ? "Nada nuevo para importar"
+                  : analysis.nuevas.length === 0 ? `Corregir saldos de ${diasRefresh} día(s) en ${acct ? acct.name : ""}`
                   : `Importar ${analysis.nuevas.length} movimiento(s) en ${acct ? acct.name : ""}`}
               </PrimaryBtn>
             </>
@@ -7851,6 +7868,56 @@ function stmtKeyOf(accountId, op, esMerc) {
   const rk = refKeyDeCuenta(op.ref || op.refKey, esMerc);
   if (rk) return `${accountId}|r|${rk}|${op.date}|${cents}`;
   return `${accountId}|h|${op.date}|${cents}|${stmtNorm(op.desc).replace(/\s+/g, " ").slice(0, 40)}`;
+}
+
+/* Plan de una importación: qué líneas del archivo son nuevas y a cuáles de las
+   ya registradas hay que ACTUALIZARLES el saldo del banco.
+
+   Por qué hace falta lo segundo: el Cierre diario toma como saldo del banco de
+   un día el de la línea con el stmtRow más alto. Si ese día se cargó primero
+   con un archivo PARCIAL (bajado a media mañana) y después con el estado
+   completo, las líneas repetidas se descartaban y se quedaban con el saldo y la
+   fila del archivo parcial: el día terminaba comparándose contra un saldo
+   intermedio y aparecía un descuadre que no existe (y el mismo monto al revés
+   al día siguiente).
+
+   Regla: si el archivo nuevo trae fechas POSTERIORES a la del movimiento, ese
+   día está completo en el archivo, así que su saldo y su fila mandan. El último
+   día del archivo puede estar a medias y no se toca: un archivo parcial nunca
+   pisa a uno completo. */
+function planStatementImport(existingTxns, ops, accountId, esMerc, accounts) {
+  const pool = new Map();
+  (existingTxns || []).forEach((t) => {
+    if (!t || t.accountId !== accountId) return;
+    const k = stmtKeyOf(
+      t.accountId,
+      { ref: t.ref, date: t.date, amount: t.amount, desc: t.bankDesc || t.motivo },
+      cuentaEsMercantil(accounts, t.accountId)
+    );
+    if (!pool.has(k)) pool.set(k, []);
+    pool.get(k).push(t);
+  });
+  // Líneas idénticas (mismo monto y referencia el mismo día): se emparejan en
+  // orden de fila, para que cada una reciba el saldo que le corresponde.
+  pool.forEach((lista) => lista.sort((a, b) => (a.stmtRow == null ? 1e9 : a.stmtRow) - (b.stmtRow == null ? 1e9 : b.stmtRow)));
+
+  const fechas = (ops || []).map((o) => o.date).filter(Boolean).sort();
+  const ultimoDia = fechas.length ? fechas[fechas.length - 1] : "";
+  const nuevas = [];
+  const refresh = [];
+  let repetidas = 0;
+  (ops || []).forEach((op) => {
+    const k = stmtKeyOf(accountId, op, esMerc);
+    const lista = pool.get(k);
+    if (!lista || !lista.length) { nuevas.push(op); return; }
+    const t = lista.shift();
+    repetidas++;
+    const diaCompleto = op.date && op.date < ultimoDia;
+    if (!diaCompleto || op.bankBalance == null || op.rowNum == null) return;
+    if (t.bankBalance === op.bankBalance && t.stmtRow === op.rowNum) return;
+    refresh.push({ id: t.id, date: op.date, bankBalance: op.bankBalance, stmtRow: op.rowNum });
+  });
+  return { nuevas, repetidas, refresh };
 }
 
 /* Índice de lo ya registrado, para no duplicar al reimportar el mismo estado.
