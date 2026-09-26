@@ -885,7 +885,11 @@ function numVE(s) {
   if (s == null) return NaN;
   let t = String(s).replace(/[^\d.,-]/g, "").trim();
   if (t === "") return NaN;
-  if (t.indexOf(".") >= 0 && t.indexOf(",") >= 0) t = t.replace(/\./g, "").replace(",", ".");
+  if (t.indexOf(".") >= 0 && t.indexOf(",") >= 0) {
+    // El separador que aparece ÚLTIMO es el decimal: "1.234,56" (VE) o "1,234.56" (US)
+    if (t.lastIndexOf(",") > t.lastIndexOf(".")) t = t.replace(/\./g, "").replace(",", ".");
+    else t = t.replace(/,/g, "");
+  }
   else if (t.indexOf(",") >= 0) t = t.replace(",", ".");
   return parseFloat(t);
 }
@@ -1834,7 +1838,13 @@ function AppMain({ session, role, signOut }) {
     plan.refresh.forEach((r) => {
       parches.set(r.id, { bankBalance: r.bankBalance, stmtRow: r.stmtRow, importFile: (meta && meta.fileName) || undefined });
     });
-    if (nuevos.length === 0 && parches.size === 0) return { added: 0, omitidos, traslados: 0, saldosActualizados: 0 };
+    // Saldos de cierre del banco por día (días completos del archivo)
+    const cierres = cierresDeArchivo(ops);
+    const cierresNuevos = cierresCambian(accounts.find((a) => a.id === accountId), cierres);
+    if (cierresNuevos) {
+      setAccounts((prev) => prev.map((a) => (a.id === accountId ? { ...a, cierresBanco: { ...(a.cierresBanco || {}), ...cierres } } : a)));
+    }
+    if (nuevos.length === 0 && parches.size === 0) return { added: 0, omitidos, traslados: 0, saldosActualizados: 0, cierresGuardados: cierresNuevos };
 
     /* Traslados entre cuentas: si alguna de las líneas recién cargadas comparte
        referencia con un movimiento de OTRA cuenta, las dos patas se justifican
@@ -1846,12 +1856,21 @@ function AppMain({ session, role, signOut }) {
          mismo estado de cuenta desde otro dispositivo, o el botón pudo
          dispararse dos veces. `prev` es lo único garantizado al día: sin esta
          pasada, esos casos duplican el período completo. */
-      const bud = buildTxnIndex(unir(prev), accounts);
+      /* Cupo por clave = veces que la trae el archivo − veces que ya está.
+         Antes se comparaba cada línea nueva solo contra lo existente, y si el
+         archivo traía DOS líneas idénticas (mismo pago dos veces, misma
+         referencia) y la app tenía una, la segunda se descartaba igual. */
+      const ya = buildTxnIndex(unir(prev), accounts);
+      const enArchivo = new Map();
+      ops.forEach((op) => { const k = clave(op); enArchivo.set(k, (enArchivo.get(k) || 0) + 1); });
+      const cupo = new Map();
+      enArchivo.forEach((n, k) => cupo.set(k, Math.max(0, n - (ya.get(k) || 0))));
       const limpios = [];
       nuevos.forEach((t) => {
         const k = clave(t);
-        const left = bud.get(k) || 0;
-        if (left > 0) { bud.set(k, left - 1); return; }
+        const left = cupo.get(k) || 0;
+        if (left <= 0) return;
+        cupo.set(k, left - 1);
         limpios.push(t);
       });
       let base = prev;
@@ -1871,7 +1890,7 @@ function AppMain({ session, role, signOut }) {
     });
     // Solo para el resumen de la importación
     const previstos = nuevos.length ? autoTraslados([...nuevos, ...txns], accounts).tocados : 0;
-    return { added: nuevos.length, omitidos, traslados: previstos, saldosActualizados: parches.size };
+    return { added: nuevos.length, omitidos, traslados: previstos, saldosActualizados: parches.size, cierresGuardados: cierresNuevos };
   }
 
   /* Borrado en lote, para la verificación de duplicados. Arrastra lo mismo que
@@ -4023,6 +4042,10 @@ function CierreDiarioTab({ txns, accounts, cur, onVerDia }) {
        pinta de rojo el mes entero y esconde dónde está el problema real.
        `nuevo` es lo que se descuadró ESE día, ya descontado el arrastre. */
     const lista = Array.from(m.values()).sort((a, b) => (a.date < b.date ? -1 : 1));
+    // Si se guardó el saldo de cierre del estado de cuenta para ese día, manda
+    // sobre la heurística de la última línea.
+    const cierres = acct.cierresBanco || {};
+    lista.forEach((d) => { if (cierres[d.date] != null) { d.bank = cierres[d.date]; d.bankRef = null; } });
     let arrastre = 0;
     lista.forEach((d) => {
       if (d.bank == null) { d.dif = null; d.nuevo = null; return; }
@@ -4301,7 +4324,9 @@ function StatementImportSheet({ open, onClose, accounts, cur, txns, onImport, on
     const plan = planStatementImport(txns, ops, accountId, esMerc, accounts);
     return { nuevas: plan.nuevas, repetidas: plan.repetidas, sinRef, refresh: plan.refresh };
   }, [ops, accountId, txns, accounts, esMerc]);
-  const hayAlgo = analysis.nuevas.length > 0 || analysis.refresh.length > 0;
+  const cierresArch = useMemo(() => cierresDeArchivo(ops), [ops]);
+  const cierresPend = useMemo(() => cierresCambian(accounts.find((a) => a.id === accountId), cierresArch), [accounts, accountId, cierresArch]);
+  const hayAlgo = analysis.nuevas.length > 0 || analysis.refresh.length > 0 || cierresPend > 0;
   const diasRefresh = useMemo(() => new Set(analysis.refresh.map((r) => r.date)).size, [analysis.refresh]);
 
   const acct = usable.find((a) => a.id === accountId);
@@ -4481,6 +4506,14 @@ function StatementImportSheet({ open, onClose, accounts, cur, txns, onImport, on
                   </span>
                 </>
               )}
+              {done.cierresGuardados > 0 && (
+                <>
+                  <br />
+                  <span style={{ color: T.blue }}>
+                    Se guardó el saldo de cierre del banco de {done.cierresGuardados} día(s). El Cierre diario compara contra ese saldo.
+                  </span>
+                </>
+              )}
               {done.saldosActualizados > 0 && (
                 <>
                   <br />
@@ -4644,6 +4677,9 @@ function StatementImportSheet({ open, onClose, accounts, cur, txns, onImport, on
                   {analysis.refresh.length > 0 && (
                     <><br />Saldos del banco a corregir: <b style={{ color: T.blue }}>{analysis.refresh.length}</b> en {diasRefresh} día(s)</>
                   )}
+                  {cierresPend > 0 && (
+                    <><br />Saldos de cierre diario a guardar: <b style={{ color: T.blue }}>{cierresPend}</b> día(s)</>
+                  )}
                   {analysis.sinRef > 0 && (<><br />Sin referencia del banco: <b style={{ color: T.gold }}>{analysis.sinRef}</b></>)}
                   {esMerc && (
                     <>
@@ -4732,7 +4768,7 @@ function StatementImportSheet({ open, onClose, accounts, cur, txns, onImport, on
                 {busy ? "Verificando…"
                   : !accountId ? "Elegí la cuenta destino"
                   : !hayAlgo ? "Nada nuevo para importar"
-                  : analysis.nuevas.length === 0 ? `Corregir saldos de ${diasRefresh} día(s) en ${acct ? acct.name : ""}`
+                  : analysis.nuevas.length === 0 ? `Actualizar saldos del banco en ${acct ? acct.name : ""}`
                   : `Importar ${analysis.nuevas.length} movimiento(s) en ${acct ? acct.name : ""}`}
               </PrimaryBtn>
             </>
@@ -7918,6 +7954,29 @@ function planStatementImport(existingTxns, ops, accountId, esMerc, accounts) {
     refresh.push({ id: t.id, date: op.date, bankBalance: op.bankBalance, stmtRow: op.rowNum });
   });
   return { nuevas, repetidas, refresh };
+}
+
+/* Saldo de cierre de cada día COMPLETO del archivo: el de su última línea.
+   El último día del archivo se deja afuera porque puede venir a medias (un
+   estado bajado a media mañana). Se guarda en la cuenta y el Cierre diario lo
+   usa directo, sin depender de qué movimiento quedó con qué número de fila:
+   así no importa cuántas cargas parciales armaron el día ni cuáles líneas se
+   descartaron por repetidas. */
+function cierresDeArchivo(ops) {
+  const ult = {};
+  (ops || []).forEach((op) => {
+    if (!op.date || op.bankBalance == null || isNaN(op.bankBalance)) return;
+    const prev = ult[op.date];
+    if (!prev || (op.rowNum || 0) >= (prev.rowNum || 0)) ult[op.date] = op;
+  });
+  const fechas = Object.keys(ult).sort();
+  const out = {};
+  fechas.slice(0, -1).forEach((f) => { out[f] = Math.round(ult[f].bankBalance * 100) / 100; });
+  return out;
+}
+function cierresCambian(acct, nuevos) {
+  const guardados = (acct && acct.cierresBanco) || {};
+  return Object.keys(nuevos).filter((f) => guardados[f] !== nuevos[f]).length;
 }
 
 /* Índice de lo ya registrado, para no duplicar al reimportar el mismo estado.
