@@ -1839,7 +1839,7 @@ function AppMain({ session, role, signOut }) {
       parches.set(r.id, { bankBalance: r.bankBalance, stmtRow: r.stmtRow, importFile: (meta && meta.fileName) || undefined });
     });
     // Saldos de cierre del banco por día (días completos del archivo)
-    const cierres = cierresDeArchivo(ops);
+    const cierres = cierresDeArchivo(ops, plan.ultimoCubierto);
     const cierresNuevos = cierresCambian(accounts.find((a) => a.id === accountId), cierres);
     if (cierresNuevos) {
       setAccounts((prev) => prev.map((a) => (a.id === accountId ? { ...a, cierresBanco: { ...(a.cierresBanco || {}), ...cierres } } : a)));
@@ -4316,15 +4316,15 @@ function StatementImportSheet({ open, onClose, accounts, cur, txns, onImport, on
   // escribe de dos formas distintas y si no, la misma línea entra dos veces).
   const esMerc = useMemo(() => cuentaEsMercantil(accounts, accountId), [accounts, accountId]);
   const analysis = useMemo(() => {
-    if (!accountId) return { nuevas: [], repetidas: 0, sinRef: 0, refresh: [] };
+    if (!accountId) return { nuevas: [], repetidas: 0, sinRef: 0, refresh: [], ultimoCubierto: false };
     // Cada línea del archivo consume una ya registrada con la misma clave;
     // cuando se agotan, la línea es genuinamente nueva. Las repetidas de días
     // completos pueden traer el saldo correcto del banco (ver planStatementImport).
     const sinRef = ops.filter((o) => !o.refKey).length;
     const plan = planStatementImport(txns, ops, accountId, esMerc, accounts);
-    return { nuevas: plan.nuevas, repetidas: plan.repetidas, sinRef, refresh: plan.refresh };
+    return { nuevas: plan.nuevas, repetidas: plan.repetidas, sinRef, refresh: plan.refresh, ultimoCubierto: plan.ultimoCubierto };
   }, [ops, accountId, txns, accounts, esMerc]);
-  const cierresArch = useMemo(() => cierresDeArchivo(ops), [ops]);
+  const cierresArch = useMemo(() => cierresDeArchivo(ops, analysis.ultimoCubierto), [ops, analysis.ultimoCubierto]);
   const cierresPend = useMemo(() => cierresCambian(accounts.find((a) => a.id === accountId), cierresArch), [accounts, accountId, cierresArch]);
   const hayAlgo = analysis.nuevas.length > 0 || analysis.refresh.length > 0 || cierresPend > 0;
   const diasRefresh = useMemo(() => new Set(analysis.refresh.map((r) => r.date)).size, [analysis.refresh]);
@@ -7941,19 +7941,34 @@ function planStatementImport(existingTxns, ops, accountId, esMerc, accounts) {
   const ultimoDia = fechas.length ? fechas[fechas.length - 1] : "";
   const nuevas = [];
   const refresh = [];
+  const refreshUltimo = [];
+  const emparejados = new Set();
   let repetidas = 0;
   (ops || []).forEach((op) => {
     const k = stmtKeyOf(accountId, op, esMerc);
     const lista = pool.get(k);
     if (!lista || !lista.length) { nuevas.push(op); return; }
     const t = lista.shift();
+    emparejados.add(t.id);
     repetidas++;
-    const diaCompleto = op.date && op.date < ultimoDia;
-    if (!diaCompleto || op.bankBalance == null || op.rowNum == null) return;
+    if (!op.date || op.bankBalance == null || op.rowNum == null) return;
     if (t.bankBalance === op.bankBalance && t.stmtRow === op.rowNum) return;
-    refresh.push({ id: t.id, date: op.date, bankBalance: op.bankBalance, stmtRow: op.rowNum });
+    const r = { id: t.id, date: op.date, bankBalance: op.bankBalance, stmtRow: op.rowNum };
+    if (op.date < ultimoDia) refresh.push(r);
+    else refreshUltimo.push(r);
   });
-  return { nuevas, repetidas, refresh };
+
+  /* El último día del archivo puede venir a medias, pero si el archivo trae
+     TODAS las líneas del banco que la app ya tiene de ese día (y quizás más),
+     es al menos tan completo como lo cargado antes: su saldo y sus filas
+     mandan. Un archivo parcial nunca cumple esto frente a uno más completo,
+     porque le faltarían líneas que la app ya tiene. */
+  const delBancoUltimo = (existingTxns || []).filter(
+    (t) => t && t.accountId === accountId && t.date === ultimoDia && (t.source === "bank" || t.bankBalance != null)
+  );
+  const ultimoCubierto = !!ultimoDia && delBancoUltimo.every((t) => emparejados.has(t.id));
+  if (ultimoCubierto) refresh.push(...refreshUltimo);
+  return { nuevas, repetidas, refresh, ultimoCubierto };
 }
 
 /* Saldo de cierre de cada día COMPLETO del archivo: el de su última línea.
@@ -7962,7 +7977,7 @@ function planStatementImport(existingTxns, ops, accountId, esMerc, accounts) {
    usa directo, sin depender de qué movimiento quedó con qué número de fila:
    así no importa cuántas cargas parciales armaron el día ni cuáles líneas se
    descartaron por repetidas. */
-function cierresDeArchivo(ops) {
+function cierresDeArchivo(ops, incluirUltimo) {
   const ult = {};
   (ops || []).forEach((op) => {
     if (!op.date || op.bankBalance == null || isNaN(op.bankBalance)) return;
@@ -7971,7 +7986,7 @@ function cierresDeArchivo(ops) {
   });
   const fechas = Object.keys(ult).sort();
   const out = {};
-  fechas.slice(0, -1).forEach((f) => { out[f] = Math.round(ult[f].bankBalance * 100) / 100; });
+  (incluirUltimo ? fechas : fechas.slice(0, -1)).forEach((f) => { out[f] = Math.round(ult[f].bankBalance * 100) / 100; });
   return out;
 }
 function cierresCambian(acct, nuevos) {
