@@ -957,7 +957,69 @@ function parseDivisasCSV(text) {
   }
   return out;
 }
-function mergeSheetOps(prev, rows) {
+/* ─────────────  Nombres de clientes: unificar variantes  ─────────────
+   Un mismo cliente suele quedar escrito de varias formas ("Ilanna bendayan",
+   "Ilana Bendayan"). CxC agrupa por nombre, así que cada variante aparecía
+   como un cliente distinto con su propio saldo.
+
+   clienteKey: la clave exacta con la que CxC agrupa (minúsculas, sin espacios
+   sobrantes). clienteParecido: una clave más floja —sin acentos, sin letras
+   repetidas seguidas, sin signos— que solo se usa para SUGERIR duplicados;
+   nunca se unifica solo, siempre lo confirma el usuario.
+
+   Los alias quedan guardados en settings.clienteAlias ({ claveVieja: "Nombre
+   correcto" }) para que la próxima sincronización del Google Sheet no devuelva
+   el nombre viejo: el Sheet se sigue leyendo tal cual, y el alias se aplica al
+   entrar. */
+const clienteKey = (p) => String(p || "").trim().replace(/\s+/g, " ").toLowerCase();
+function clienteParecido(p) {
+  return clienteKey(p)
+    .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9 ]/g, "")
+    .replace(/(.)\1+/g, "$1")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+function levenshtein(a, b) {
+  if (a === b) return 0;
+  if (!a.length) return b.length;
+  if (!b.length) return a.length;
+  let prev = Array.from({ length: b.length + 1 }, (_, i) => i);
+  for (let i = 1; i <= a.length; i++) {
+    const cur = [i];
+    for (let j = 1; j <= b.length; j++) {
+      cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+    }
+    prev = cur;
+  }
+  return prev[b.length];
+}
+/* Agrupa nombres que probablemente son la misma persona. Devuelve grupos de 2+
+   claves exactas (clienteKey). Tolerancia: igual clave floja, o hasta 1 letra
+   de diferencia (2 si el nombre es largo). */
+function sugerirDuplicados(nombres) {
+  const items = nombres.map((n) => ({ key: clienteKey(n), loose: clienteParecido(n) })).filter((x) => x.loose.length >= 3);
+  const parent = items.map((_, i) => i);
+  const find = (i) => (parent[i] === i ? i : (parent[i] = find(parent[i])));
+  for (let i = 0; i < items.length; i++) {
+    for (let j = i + 1; j < items.length; j++) {
+      const a = items[i].loose, b = items[j].loose;
+      const tol = Math.min(a.length, b.length) >= 10 ? 2 : 1;
+      if (a === b || (Math.abs(a.length - b.length) <= tol && levenshtein(a, b) <= tol)) parent[find(i)] = find(j);
+    }
+  }
+  const grupos = {};
+  items.forEach((it, i) => { (grupos[find(i)] = grupos[find(i)] || []).push(it.key); });
+  return Object.values(grupos).filter((g) => g.length > 1);
+}
+const aplicarAlias = (persona, alias) => {
+  if (!alias || !persona) return persona;
+  const nuevo = alias[clienteKey(persona)];
+  return nuevo || persona;
+};
+
+function mergeSheetOps(prev, rows, alias) {
+  if (alias) rows = rows.map((r) => (r.persona ? { ...r, persona: aplicarAlias(r.persona, alias) } : r));
   const prevSheet = prev.filter((d) => d.source === "sheet");
   const manual = prev.filter((d) => d.source !== "sheet");
   const prevByRef = {};
@@ -2098,6 +2160,48 @@ function AppMain({ session, role, signOut }) {
   function patchDivisa(id, patch) {
     setDivisas((prev) => prev.map((d) => (d.id === id ? { ...d, ...patch } : d)));
   }
+  /* Unificar / renombrar clientes de Cuentas por cobrar. `claves` son las
+     claves exactas (clienteKey) de los nombres a reemplazar; todas pasan a
+     llamarse `nuevo`. Se cambia:
+       · persona en compras, ventas y abonos de Divisas;
+       · el motivo del ingreso que generó cada abono, si todavía tiene la
+         etiqueta automática ("ABONO <nombre> · …") — si alguien lo escribió a
+         mano, se respeta;
+       · el mapa de alias, para que el Sheet no traiga de vuelta el nombre viejo. */
+  function renombrarClientes(claves, nuevo) {
+    const nombre = String(nuevo || "").trim().replace(/\s+/g, " ");
+    const set = new Set((claves || []).map(clienteKey).filter(Boolean));
+    if (!nombre || !set.size) return;
+    const kNuevo = clienteKey(nombre);
+    // Motivos a actualizar: se calculan antes, desde el estado actual, para no
+    // depender del orden en que React corre los updaters de cada estado.
+    const motivos = {};   // txnId -> { viejo, nuevo }
+    (divisas || []).forEach((d) => {
+      if (d && d.kind === "abono" && d.txnId && set.has(clienteKey(d.persona)))
+        motivos[d.txnId] = { viejo: motivoAbono(d.persona, d.metodo), nuevo: motivoAbono(nombre, d.metodo) };
+    });
+    setDivisas((prev) =>
+      prev.map((d) => {
+        if (!d || !set.has(clienteKey(d.persona)) || d.persona === nombre) return d;
+        return { ...d, persona: nombre };
+      })
+    );
+    setTxns((prev) =>
+      prev.map((t) => {
+        const m = motivos[t.id];
+        if (!m || t.motivo !== m.viejo || m.viejo === m.nuevo) return t;
+        return { ...t, motivo: m.nuevo };
+      })
+    );
+    setSettings((s) => {
+      const alias = { ...(s.clienteAlias || {}) };
+      // Los alias que apuntaban a un nombre que ahora se unifica, siguen al nuevo
+      Object.keys(alias).forEach((k) => { if (set.has(clienteKey(alias[k]))) alias[k] = nombre; });
+      set.forEach((k) => { if (k !== kNuevo) alias[k] = nombre; });
+      delete alias[kNuevo];   // el nombre correcto nunca es alias de sí mismo
+      return { ...s, clienteAlias: alias };
+    });
+  }
   function setVesRate(date, rate) {
     if (!(rate > 0) || !date) return;
     setSettings((s) => {
@@ -2208,7 +2312,7 @@ function AppMain({ session, role, signOut }) {
     // lo más probable es un fallo de descarga/parseo — no borrar nada.
     setDivisas((prev) => {
       if (!rows.length && prev.some((d) => d.source === "sheet")) return prev;
-      return mergeSheetOps(prev, rows);
+      return mergeSheetOps(prev, rows, settings.clienteAlias);
     });
     return { ok: true, count: rows.length };
   }
@@ -2440,6 +2544,7 @@ function AppMain({ session, role, signOut }) {
                 onAddAbono={addAbono}
                 onDeleteAbono={deleteDivisa}
                 onPatch={patchDivisa}
+                onRenombrar={renombrarClientes}
               />
             )}
           </div>
@@ -6106,7 +6211,7 @@ function AjustesTab({ settings, setSettings, accounts, txns, prices, cur, divisa
 
 /* ─────────────────────────────  Tab: Divisas (USD / VES)  ───────────────────────────── */
 /* ─────────────────────────────  Cuentas por cobrar (por cliente)  ───────────────────────────── */
-function CxCTab({ divisas, accounts = [], projects = [], canWrite = true, onAddAbono, onDeleteAbono, onPatch }) {
+function CxCTab({ divisas, accounts = [], projects = [], canWrite = true, onAddAbono, onDeleteAbono, onPatch, onRenombrar }) {
   const [openKey, setOpenKey] = useState(null);
   const [monto, setMonto] = useState("");
   const [fecha, setFecha] = useState(todayISO());
@@ -6121,13 +6226,19 @@ function CxCTab({ divisas, accounts = [], projects = [], canWrite = true, onAddA
   const [q, setQ] = useState("");                      // buscador: cliente o referencia
   const [refAmplio, setRefAmplio] = useState(false);   // aflojar la comparación de referencia
 
-  const keyOf = (p) => String(p || "").trim().toLowerCase();
+  // Unificar nombres: modo selección + nombre correcto
+  const [selMode, setSelMode] = useState(false);
+  const [sel, setSel] = useState([]);                  // claves seleccionadas
+  const [nombreOk, setNombreOk] = useState("");
+  const [sugOcultas, setSugOcultas] = useState([]);    // grupos descartados (firma)
+
+  const keyOf = clienteKey;
   const clientes = useMemo(() => {
     const m = {};
     (divisas || []).forEach((d) => {
       const k = keyOf(d.persona);
       if (!k) return;
-      if (!m[k]) m[k] = { nombre: String(d.persona).trim(), compras: [], ventas: [], abonos: [] };
+      if (!m[k]) m[k] = { nombre: String(d.persona).trim().replace(/\s+/g, " "), compras: [], ventas: [], abonos: [] };
       if (d.kind === "compra") m[k].compras.push(d);
       else if (d.kind === "venta") m[k].ventas.push(d);
       else if (d.kind === "abono") m[k].abonos.push(d);
@@ -6143,6 +6254,55 @@ function CxCTab({ divisas, accounts = [], projects = [], canWrite = true, onAddA
   }, [divisas]);
 
   const totalPendiente = clientes.reduce((s, c) => s + Math.max(0, c.pendiente), 0);
+
+  /* ─────────────  Unificar nombres  ─────────────
+     Sugerencias automáticas de posibles duplicados (nunca se aplican solas) y
+     un modo de selección para juntar a mano los que la sugerencia no vea. */
+  const porClave = useMemo(() => Object.fromEntries(clientes.map((c) => [c.key, c])), [clientes]);
+  const sugerencias = useMemo(() => {
+    const firmas = new Set(sugOcultas);
+    return sugerirDuplicados(clientes.map((c) => c.nombre))
+      .map((g) => g.filter((k) => porClave[k]))
+      .filter((g) => g.length > 1 && !firmas.has(g.slice().sort().join("|")));
+  }, [clientes, porClave, sugOcultas]);
+  const nOps = (c) => c.compras.length + c.ventas.length + c.abonos.length;
+  /* Nombre sugerido para el grupo: el que tiene más operaciones (el que más se
+     usó suele ser el bien escrito); a igualdad, el que tiene más mayúsculas
+     iniciales ("Ilana Bendayan" antes que "ilana bendayan"). */
+  const nombreSugerido = (keys) => {
+    const cs = keys.map((k) => porClave[k]).filter(Boolean);
+    const caps = (n) => (n.match(/(^|\s)\p{Lu}/gu) || []).length;
+    cs.sort((a, b) => nOps(b) - nOps(a) || caps(b.nombre) - caps(a.nombre));
+    return cs.length ? cs[0].nombre : "";
+  };
+  function entrarSeleccion(keys) {
+    setSelMode(true);
+    setSel(keys || []);
+    setNombreOk(keys && keys.length ? nombreSugerido(keys) : "");
+    setOpenKey("__cerrado");
+  }
+  function salirSeleccion() { setSelMode(false); setSel([]); setNombreOk(""); }
+  function toggleSel(k) {
+    const next = sel.includes(k) ? sel.filter((x) => x !== k) : [...sel, k];
+    setSel(next);
+    // Si el nombre todavía está vacío, se propone el del más usado
+    if (!nombreOk.trim() && next.length) setNombreOk(nombreSugerido(next));
+  }
+  const nombreOkLimpio = nombreOk.trim().replace(/\s+/g, " ");
+  const selValida = sel.length >= 1 && !!nombreOkLimpio &&
+    !(sel.length === 1 && porClave[sel[0]] && porClave[sel[0]].nombre === nombreOkLimpio);
+  function aplicarUnificacion() {
+    if (!selValida || !onRenombrar) return;
+    const nombres = sel.map((k) => (porClave[k] ? porClave[k].nombre : k));
+    const destinoExiste = porClave[clienteKey(nombreOkLimpio)] && !sel.includes(clienteKey(nombreOkLimpio));
+    const msg = sel.length === 1 && !destinoExiste
+      ? `¿Renombrar "${nombres[0]}" a "${nombreOkLimpio}"?`
+      : `¿Unificar ${nombres.map((n) => `"${n}"`).join(", ")}${destinoExiste ? ` y "${porClave[clienteKey(nombreOkLimpio)].nombre}"` : ""} bajo "${nombreOkLimpio}"?\n\nSus compras y abonos pasan a un solo cliente y el saldo se suma.`;
+    if (!window.confirm(msg)) return;
+    onRenombrar(sel, nombreOkLimpio);
+    salirSeleccion();
+    setQ("");
+  }
   const byDateDesc = (a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : (b.createdAt || 0) - (a.createdAt || 0));
 
   /* ─────────────  Buscador: por cliente y por referencia del banco  ─────────────
@@ -6295,6 +6455,86 @@ function CxCTab({ divisas, accounts = [], projects = [], canWrite = true, onAddA
         </>
       )}
 
+      {/* Unificar nombres: botón de modo selección */}
+      {canWrite && onRenombrar && clientes.length > 1 && !selMode && (
+        <button
+          onClick={() => entrarSeleccion([])}
+          style={{ ...btnGhost, color: T.gold, fontSize: 13, fontWeight: 600, padding: "0 0 12px" }}
+        >
+          ✎ Unificar o renombrar clientes
+        </button>
+      )}
+
+      {/* Sugerencias de nombres que parecen la misma persona */}
+      {canWrite && onRenombrar && !selMode && !qn && sugerencias.length > 0 && (
+        <div style={{ background: T.card2, border: `1px solid ${T.gold}`, borderRadius: 14, padding: "12px 14px", marginBottom: 14 }}>
+          <div style={{ fontSize: 13, fontWeight: 700, color: T.gold, marginBottom: 8 }}>
+            Posibles nombres duplicados ({sugerencias.length})
+          </div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            {sugerencias.map((g) => {
+              const firma = g.slice().sort().join("|");
+              return (
+                <div key={firma} style={{ display: "flex", alignItems: "center", gap: 8, justifyContent: "space-between" }}>
+                  <div style={{ fontSize: 12.5, color: T.text, minWidth: 0, flex: 1 }}>
+                    {g.map((k) => porClave[k].nombre).join("  ·  ")}
+                  </div>
+                  <button onClick={() => entrarSeleccion(g)} style={{ ...miniBtn, background: T.gold, color: "#0A0F1E", border: "none", padding: "7px 11px" }}>Revisar</button>
+                  <button onClick={() => setSugOcultas((p) => [...p, firma])} style={{ ...btnGhost, color: T.mut2, fontSize: 12 }} aria-label="No son la misma persona">No</button>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {/* Panel de unificación */}
+      {selMode && (
+        <div style={{ position: "sticky", top: 8, zIndex: 5, background: T.card2, border: `1px solid ${T.gold}`, borderRadius: 14, padding: "12px 14px", marginBottom: 14, boxShadow: "0 6px 20px rgba(0,0,0,0.25)" }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+            <div style={{ fontSize: 13, fontWeight: 700, color: T.gold }}>
+              {sel.length === 0 ? "Tocá los clientes a unificar" : `${sel.length} seleccionado(s)`}
+            </div>
+            <button onClick={salirSeleccion} style={{ ...btnGhost, color: T.mut, fontSize: 13 }}>Cancelar</button>
+          </div>
+          {sel.length > 0 && (
+            <>
+              <label style={labelStyle}>Nombre correcto</label>
+              <input style={inputStyle} value={nombreOk} onChange={(e) => setNombreOk(e.target.value)} placeholder="Ej. Ilana Bendayan" list="cxc-nombres-sel" />
+              <datalist id="cxc-nombres-sel">
+                {clientes.map((c) => (<option key={c.key} value={c.nombre} />))}
+              </datalist>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 6, margin: "-2px 0 10px" }}>
+                {sel.filter((k) => porClave[k]).map((k) => {
+                  const n = porClave[k].nombre;
+                  const activo = n === nombreOkLimpio;
+                  return (
+                    <button
+                      key={k}
+                      onClick={() => setNombreOk(n)}
+                      style={{ ...miniBtn, padding: "5px 9px", fontSize: 12, background: activo ? T.gold : "transparent", color: activo ? "#0A0F1E" : T.text, border: `1px solid ${activo ? T.gold : T.line}` }}
+                    >
+                      {n} <span style={{ opacity: 0.7 }}>({nOps(porClave[k])})</span>
+                    </button>
+                  );
+                })}
+              </div>
+              <button
+                onClick={aplicarUnificacion}
+                disabled={!selValida}
+                style={{ width: "100%", background: selValida ? T.gold : T.card, color: selValida ? "#0A0F1E" : T.mut2, border: "none", borderRadius: 11, padding: "11px", fontSize: 14, fontWeight: 650, fontFamily: FONT, cursor: selValida ? "pointer" : "default" }}
+              >
+                {!nombreOkLimpio ? "Escribí el nombre correcto" : sel.length === 1 ? "Renombrar" : `Unificar ${sel.length} bajo “${nombreOkLimpio}”`}
+              </button>
+              <div style={{ fontSize: 11.5, color: T.mut2, lineHeight: 1.5, marginTop: 8 }}>
+                Cambia el nombre en todas sus compras, ventas y abonos. Si las operaciones vienen del
+                Google Sheet, la app recuerda el cambio y lo aplica en cada sincronización.
+              </div>
+            </>
+          )}
+        </div>
+      )}
+
       {clientes.length === 0 ? (
         <div style={emptyRow}>Las compras de divisas con cliente aparecen acá agrupadas.</div>
       ) : clientesFiltrados.length === 0 ? (
@@ -6305,11 +6545,17 @@ function CxCTab({ divisas, accounts = [], projects = [], canWrite = true, onAddA
       ) : (
         <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
           {clientesFiltrados.map((c) => {
-            const open = openKey === c.key || (autoAbierto && openKey === null);
+            const open = !selMode && (openKey === c.key || (autoAbierto && openKey === null));
             const saldada = c.pendiente <= 0.01;
+            const marcado = selMode && sel.includes(c.key);
             return (
-              <div key={c.key} style={{ ...rowCard, flexDirection: "column", alignItems: "stretch", padding: 0, overflow: "hidden" }}>
-                <div onClick={() => abrirCliente(c.key)} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10, padding: "13px 15px", cursor: "pointer" }}>
+              <div key={c.key} style={{ ...rowCard, flexDirection: "column", alignItems: "stretch", padding: 0, overflow: "hidden", ...(marcado ? { border: `1px solid ${T.gold}` } : {}) }}>
+                <div onClick={() => (selMode ? toggleSel(c.key) : abrirCliente(c.key))} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10, padding: "13px 15px", cursor: "pointer" }}>
+                  {selMode && (
+                    <span style={{ width: 22, height: 22, flexShrink: 0, borderRadius: 6, border: `2px solid ${marcado ? T.gold : T.line}`, background: marcado ? T.gold : "transparent", color: "#0A0F1E", fontSize: 14, fontWeight: 800, display: "flex", alignItems: "center", justifyContent: "center" }}>
+                      {marcado ? "✓" : ""}
+                    </span>
+                  )}
                   <div style={{ minWidth: 0, flex: 1 }}>
                     <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", marginBottom: 3 }}>
                       <span style={{ fontSize: 15, fontWeight: 700, color: T.text }}>{c.nombre}</span>
@@ -6324,7 +6570,7 @@ function CxCTab({ divisas, accounts = [], projects = [], canWrite = true, onAddA
                       Pendiente: {fmtUsd(Math.max(0, c.pendiente))}{c.pendiente < -0.01 ? ` (a favor ${fmtUsd(-c.pendiente)})` : ""}
                     </div>
                   </div>
-                  <span style={{ color: T.mut2, fontSize: 12 }}>{open ? "▲" : "▼"}</span>
+                  {!selMode && <span style={{ color: T.mut2, fontSize: 12 }}>{open ? "▲" : "▼"}</span>}
                 </div>
 
                 {open && (
