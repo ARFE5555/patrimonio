@@ -36,7 +36,7 @@ const { useState, useEffect, useRef, useMemo } = React;
 
 /* Versión de compilación. Sirve para confirmar de un vistazo qué build está
    corriendo en pantalla (útil para detectar caché vieja de la PWA). */
-const BUILD = "v6.0 · Transiciones suaves, íconos monocromáticos y tipografía de Apple · 2026-10-14";
+const BUILD = "v6.1 · Meses anteriores plegados en Movimientos (carga por demanda) · 2026-10-14";
 try { console.log("[Patrimonio] build:", BUILD); } catch (e) {}
 
 /* ─────────────────────────────  Tokens de diseño  ───────────────────────────── */
@@ -3467,6 +3467,98 @@ function TxnsTab({ txns, accounts, cur, onAdd, onEdit, onDelete, onDeleteMany, o
     return Object.entries(m).sort((a, b) => (a[0] < b[0] ? 1 : -1));
   }, [filtrados]);
 
+  /* ─────────────  Agrupación por mes  ─────────────
+     El mes en curso (y cualquier fecha futura) se muestra abierto. Los meses
+     anteriores quedan plegados en una lista desplegable "Mes Año": sus filas
+     NO se dibujan hasta que se abren, así la pestaña carga rápido aunque haya
+     años de historia. Dentro de cada mes se dibuja por tandas. */
+  const mesActual = todayISO().slice(0, 7);
+  const POR_TANDA = 120;
+  const [mesesAbiertos, setMesesAbiertos] = useState({});   // "2026-09" -> true/false
+  const [limites, setLimites] = useState({});               // "2026-09" -> filas visibles
+  const busquedaActiva = !!(qn || diaFijado || soloPend || fFrom || fTo);
+  const meses = useMemo(() => {
+    const m = new Map();
+    grouped.forEach(([date, items]) => {
+      const k = String(date || "").slice(0, 7) || "sin-fecha";
+      if (!m.has(k)) m.set(k, { key: k, dias: [], n: 0, pend: 0, tot: {} });
+      const g = m.get(k);
+      g.dias.push([date, items]);
+      g.n += items.length;
+      items.forEach((t) => {
+        if (t.pending) g.pend++;
+        const c = acctCur(t);
+        const o = (g.tot[c] = g.tot[c] || { inc: 0, exp: 0 });
+        if (t.kind === "income") o.inc += t.amount || 0; else o.exp += t.amount || 0;
+      });
+    });
+    return Array.from(m.values());
+  }, [grouped]);
+  const nombreMes = (k) => {
+    const [y, mm] = String(k).split("-");
+    return MESES_ES[Number(mm) - 1] ? `${MESES_ES[Number(mm) - 1]} ${y}` : "Sin fecha";
+  };
+  function renderPorMes(renderDay) {
+    const tanda = (g) => {
+      const lim = limites[g.key] || POR_TANDA;
+      const vis = [];
+      let filas = 0;
+      for (const d of g.dias) { if (filas >= lim && vis.length) break; vis.push(d); filas += d[1].length; }
+      return (
+        <>
+          {vis.map(renderDay)}
+          {vis.length < g.dias.length && (
+            <button
+              onClick={() => setLimites((l) => ({ ...l, [g.key]: lim + POR_TANDA * 2 }))}
+              style={{ width: "100%", background: "transparent", color: T.blue, border: `1px dashed ${T.line}`, borderRadius: 12, padding: "11px", fontSize: 13, fontWeight: 600, fontFamily: FONT, cursor: "pointer", marginBottom: 14 }}
+            >
+              <ConIco name="descarga" size={15}>Mostrar más de {nombreMes(g.key)} ({g.n - filas} restantes)</ConIco>
+            </button>
+          )}
+        </>
+      );
+    };
+    return meses.map((g) => {
+      if (g.key >= mesActual) return <React.Fragment key={g.key}>{tanda(g)}</React.Fragment>;
+      const auto = busquedaActiva && filtrados.length <= 300;
+      const abierto = mesesAbiertos[g.key] !== undefined ? mesesAbiertos[g.key] : auto;
+      return (
+        <div key={g.key} style={{ background: T.card, border: `1px solid ${abierto ? T.line : T.lineSoft}`, borderRadius: 14, marginBottom: 10, overflow: "hidden" }}>
+          <button
+            onClick={() => setMesesAbiertos((m) => ({ ...m, [g.key]: !abierto }))}
+            style={{ width: "100%", background: "transparent", border: "none", padding: "13px 15px", cursor: "pointer", fontFamily: FONT, textAlign: "left", display: "flex", alignItems: "center", gap: 12 }}
+          >
+            <span style={{ width: 32, height: 32, borderRadius: 10, background: T.goldSoft, color: T.gold, display: "inline-flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+              <Ico name="calendario" size={16} />
+            </span>
+            <span style={{ flex: 1, minWidth: 0 }}>
+              <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <span style={{ fontSize: 15, fontWeight: 650, color: T.text }}>{nombreMes(g.key)}</span>
+                {g.pend > 0 && (
+                  <span style={{ fontSize: 10.5, fontWeight: 700, color: T.gold, background: T.goldSoft, borderRadius: 6, padding: "2px 6px" }}>{g.pend} s/justificar</span>
+                )}
+              </span>
+              <span style={{ display: "flex", flexWrap: "wrap", gap: "2px 10px", marginTop: 3, fontSize: 11.5, fontFamily: MONO, fontVariantNumeric: "tabular-nums" }}>
+                <span style={{ color: T.mut2, fontFamily: FONT }}>{g.n} mov.</span>
+                {Object.entries(g.tot).map(([c, v]) => (
+                  <span key={c} style={{ color: T.mut }}>
+                    <span style={{ color: T.green }}>+{money(v.inc, c)}</span> / <span style={{ color: T.red }}>−{money(v.exp, c)}</span>
+                  </span>
+                ))}
+              </span>
+            </span>
+            <Ico name="flecha" size={16} color={T.mut} style={{ transform: abierto ? "rotate(90deg)" : "none", transition: "transform .25s cubic-bezier(.22,1,.36,1)" }} />
+          </button>
+          {abierto && (
+            <div className="pt-pop" style={{ borderTop: `1px solid ${T.lineSoft}`, padding: "14px 12px 2px", background: T.bg2 }}>
+              {tanda(g)}
+            </div>
+          )}
+        </div>
+      );
+    });
+  }
+
   const selStyle = { ...inputStyle, appearance: "none", fontSize: 14, padding: "11px 12px" };
 
   const [bulkMsg, setBulkMsg] = useState("");
@@ -4079,7 +4171,7 @@ function TxnsTab({ txns, accounts, cur, onAdd, onEdit, onDelete, onDeleteMany, o
       ) : filtrados.length === 0 ? (
         <div style={emptyRow}>Ningún movimiento coincide con los filtros</div>
       ) : (
-        grouped.map(([date, items]) => (
+        renderPorMes(([date, items]) => (
           <div key={date} style={{ marginBottom: 18 }}>
             <div style={{ ...sectionTitle, marginBottom: 8 }}><ConIco name="calendario" size={13} gap={6}>{fmtDate(date)}</ConIco></div>
             <div className="pt-list" style={{ display: "flex", flexDirection: "column", gap: 8 }}>
