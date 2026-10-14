@@ -36,7 +36,7 @@ const { useState, useEffect, useRef, useMemo } = React;
 
 /* Versión de compilación. Sirve para confirmar de un vistazo qué build está
    corriendo en pantalla (útil para detectar caché vieja de la PWA). */
-const BUILD = "v6.3 · Reporte: total del día con todos los ingresos y egresos + sin clasificar visible · 2026-10-14";
+const BUILD = "v6.4 · Reporte diario por proyecto (opcional) en pantalla, PDF, Excel y Drive · 2026-10-14";
 try { console.log("[Patrimonio] build:", BUILD); } catch (e) {}
 
 /* ─────────────────────────────  Tokens de diseño  ───────────────────────────── */
@@ -4534,11 +4534,26 @@ function nombreSeguro(s, max = 60) {
 }
 
 /* Arma todo lo del día a partir de los datos de la app. */
-function armarReporteDia(fecha, { txns, accounts, divisas, cur, empleados = [] }) {
+/* Proyecto: "" = reporte completo · "__none" = sin proyecto · otro = ese proyecto */
+function nombreProyecto(p) { return p === "__none" ? "Sin proyecto" : String(p || ""); }
+function nombreReporte(rep) {
+  if (!rep.proyecto) return `Reporte ${rep.fecha}`;
+  return `Reporte ${rep.fecha} - ` + (rep.proyecto === "__none" ? "Sin proyecto" : `Proyecto ${nombreSeguro(rep.proyecto, 50)}`);
+}
+// Proyectos con movimientos (o divisas) ese día, para el selector y la subida por proyecto
+function proyectosDelDia(fecha, txns, divisas) {
+  const s = new Set();
+  let sinProy = false;
+  (txns || []).forEach((t) => { if (t.date === fecha) { if (t.project) s.add(t.project); else sinProy = true; } });
+  (divisas || []).forEach((d) => { if (d.date === fecha && d.project) s.add(d.project); });
+  return { lista: Array.from(s).sort((a, b) => a.localeCompare(b, "es")), sinProy };
+}
+function armarReporteDia(fecha, { txns, accounts, divisas, cur, empleados = [], proyecto = "" }) {
+  const enProy = (p) => !proyecto || (proyecto === "__none" ? !p : p === proyecto);
   const acc = (id) => (accounts || []).find((a) => a.id === id) || {};
   const curDe = (t) => t.currency || acc(t.accountId).currency || cur || "usd";
   const filas = (txns || [])
-    .filter((t) => t.date === fecha)
+    .filter((t) => t.date === fecha && enProy(t.project))
     .map((t) => {
       const c = claseDe(t);
       const entra = t.kind === "income";
@@ -4588,7 +4603,12 @@ function armarReporteDia(fecha, { txns, accounts, divisas, cur, empleados = [] }
   Object.values(general).forEach((g) => { g.neto = g.ingresos - g.egresos - g.comisiones; });
 
   // Operaciones cambiarias del día (incluye las que no pasan por banco, ej. Binance P2P)
-  const ops = (divisas || []).filter((d) => d.date === fecha && (d.kind === "compra" || d.kind === "venta" || d.kind === "abono"));
+  /* Con proyecto: una operación cambiaria entra si su movimiento de banco es
+     de ese proyecto, o si ella misma lleva el proyecto (abonos). */
+  const idsFilas = new Set(filas.map((f) => f.id));
+  const opDelProyecto = (d) => !proyecto
+    || (d.txnId && (txns || []).some((t) => t.id === d.txnId) ? idsFilas.has(d.txnId) : enProy(d.project));
+  const ops = (divisas || []).filter((d) => d.date === fecha && (d.kind === "compra" || d.kind === "venta" || d.kind === "abono") && opDelProyecto(d));
   const opsFilas = ops.map((d) => ({
     d,
     id: d.id,
@@ -4603,11 +4623,12 @@ function armarReporteDia(fecha, { txns, accounts, divisas, cur, empleados = [] }
   // Pagos parciales registrados dentro de una venta, con fecha de este día
   const pagosVenta = [];
   (divisas || []).forEach((v) => (v.abonos || []).forEach((a) => {
-    if (a && (a.date || a.fecha) === fecha) pagosVenta.push({ venta: v, a });
+    if (a && (a.date || a.fecha) === fecha && (!proyecto || opDelProyecto(v))) pagosVenta.push({ venta: v, a });
   }));
 
   // Saldo de cierre (según la app) de cada cuenta de banco o efectivo
-  const saldos = (accounts || [])
+  // Los saldos son de la cuenta entera: en un reporte por proyecto no aplican
+  const saldos = proyecto ? [] : (accounts || [])
     .filter((a) => a.type === "bank" || a.type === "cash")
     .map((a) => {
       const s = (txns || []).filter((t) => t.accountId === a.id && t.date && t.date <= fecha)
@@ -4617,7 +4638,7 @@ function armarReporteDia(fecha, { txns, accounts, divisas, cur, empleados = [] }
     })
     .filter((s) => s.mov > 0 || Math.abs(s.saldo) > 0.005);
 
-  return { fecha, filas, porClase, totales, comisiones, general, ops: opsFilas, pagosVenta, saldos,
+  return { fecha, proyecto, filas, porClase, totales, comisiones, general, ops: opsFilas, pagosVenta, saldos,
     vacio: filas.length === 0 && opsFilas.length === 0 && pagosVenta.length === 0 };
 }
 
@@ -4669,11 +4690,19 @@ async function reportePDF(rep) {
   doc.setFontSize(8.5);
   doc.text("Generado por Patrimonio el " + new Date().toLocaleString("es-VE"), W - M, M + 24, { align: "right" });
   let y = M + 44;
+  if (rep.proyecto) {
+    doc.setFillColor(232, 238, 250); doc.roundedRect(M, y - 12, W - 2 * M, 22, 4, 4, "F");
+    doc.setFont("helvetica", "bold"); doc.setFontSize(10.5); doc.setTextColor(...tinta);
+    doc.text("Proyecto: " + nombreProyecto(rep.proyecto), M + 8, y + 3);
+    doc.setFont("helvetica", "normal"); doc.setFontSize(8.5); doc.setTextColor(...gris);
+    doc.text("Solo los movimientos de este proyecto", W - M - 8, y + 3, { align: "right" });
+    y += 26;
+  }
 
   // Resumen: primero el total del día, después por clase y moneda
   const resumen = [];
   Object.entries(rep.general).forEach(([mon, g]) => {
-    resumen.push(["TOTAL DEL DÍA (todos los movimientos)", curLbl(mon), nVE(g.ingresos), nVE(g.egresos + g.comisiones), nVE(g.neto), String(g.nIng + g.nEgr)]);
+    resumen.push([rep.proyecto ? "TOTAL DEL PROYECTO EN EL DÍA" : "TOTAL DEL DÍA (todos los movimientos)", curLbl(mon), nVE(g.ingresos), nVE(g.egresos + g.comisiones), nVE(g.neto), String(g.nIng + g.nEgr)]);
   });
   CLASES_ORDEN.concat([""]).forEach((k) => {
     const porMon = rep.totales[k] || {};
@@ -4780,7 +4809,7 @@ async function reporteXLSX(rep) {
 
   const res = [["Concepto", "Moneda", "Entra", "Sale", "Neto", "Movimientos"]];
   Object.entries(rep.general).forEach(([mon, g]) => {
-    res.push(["TOTAL DEL DÍA", curLbl(mon), r2(g.ingresos), r2(g.egresos + g.comisiones), r2(g.neto), g.nIng + g.nEgr]);
+    res.push([rep.proyecto ? "TOTAL DEL PROYECTO" : "TOTAL DEL DÍA", curLbl(mon), r2(g.ingresos), r2(g.egresos + g.comisiones), r2(g.neto), g.nIng + g.nEgr]);
   });
   CLASES_ORDEN.concat([""]).forEach((k) => {
     const porMon = rep.totales[k] || {};
@@ -4790,6 +4819,7 @@ async function reporteXLSX(rep) {
     });
   });
   Object.keys(rep.comisiones).forEach((mon) => res.push(["Comisiones bancarias", curLbl(mon), 0, r2(rep.comisiones[mon]), r2(-rep.comisiones[mon]), ""]));
+  if (rep.proyecto) { res.push([]); res.push(["Proyecto", nombreProyecto(rep.proyecto)]); }
   res.push([]);
   res.push(["Saldos al cierre (según la app)"]);
   res.push(["Cuenta", "Moneda", "Saldo", "", "", "Movimientos"]);
@@ -4948,7 +4978,7 @@ async function driveRaiz(guardada) {
   return driveCarpeta(DRIVE_RAIZ_NOMBRE, "root");
 }
 /* Sube un día completo. Devuelve el id de la carpeta del día y lo que subió. */
-async function subirDiaADrive(rep, raizId, onPaso) {
+async function subirDiaADrive(rep, raizId, onPaso, { soportes = true } = {}) {
   const paso = (m) => { try { onPaso && onPaso(m); } catch (e) { /* no-op */ } };
   const mesId = await driveCarpeta(carpetaMes(rep.fecha), raizId);
   const diaId = await driveCarpeta(rep.fecha, mesId);
@@ -4957,9 +4987,9 @@ async function subirDiaADrive(rep, raizId, onPaso) {
   paso("Generando Excel…");
   const xls = await reporteXLSX(rep);
   paso("Subiendo reporte…");
-  await driveSubir(`Reporte ${rep.fecha}.pdf`, diaId, pdf, "application/pdf");
-  await driveSubir(`Reporte ${rep.fecha}.xlsx`, diaId, xls, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
-  const sop = await soportesDelDia(rep);
+  await driveSubir(`${nombreReporte(rep)}.pdf`, diaId, pdf, "application/pdf");
+  await driveSubir(`${nombreReporte(rep)}.xlsx`, diaId, xls, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+  const sop = soportes ? await soportesDelDia(rep) : [];
   for (let i = 0; i < sop.length; i++) {
     paso(`Subiendo soportes ${i + 1}/${sop.length}…`);
     await driveSubir(sop[i].name, diaId, sop[i].blob, sop[i].mime);
@@ -4995,7 +5025,10 @@ function ReporteDiarioTab({ txns, accounts, divisas, cur, settings, setSettings,
 
   useEffect(() => { if (clientId) ensureGIS().catch(() => {}); }, [clientId]);
 
-  const rep = useMemo(() => armarReporteDia(fecha, { txns, accounts, divisas, cur, empleados }), [fecha, txns, accounts, divisas, cur, empleados]);
+  const [proyecto, setProyecto] = useState("");   // "" = completo
+  const [porProyecto, setPorProyecto] = useState(!!loc.porProyecto);
+  const proysDia = useMemo(() => proyectosDelDia(fecha, txns, divisas), [fecha, txns, divisas]);
+  const rep = useMemo(() => armarReporteDia(fecha, { txns, accounts, divisas, cur, empleados, proyecto }), [fecha, txns, accounts, divisas, cur, empleados, proyecto]);
   const sinClase = rep.porClase[""];
 
   function guardarCfg() {
@@ -5022,13 +5055,13 @@ function ReporteDiarioTab({ txns, accounts, divisas, cur, settings, setSettings,
 
   async function bajarPDF() {
     setErr(""); setMsg(""); setBusy("pdf");
-    try { descargarBlob(await reportePDF(rep), `Reporte ${fecha}.pdf`); }
+    try { descargarBlob(await reportePDF(rep), `${nombreReporte(rep)}.pdf`); }
     catch (e) { setErr(e.message || "No se pudo generar el PDF."); }
     finally { setBusy(""); }
   }
   async function bajarXLSX() {
     setErr(""); setMsg(""); setBusy("xlsx");
-    try { descargarBlob(await reporteXLSX(rep), `Reporte ${fecha}.xlsx`); }
+    try { descargarBlob(await reporteXLSX(rep), `${nombreReporte(rep)}.xlsx`); }
     catch (e) { setErr(e.message || "No se pudo generar el Excel."); }
     finally { setBusy(""); }
   }
@@ -5048,14 +5081,26 @@ function ReporteDiarioTab({ txns, accounts, divisas, cur, settings, setSettings,
         const hechos = [];
         let archivos = 0;
         for (let i = 0; i < dias.length; i++) {
-          const r = armarReporteDia(dias[i], { txns, accounts, divisas, cur, empleados });
+          const r = armarReporteDia(dias[i], { txns, accounts, divisas, cur, empleados, proyecto });
           if (r.vacio) continue;
           const pre = dias.length > 1 ? `${dias[i]} (${i + 1}/${dias.length}) · ` : "";
           const out = await subirDiaADrive(r, raiz, (m) => setMsg(pre + m));
           archivos += out.archivos;
           hechos.push(dias[i]);
+          /* Opcional: con el reporte completo, uno más por cada proyecto del
+             día (PDF + Excel, sin repetir los soportes). */
+          if (!proyecto && porProyecto) {
+            const pd = proyectosDelDia(dias[i], txns, divisas);
+            const claves = pd.lista.concat(pd.sinProy && pd.lista.length ? ["__none"] : []);
+            for (let j = 0; j < claves.length; j++) {
+              const rp = armarReporteDia(dias[i], { txns, accounts, divisas, cur, empleados, proyecto: claves[j] });
+              if (rp.vacio) continue;
+              const o2 = await subirDiaADrive(rp, raiz, (m) => setMsg(pre + `Proyecto ${nombreProyecto(claves[j])} · ` + m), { soportes: false });
+              archivos += o2.archivos;
+            }
+          }
         }
-        anotarSubida(hechos, raiz);
+        if (!proyecto) anotarSubida(hechos, raiz);
         setMsg(hechos.length
           ? `✓ Listo: ${hechos.length} día(s), ${archivos} archivo(s) en Drive → ${DRIVE_RAIZ_NOMBRE} / ${carpetaMes(hechos[0])}.`
           : "No había nada que subir en esas fechas.");
@@ -5092,13 +5137,34 @@ function ReporteDiarioTab({ txns, accounts, divisas, cur, settings, setSettings,
         <button onClick={() => mover(1)} style={{ ...btnGhost, color: T.mut, fontSize: 20, padding: "8px 10px" }} aria-label="Día siguiente">›</button>
       </div>
 
+      {(proysDia.lista.length > 0 || proyecto) && (
+        <div style={{ marginBottom: 12 }}>
+          <label style={labelStyle}><Ico name="proyecto" size={13} style={{ marginRight: 5 }} />Proyecto (opcional)</label>
+          <select
+            value={proyecto}
+            onChange={(e) => setProyecto(e.target.value)}
+            style={{ ...inputStyle, appearance: "none", fontSize: 14, padding: "10px 12px", borderColor: proyecto ? T.blue : undefined }}
+          >
+            <option value="">Todos — reporte completo del día</option>
+            {proysDia.lista.map((p) => (<option key={p} value={p}>{p}</option>))}
+            {proyecto && proyecto !== "__none" && !proysDia.lista.includes(proyecto) && <option value={proyecto}>{proyecto}</option>}
+            {(proysDia.sinProy || proyecto === "__none") && <option value="__none">Sin proyecto</option>}
+          </select>
+          {proyecto && (
+            <div style={{ fontSize: 11.5, color: T.blue, marginTop: 5 }}>
+              Mostrando solo «{nombreProyecto(proyecto)}». El PDF, el Excel y la subida a Drive salen con el nombre del proyecto.
+            </div>
+          )}
+        </div>
+      )}
+
       {rep.vacio ? (
-        <div style={emptyRow}>No hay movimientos ni operaciones el {fmtDate(fecha)}.</div>
+        <div style={emptyRow}>{proyecto ? `El proyecto «${nombreProyecto(proyecto)}» no tiene movimientos el ${fmtDate(fecha)}.` : `No hay movimientos ni operaciones el ${fmtDate(fecha)}.`}</div>
       ) : (
         <>
           <div style={{ background: `linear-gradient(160deg, ${T.card2}, ${T.card})`, border: `1px solid ${T.line}`, borderRadius: 16, padding: "14px 16px", marginBottom: 10 }}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 10, marginBottom: 6 }}>
-              <span style={{ fontSize: 13, color: T.mut, fontWeight: 600 }}><Ico name="reporte" size={15} color={T.gold} style={{ marginRight: 6 }} />Total del día</span>
+              <span style={{ fontSize: 13, color: T.mut, fontWeight: 600 }}><Ico name="reporte" size={15} color={T.gold} style={{ marginRight: 6 }} />{proyecto ? `Total · ${nombreProyecto(proyecto)}` : "Total del día"}</span>
               <span style={{ fontSize: 11.5, color: T.mut2 }}>{rep.filas.length} movimiento(s)</span>
             </div>
             {Object.entries(rep.general).map(([mon, g]) => (
@@ -5176,13 +5242,13 @@ function ReporteDiarioTab({ txns, accounts, divisas, cur, settings, setSettings,
             <button onClick={bajarXLSX} disabled={!!busy} style={btn(T.green, !busy)}><ConIco name="excel">{busy === "xlsx" ? "Generando…" : "Descargar Excel"}</ConIco></button>
           </div>
           <button onClick={() => subir([fecha])} disabled={!!busy} style={{ ...btn(T.blue, !busy), width: "100%", marginBottom: 6 }}>
-            <ConIco name="nube" size={17}>{busy === "drive" ? "Subiendo a Drive…" : log[fecha] ? "Volver a subir este día a Drive" : "Subir este día a Drive"}</ConIco>
+            <ConIco name="nube" size={17}>{busy === "drive" ? "Subiendo a Drive…" : proyecto ? `Subir reporte de «${nombreProyecto(proyecto)}» a Drive` : log[fecha] ? "Volver a subir este día a Drive" : "Subir este día a Drive"}</ConIco>
           </button>
-          {log[fecha] && <div style={{ fontSize: 11.5, color: T.mut2, textAlign: "center", marginBottom: 8 }}>Subido {relTime(log[fecha])}. Volver a subir reemplaza los archivos.</div>}
+          {log[fecha] && !proyecto && <div style={{ fontSize: 11.5, color: T.mut2, textAlign: "center", marginBottom: 8 }}>Subido {relTime(log[fecha])}. Volver a subir reemplaza los archivos.</div>}
         </>
       )}
 
-      {pendientesMes.length > 0 && (
+      {pendientesMes.length > 0 && !proyecto && (
         <button onClick={() => subir(pendientesMes)} disabled={!!busy} style={{ ...btnGhost, width: "100%", color: busy ? T.mut2 : T.blue, fontSize: 12.5, fontWeight: 700, padding: "8px 0" }}>
           Subir los {pendientesMes.length} día(s) de {carpetaMes(fecha).slice(8)} que faltan en Drive
         </button>
@@ -5208,6 +5274,18 @@ function ReporteDiarioTab({ txns, accounts, divisas, cur, settings, setSettings,
             Abrir la carpeta en Drive ↗
           </a>
         )}
+        <button
+          onClick={() => { const v = !porProyecto; setPorProyecto(v); driveLocalSet({ porProyecto: v }); }}
+          style={{ display: "flex", alignItems: "center", gap: 10, width: "100%", background: "transparent", border: "none", padding: "10px 0 0", cursor: "pointer", fontFamily: FONT, textAlign: "left" }}
+        >
+          <span style={{ width: 36, height: 21, borderRadius: 11, background: porProyecto ? T.blue : T.card2, border: `1px solid ${porProyecto ? T.blue : T.line}`, position: "relative", flexShrink: 0, transition: "background .2s ease" }}>
+            <span style={{ position: "absolute", top: 2, left: porProyecto ? 17 : 2, width: 15, height: 15, borderRadius: 8, background: "#fff", transition: "left .22s cubic-bezier(.22,1,.36,1)" }} />
+          </span>
+          <span style={{ fontSize: 12.5, color: T.text, lineHeight: 1.4 }}>
+            Al subir el día completo, incluir también un reporte por cada proyecto
+            <span style={{ display: "block", fontSize: 11, color: T.mut2 }}>Queda en la misma carpeta del día: «Reporte AAAA-MM-DD - Proyecto X»</span>
+          </span>
+        </button>
         {cfgOpen && (
           <div style={{ marginTop: 12 }}>
             <Field label="Client ID de Google (OAuth, tipo Aplicación web)">
