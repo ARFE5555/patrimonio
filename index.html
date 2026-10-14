@@ -33,7 +33,7 @@ const { useState, useEffect, useRef, useMemo } = React;
 
 /* Versión de compilación. Sirve para confirmar de un vistazo qué build está
    corriendo en pantalla (útil para detectar caché vieja de la PWA). */
-const BUILD = "v5.8 · Clases (gasto / interno / venta / divisa) + reporte diario PDF/Excel → Google Drive · 2026-10-14";
+const BUILD = "v5.9 · Nómina por cédula (USD / Bs / mixto) + clases y reporte diario a Drive · 2026-10-14";
 try { console.log("[Patrimonio] build:", BUILD); } catch (e) {}
 
 /* ─────────────────────────────  Tokens de diseño  ───────────────────────────── */
@@ -1705,6 +1705,19 @@ function AppMain({ session, role, signOut }) {
     }
     setTxnSheet(false);
   }
+  /* Empleados de nómina: viven en los ajustes compartidos, con la cédula como clave. */
+  const empleados = (settings && Array.isArray(settings.empleados)) ? settings.empleados : [];
+  function saveEmpleado(e) {
+    const k = normCedula(e && e.cedula);
+    if (!k) return;
+    setSettings((s) => {
+      const lista = Array.isArray(s.empleados) ? s.empleados.slice() : [];
+      const i = lista.findIndex((x) => normCedula(x.cedula) === k);
+      const limpio = { cedula: k, nombre: e.nombre, apellido: e.apellido, pago: e.pago || "mixto", activo: e.activo !== false };
+      if (i >= 0) lista[i] = { ...lista[i], ...limpio }; else lista.push(limpio);
+      return { ...s, empleados: lista };
+    });
+  }
   /* Factura / soporte de un movimiento (gasto, venta…). Se guarda con el id
      del movimiento, igual que los comprobantes de divisas. */
   async function adjuntarSoporteTxn(txnId, file) {
@@ -2075,6 +2088,7 @@ function AppMain({ session, role, signOut }) {
         if (patch.clase !== undefined) {
           base.clase = patch.clase || undefined;
           base.categoria = patch.clase ? (patch.categoria || undefined) : undefined;
+          base.empleado = patch.empleado || undefined;
         }
         /* Si alguien justifica a mano un traslado con otro motivo —o le asigna
            un proyecto— manda su criterio: deja de ser traslado y el barrido no
@@ -2466,11 +2480,11 @@ function AppMain({ session, role, signOut }) {
         {tab === "txns" && (
           <div style={{ paddingTop: 8 }}>
             <div style={{ display: "flex", background: T.card, borderRadius: 12, padding: 4, marginBottom: 4, border: `1px solid ${T.lineSoft}` }}>
-              {[["mov", "Movimientos"], ["cierre", "Cierre"], ["reporte", "Reporte"], ["proj", "Proyectos"]].map(([v, label]) => (
+              {[["mov", "Movim."], ["cierre", "Cierre"], ["reporte", "Reporte"], ["nomina", "Nómina"], ["proj", "Proyectos"]].map(([v, label]) => (
                 <button
                   key={v}
                   onClick={() => setTxnView(v)}
-                  style={{ flex: 1, border: "none", borderRadius: 9, padding: "10px 4px", fontSize: 13, fontWeight: 600, fontFamily: FONT, cursor: "pointer", background: txnView === v ? T.gold : "transparent", color: txnView === v ? "#0A0F1E" : T.mut }}
+                  style={{ flex: 1, border: "none", borderRadius: 9, padding: "10px 2px", fontSize: 12.5, fontWeight: 600, fontFamily: FONT, cursor: "pointer", background: txnView === v ? T.gold : "transparent", color: txnView === v ? "#0A0F1E" : T.mut }}
                 >
                   {label}
                 </button>
@@ -2495,9 +2509,21 @@ function AppMain({ session, role, signOut }) {
                 onNoSugerencia={descartarSugerencia}
                 diaFijado={diaFijado}
                 onLimpiarDia={() => setDiaFijado("")}
+                empleados={empleados}
+              />
+            ) : txnView === "nomina" ? (
+              <NominaTab
+                txns={txns}
+                accounts={accountsView}
+                cur={cur}
+                empleados={empleados}
+                onSaveEmpleado={saveEmpleado}
+                canEdit={canWriteData}
+                onVerMovs={canWriteData ? ((list) => setJustifySheet({ list })) : undefined}
               />
             ) : txnView === "reporte" ? (
               <ReporteDiarioTab
+                empleados={empleados}
                 txns={txns}
                 accounts={accountsView}
                 divisas={divisas}
@@ -2677,6 +2703,8 @@ function AppMain({ session, role, signOut }) {
         onClose={() => setTxnSheet(false)}
         onSave={saveTxn}
         onDelete={deleteTxn}
+        empleados={empleados}
+        onAddEmpleado={saveEmpleado}
       />
       <StatementImportSheet
         open={stmtSheet}
@@ -2699,6 +2727,8 @@ function AppMain({ session, role, signOut }) {
         onEdit={(t) => setTxnSheet(t)}
         onReceipt={canWriteData ? adjuntarSoporteTxn : undefined}
         onReceiptDel={canWriteData ? quitarSoporteTxn : undefined}
+        empleados={empleados}
+        onAddEmpleado={saveEmpleado}
         onSave={(ids, patch, divisa) => { justifyTxns(ids, patch, divisa); setJustifySheet(null); }}
       />
       <ProjectSheet
@@ -3236,7 +3266,7 @@ function AccountsTab({ accounts, prices, cur, settings, vesRate, onSetRate, onAd
 }
 
 /* ─────────────────────────────  Tab: Movimientos  ───────────────────────────── */
-function TxnsTab({ txns, accounts, cur, onAdd, onEdit, onDelete, onDeleteMany, onBulkImport, onImportStatement, onJustify, onTraslados, onNoTraslado, onTrasladoManual, onNoSugerencia, canWrite = true, diaFijado = "", onLimpiarDia }) {
+function TxnsTab({ txns, accounts, cur, onAdd, onEdit, onDelete, onDeleteMany, onBulkImport, onImportStatement, onJustify, onTraslados, onNoTraslado, onTrasladoManual, onNoSugerencia, canWrite = true, diaFijado = "", onLimpiarDia, empleados = [] }) {
   const acct = (id) => accounts.find((a) => a.id === id);
   const acctName = (id) => (acct(id) || {}).name || "—";
   const acctCur = (t) => t.currency || (acct(t.accountId) || {}).currency || cur;
@@ -3350,7 +3380,7 @@ function TxnsTab({ txns, accounts, cur, onAdd, onEdit, onDelete, onDeleteMany, o
       return texto.includes(qn);
     }
     if (qRef && normRef(t.ref).includes(qRef)) return true;
-    const hay = [t.motivo, t.bankDesc, t.ref, t.project, acctName(t.accountId)]
+    const hay = [t.motivo, t.bankDesc, t.ref, t.project, acctName(t.accountId), t.empleado ? etiquetaEmpleado(empleados, t.empleado) + " " + normCedula(t.empleado) : ""]
       .filter(Boolean).join(" ").toLowerCase();
     if (hay.includes(qn)) return true;
     const nq = numVE(q);
@@ -4106,7 +4136,7 @@ function TxnsTab({ txns, accounts, cur, onAdd, onEdit, onDelete, onDeleteMany, o
                           const cl = claseDe(t);
                           return (
                             <div style={{ fontSize: 10.5, fontWeight: 700, letterSpacing: 0.3, marginTop: 3, color: cl ? CLASES[cl].color : T.mut2, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
-                              {cl ? (CLASES[cl].label + (categoriaDe(t) ? " · " + categoriaDe(t) : "")).toUpperCase() : "SIN CLASIFICAR"}
+                              {cl ? (CLASES[cl].label + (categoriaDe(t) ? " · " + categoriaDe(t) : "") + (t.empleado ? " · " + etiquetaEmpleado(empleados, t.empleado) : "")).toUpperCase() : "SIN CLASIFICAR"}
                             </div>
                           );
                         })()}
@@ -4384,7 +4414,7 @@ function nombreSeguro(s, max = 60) {
 }
 
 /* Arma todo lo del día a partir de los datos de la app. */
-function armarReporteDia(fecha, { txns, accounts, divisas, cur }) {
+function armarReporteDia(fecha, { txns, accounts, divisas, cur, empleados = [] }) {
   const acc = (id) => (accounts || []).find((a) => a.id === id) || {};
   const curDe = (t) => t.currency || acc(t.accountId).currency || cur || "usd";
   const filas = (txns || [])
@@ -4401,6 +4431,7 @@ function armarReporteDia(fecha, { txns, accounts, divisas, cur }) {
         claseNombre: c ? CLASES[c].label : "Sin clasificar",
         categoria: categoriaDe(t),
         motivo: t.motivo || t.bankDesc || "",
+        empleado: t.empleado ? etiquetaEmpleado(empleados, t.empleado) : "",
         referencia: t.ref || "",
         proyecto: t.project || "",
         tipo: entra ? "Entra" : "Sale",
@@ -4542,7 +4573,7 @@ async function reportePDF(rep) {
       startY: y + 6, margin: { left: M, right: M },
       head: [["Cuenta", "Categoría", "Motivo", "Ref.", "Proyecto", "Monto", "Com."]],
       body: filas.map((f) => [
-        f.cuenta, f.categoria || "-", (f.pendiente ? "[Por justificar] " : "") + f.motivo + (f.soporte ? "  (soporte adj.)" : ""),
+        f.cuenta, f.categoria || "-", (f.pendiente ? "[Por justificar] " : "") + f.motivo + (f.empleado && !f.motivo.includes(f.empleado.split(" · ")[0]) ? " - " + f.empleado : (f.empleado ? " (" + f.empleado.split(" · ").pop() + ")" : "")) + (f.soporte ? "  (soporte adj.)" : ""),
         f.referencia || "-", f.proyecto || "-",
         (f.monto < 0 ? "-" : "+") + nVE(Math.abs(f.monto)) + " " + curLbl(f.moneda),
         f.comision ? nVE(f.comision) : "",
@@ -4628,9 +4659,9 @@ async function reporteXLSX(rep) {
   rep.saldos.forEach((s) => res.push([s.cuenta, curLbl(s.moneda), r2(s.saldo), "", "", s.mov]));
   XLSX.utils.book_append_sheet(wb, hoja(res, [30, 9, 14, 14, 14, 12]), "Resumen");
 
-  const cab = ["Fecha", "Cuenta", "Clase", "Categoría", "Motivo", "Referencia", "Proyecto", "Entra/Sale", "Monto", "Comisión", "Moneda", "Por justificar", "Soporte", "Descripción banco"];
-  const fila = (f) => [rep.fecha, f.cuenta, f.claseNombre, f.categoria, f.motivo, f.referencia, f.proyecto, f.tipo, r2(f.monto), r2(f.comision), curLbl(f.moneda), f.pendiente ? "Sí" : "", f.soporte ? "Sí" : "", f.t.bankDesc || ""];
-  const anchos = [11, 20, 16, 22, 30, 16, 14, 9, 13, 10, 7, 9, 8, 34];
+  const cab = ["Fecha", "Cuenta", "Clase", "Categoría", "Empleado", "Motivo", "Referencia", "Proyecto", "Entra/Sale", "Monto", "Comisión", "Moneda", "Por justificar", "Soporte", "Descripción banco"];
+  const fila = (f) => [rep.fecha, f.cuenta, f.claseNombre, f.categoria, f.empleado, f.motivo, f.referencia, f.proyecto, f.tipo, r2(f.monto), r2(f.comision), curLbl(f.moneda), f.pendiente ? "Sí" : "", f.soporte ? "Sí" : "", f.t.bankDesc || ""];
+  const anchos = [11, 20, 16, 22, 26, 30, 16, 14, 9, 13, 10, 7, 9, 8, 34];
   XLSX.utils.book_append_sheet(wb, hoja([cab, ...rep.filas.map(fila)], anchos), "Todos");
   [["gasto", "Gastos"], ["interno", "Internos"], ["venta", "Ventas"], ["divisa", "Divisas (banco)"], ["", "Sin clasificar"]].forEach(([k, nombre]) => {
     if ((rep.porClase[k] || []).length) XLSX.utils.book_append_sheet(wb, hoja([cab, ...rep.porClase[k].map(fila)], anchos), nombre);
@@ -4810,7 +4841,7 @@ const LS_DRIVE = "fin:drive";
 function driveLocal() { try { return JSON.parse(localStorage.getItem(LS_DRIVE) || "{}") || {}; } catch (e) { return {}; } }
 function driveLocalSet(patch) { try { localStorage.setItem(LS_DRIVE, JSON.stringify({ ...driveLocal(), ...patch })); } catch (e) { /* no-op */ } }
 
-function ReporteDiarioTab({ txns, accounts, divisas, cur, settings, setSettings, canEditAll, onClasificar }) {
+function ReporteDiarioTab({ txns, accounts, divisas, cur, settings, setSettings, canEditAll, onClasificar, empleados = [] }) {
   const [fecha, setFecha] = useState(todayISO());
   const [busy, setBusy] = useState("");
   const [msg, setMsg] = useState("");
@@ -4827,7 +4858,7 @@ function ReporteDiarioTab({ txns, accounts, divisas, cur, settings, setSettings,
 
   useEffect(() => { if (clientId) ensureGIS().catch(() => {}); }, [clientId]);
 
-  const rep = useMemo(() => armarReporteDia(fecha, { txns, accounts, divisas, cur }), [fecha, txns, accounts, divisas, cur]);
+  const rep = useMemo(() => armarReporteDia(fecha, { txns, accounts, divisas, cur, empleados }), [fecha, txns, accounts, divisas, cur, empleados]);
   const sinClase = rep.porClase[""];
 
   function guardarCfg() {
@@ -4880,7 +4911,7 @@ function ReporteDiarioTab({ txns, accounts, divisas, cur, settings, setSettings,
         const hechos = [];
         let archivos = 0;
         for (let i = 0; i < dias.length; i++) {
-          const r = armarReporteDia(dias[i], { txns, accounts, divisas, cur });
+          const r = armarReporteDia(dias[i], { txns, accounts, divisas, cur, empleados });
           if (r.vacio) continue;
           const pre = dias.length > 1 ? `${dias[i]} (${i + 1}/${dias.length}) · ` : "";
           const out = await subirDiaADrive(r, raiz, (m) => setMsg(pre + m));
@@ -5742,8 +5773,397 @@ function ClasePicker({ clase, setClase, categoria, setCategoria, allowDivisa = f
   );
 }
 
+/* ─────────────────────────────  Nómina: empleados por cédula  ─────────────────────────────
+   Cada empleado se identifica por su CÉDULA, que es la clave única de búsqueda
+   (normalizada: "V-12.345.678" → "V12345678"). Un pago de nómina es un gasto
+   con categoría "Nómina" que lleva t.empleado = cédula. Como cada movimiento
+   vive en una sola cuenta, un pago mixto son varios movimientos (uno en Bs y
+   otro en USD) apuntando a la misma cédula: la vista Nómina los junta.
+   Los empleados se guardan en los ajustes compartidos (settings.empleados). */
+const NOMINA_CAT = "Nómina";
+const PAGO_EMPLEADO = {
+  usd: { label: "Dólares", corto: "USD" },
+  bs: { label: "Bolívares", corto: "Bs" },
+  mixto: { label: "Mixto (USD + Bs)", corto: "Mixto" },
+};
+function normCedula(s) {
+  const t = String(s || "").toUpperCase().replace(/[^VEJGP0-9]/g, "");
+  const m = t.match(/^([VEJGP])?0*(\d{5,10})$/);
+  if (!m) return "";
+  return (m[1] || "V") + m[2];
+}
+function fmtCedula(c) {
+  const n = normCedula(c);
+  if (!n) return String(c || "");
+  return n[0] + "-" + Number(n.slice(1)).toLocaleString("es-VE");
+}
+// Busca una cédula escrita dentro de un texto del banco ("TRF.MB 0105 V-12345678 JUAN…")
+function cedulasEnTexto(s) {
+  const out = [];
+  const re = /\b([VEJGP])\s*[-.]?\s*(\d{1,3}(?:\.\d{3}){1,2}|\d{5,10})\b/gi;
+  let m;
+  while ((m = re.exec(String(s || "")))) { const c = normCedula(m[1] + m[2]); if (c) out.push(c); }
+  return out;
+}
+function empleadoPorCedula(empleados, cedula) {
+  const k = normCedula(cedula);
+  return k ? (empleados || []).find((e) => normCedula(e.cedula) === k) || null : null;
+}
+function nombreEmpleado(e) {
+  return e ? `${e.nombre || ""} ${e.apellido || ""}`.trim() : "";
+}
+function etiquetaEmpleado(empleados, cedula) {
+  if (!cedula) return "";
+  const e = empleadoPorCedula(empleados, cedula);
+  return (e ? nombreEmpleado(e) + " · " : "") + fmtCedula(cedula);
+}
+function esNomina(t) {
+  return claseDe(t) === "gasto" && String(t.categoria || "").trim().toLowerCase() === NOMINA_CAT.toLowerCase();
+}
+/* Empleado que aparece en la descripción del banco, si está registrado. */
+function empleadoDeDescripcion(empleados, desc) {
+  for (const c of cedulasEnTexto(desc)) {
+    const e = empleadoPorCedula(empleados, c);
+    if (e) return e;
+  }
+  return null;
+}
+
+/* Selector de empleado: se busca por cédula, nombre o apellido; si no está,
+   se registra ahí mismo. */
+function EmpleadoPicker({ empleados = [], value, onChange, onAdd, sugerencia = "" }) {
+  const [q, setQ] = useState("");
+  const [nuevo, setNuevo] = useState(null);   // { nombre, apellido, cedula, pago }
+  const [errN, setErrN] = useState("");
+  const actual = empleadoPorCedula(empleados, value);
+  const qn = q.trim().toLowerCase();
+  const qc = normCedula(q) || q.replace(/\D/g, "");
+  const lista = (empleados || [])
+    .filter((e) => e.activo !== false || normCedula(e.cedula) === normCedula(value))
+    .filter((e) => !qn
+      || normCedula(e.cedula).includes(qc && qc.length >= 3 ? qc.replace(/^[VEJGP]/, "") : "\u0000")
+      || nombreEmpleado(e).toLowerCase().includes(qn))
+    .slice(0, 8);
+
+  function guardarNuevo() {
+    const ced = normCedula(nuevo.cedula);
+    if (!nuevo.nombre.trim() || !nuevo.apellido.trim()) { setErrN("Falta nombre y apellido."); return; }
+    if (!ced) { setErrN("Cédula inválida. Ej.: V-12345678"); return; }
+    if (empleadoPorCedula(empleados, ced)) { setErrN("Ya hay un empleado con esa cédula."); return; }
+    onAdd && onAdd({ cedula: ced, nombre: nuevo.nombre.trim(), apellido: nuevo.apellido.trim(), pago: nuevo.pago, activo: true });
+    onChange(ced);
+    setNuevo(null); setQ(""); setErrN("");
+  }
+
+  const box = { background: T.bg2, border: `1px solid ${actual ? T.red : T.lineSoft}`, borderRadius: 14, padding: "12px 14px", marginBottom: 14 };
+  if (actual && !nuevo) {
+    return (
+      <div style={box}>
+        <div style={{ fontSize: 11.5, color: T.mut, marginBottom: 4 }}>Empleado</div>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 }}>
+          <div style={{ minWidth: 0 }}>
+            <div style={{ fontSize: 14.5, fontWeight: 600, color: T.text }}>{nombreEmpleado(actual)}</div>
+            <div style={{ fontSize: 12, color: T.mut2, fontFamily: MONO }}>
+              {fmtCedula(actual.cedula)} · {(PAGO_EMPLEADO[actual.pago] || PAGO_EMPLEADO.mixto).corto}
+            </div>
+          </div>
+          <button onClick={() => onChange("")} style={{ ...btnGhost, color: T.blue, fontSize: 12.5, fontWeight: 600, flexShrink: 0 }}>Cambiar</button>
+        </div>
+      </div>
+    );
+  }
+  return (
+    <div style={box}>
+      <div style={{ fontSize: 13, color: T.text, fontWeight: 600, marginBottom: 8 }}>¿A quién se le pagó?</div>
+      {!nuevo ? (
+        <>
+          <input
+            style={{ ...inputStyle, fontSize: 14, padding: "10px 12px" }}
+            value={q}
+            onChange={(e) => setQ(e.target.value)}
+            placeholder="Cédula, nombre o apellido"
+          />
+          <div style={{ display: "flex", flexDirection: "column", gap: 4, marginTop: 8 }}>
+            {lista.map((e) => (
+              <button
+                key={e.cedula}
+                onClick={() => { onChange(normCedula(e.cedula)); setQ(""); }}
+                style={{ textAlign: "left", background: T.card, border: `1px solid ${normCedula(e.cedula) === normCedula(sugerencia) ? T.gold : T.lineSoft}`, borderRadius: 10, padding: "9px 12px", cursor: "pointer", fontFamily: FONT, display: "flex", justifyContent: "space-between", gap: 10 }}
+              >
+                <span style={{ fontSize: 13.5, color: T.text, fontWeight: 600 }}>{nombreEmpleado(e)}</span>
+                <span style={{ fontSize: 12, color: T.mut2, fontFamily: MONO, flexShrink: 0 }}>{fmtCedula(e.cedula)}</span>
+              </button>
+            ))}
+            {lista.length === 0 && (
+              <div style={{ fontSize: 12, color: T.mut2, padding: "4px 2px" }}>
+                {(empleados || []).length ? "Nadie coincide con esa búsqueda." : "Todavía no hay empleados registrados."}
+              </div>
+            )}
+          </div>
+          {onAdd && (
+            <button
+              onClick={() => setNuevo({ nombre: "", apellido: "", cedula: normCedula(q) ? q : "", pago: "mixto" })}
+              style={{ ...btnGhost, color: T.gold, fontSize: 12.5, fontWeight: 700, padding: "10px 0 0" }}
+            >
+              + Registrar empleado nuevo
+            </button>
+          )}
+        </>
+      ) : (
+        <EmpleadoCampos datos={nuevo} setDatos={setNuevo} err={errN} onCancel={() => { setNuevo(null); setErrN(""); }} onSave={guardarNuevo} />
+      )}
+    </div>
+  );
+}
+
+function EmpleadoCampos({ datos, setDatos, err, onCancel, onSave, cedulaFija = false, labelGuardar = "Guardar empleado" }) {
+  const set = (k) => (e) => setDatos({ ...datos, [k]: e.target.value });
+  return (
+    <div>
+      <div style={{ display: "flex", gap: 8 }}>
+        <div style={{ flex: 1 }}>
+          <label style={labelStyle}>Nombre</label>
+          <input style={{ ...inputStyle, fontSize: 14, padding: "10px 12px" }} value={datos.nombre} onChange={set("nombre")} />
+        </div>
+        <div style={{ flex: 1 }}>
+          <label style={labelStyle}>Apellido</label>
+          <input style={{ ...inputStyle, fontSize: 14, padding: "10px 12px" }} value={datos.apellido} onChange={set("apellido")} />
+        </div>
+      </div>
+      <div style={{ marginTop: 10 }}>
+        <label style={labelStyle}>Cédula (ID único)</label>
+        <input
+          style={{ ...inputStyle, fontSize: 14, padding: "10px 12px", fontFamily: MONO, opacity: cedulaFija ? 0.6 : 1 }}
+          value={datos.cedula}
+          onChange={set("cedula")}
+          disabled={cedulaFija}
+          placeholder="V-12345678"
+          autoCapitalize="characters"
+        />
+      </div>
+      <div style={{ marginTop: 10 }}>
+        <label style={labelStyle}>Se le paga en</label>
+        <div style={{ display: "flex", background: T.card, borderRadius: 12, padding: 4, gap: 3 }}>
+          {Object.entries(PAGO_EMPLEADO).map(([k, v]) => (
+            <button
+              key={k}
+              onClick={() => setDatos({ ...datos, pago: k })}
+              style={{ flex: 1, border: "none", borderRadius: 9, padding: "9px 4px", fontSize: 12.5, fontWeight: 700, fontFamily: FONT, cursor: "pointer", background: datos.pago === k ? T.gold : "transparent", color: datos.pago === k ? "#0A0F1E" : T.mut }}
+            >
+              {v.corto}
+            </button>
+          ))}
+        </div>
+      </div>
+      {err && <div style={{ fontSize: 12, color: T.red, marginTop: 8 }}>{err}</div>}
+      <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
+        <button onClick={onCancel} style={{ flex: 1, background: "transparent", color: T.mut, border: `1px solid ${T.line}`, borderRadius: 10, padding: "10px", fontSize: 13, fontWeight: 600, fontFamily: FONT, cursor: "pointer" }}>Cancelar</button>
+        <button onClick={onSave} style={{ flex: 2, background: T.gold, color: "#0A0F1E", border: "none", borderRadius: 10, padding: "10px", fontSize: 13, fontWeight: 700, fontFamily: FONT, cursor: "pointer" }}>{labelGuardar}</button>
+      </div>
+    </div>
+  );
+}
+
+/* Vista Nómina: empleados + lo pagado en el mes, separado en USD y Bs. */
+function NominaTab({ txns, accounts, cur, empleados = [], onSaveEmpleado, onVerMovs, canEdit = true }) {
+  const hoy = todayISO();
+  const [mes, setMes] = useState(hoy.slice(0, 7));
+  const [q, setQ] = useState("");
+  const [abierto, setAbierto] = useState(null);
+  const [form, setForm] = useState(null);     // { datos, editando }
+  const [err, setErr] = useState("");
+  const [verInactivos, setVerInactivos] = useState(false);
+  const acc = (id) => (accounts || []).find((a) => a.id === id) || {};
+  const curDe = (t) => String(t.currency || acc(t.accountId).currency || cur || "usd").toLowerCase();
+
+  const pagosMes = useMemo(
+    () => (txns || []).filter((t) => t.empleado && t.date && t.date.slice(0, 7) === mes && t.kind === "expense"),
+    [txns, mes]
+  );
+  const porEmpleado = useMemo(() => {
+    const m = {};
+    pagosMes.forEach((t) => {
+      const k = normCedula(t.empleado);
+      const r = (m[k] = m[k] || { usd: 0, bs: 0, otras: {}, pagos: [] });
+      const c = curDe(t);
+      if (c === "usd") r.usd += t.amount || 0;
+      else if (c === "ves") r.bs += t.amount || 0;
+      else r.otras[c] = (r.otras[c] || 0) + (t.amount || 0);
+      r.pagos.push(t);
+    });
+    return m;
+  }, [pagosMes, accounts]);
+  const totUsd = Object.values(porEmpleado).reduce((s, r) => s + r.usd, 0);
+  const totBs = Object.values(porEmpleado).reduce((s, r) => s + r.bs, 0);
+
+  // Pagos de nómina del mes que todavía no tienen empleado asignado
+  const sinEmpleado = useMemo(
+    () => (txns || []).filter((t) => t.date && t.date.slice(0, 7) === mes && esNomina(t) && !t.empleado),
+    [txns, mes]
+  );
+
+  const qn = q.trim().toLowerCase();
+  const qc = normCedula(q) || q.replace(/\D/g, "");
+  const lista = (empleados || [])
+    .filter((e) => verInactivos || e.activo !== false)
+    .filter((e) => !qn || nombreEmpleado(e).toLowerCase().includes(qn) || (qc.length >= 3 && normCedula(e.cedula).includes(qc.replace(/^[VEJGP]/, ""))))
+    .sort((a, b) => nombreEmpleado(a).localeCompare(nombreEmpleado(b), "es"));
+
+  function guardar() {
+    const d = form.datos;
+    const ced = normCedula(d.cedula);
+    if (!d.nombre.trim() || !d.apellido.trim()) { setErr("Falta nombre y apellido."); return; }
+    if (!ced) { setErr("Cédula inválida. Ej.: V-12345678"); return; }
+    if (!form.editando && empleadoPorCedula(empleados, ced)) { setErr("Ya hay un empleado con esa cédula."); return; }
+    onSaveEmpleado({ ...(form.editando || {}), cedula: ced, nombre: d.nombre.trim(), apellido: d.apellido.trim(), pago: d.pago, activo: d.activo !== false });
+    setForm(null); setErr("");
+  }
+
+  async function exportar() {
+    const XLSX = await ensureXLSXStyle();
+    const head = { font: { bold: true, color: { rgb: "FFFFFF" } }, fill: { fgColor: { rgb: "16203A" } } };
+    const res = [["Cédula", "Nombre", "Apellido", "Se le paga en", "Pagado USD", "Pagado Bs", "N.º pagos"]];
+    (empleados || []).forEach((e) => {
+      const r = porEmpleado[normCedula(e.cedula)];
+      if (!r && e.activo === false) return;
+      res.push([fmtCedula(e.cedula), e.nombre, e.apellido, (PAGO_EMPLEADO[e.pago] || PAGO_EMPLEADO.mixto).label, r2(r ? r.usd : 0), r2(r ? r.bs : 0), r ? r.pagos.length : 0]);
+    });
+    res.push(["", "", "", "TOTAL", r2(totUsd), r2(totBs), pagosMes.length]);
+    const det = [["Fecha", "Cédula", "Empleado", "Cuenta", "Moneda", "Monto", "Motivo", "Referencia"]];
+    pagosMes.slice().sort((a, b) => (a.date < b.date ? -1 : 1)).forEach((t) => {
+      const e = empleadoPorCedula(empleados, t.empleado);
+      det.push([t.date, fmtCedula(t.empleado), nombreEmpleado(e), acc(t.accountId).name || "", curLbl(curDe(t)), r2(t.amount), t.motivo || "", t.ref || ""]);
+    });
+    const hoja = (aoa, cols) => {
+      const ws = XLSX.utils.aoa_to_sheet(aoa);
+      ws["!cols"] = cols.map((w) => ({ wch: w }));
+      for (let c = 0; c < aoa[0].length; c++) { const cell = ws[XLSX.utils.encode_cell({ r: 0, c })]; if (cell) cell.s = head; }
+      return ws;
+    };
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, hoja(res, [14, 18, 18, 18, 13, 16, 10]), "Resumen");
+    XLSX.utils.book_append_sheet(wb, hoja(det, [11, 14, 26, 20, 7, 14, 28, 16]), "Pagos");
+    const out = XLSX.write(wb, { bookType: "xlsx", type: "array" });
+    descargarBlob(new Blob([out], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }), `Nomina ${mes}.xlsx`);
+  }
+
+  const card = { background: T.card, border: `1px solid ${T.lineSoft}`, borderRadius: 14 };
+  return (
+    <div style={{ paddingTop: 8 }}>
+      <div style={{ display: "flex", gap: 8, alignItems: "flex-end", marginBottom: 12 }}>
+        <div style={{ flex: 1 }}>
+          <label style={labelStyle}>Mes</label>
+          <input type="month" value={mes} onChange={(e) => e.target.value && setMes(e.target.value)} style={{ ...inputStyle, fontFamily: MONO, fontSize: 15, padding: "10px 12px" }} />
+        </div>
+        <button onClick={exportar} style={{ background: T.green, color: "#0A0F1E", border: "none", borderRadius: 11, padding: "12px 14px", fontSize: 13, fontWeight: 700, fontFamily: FONT, cursor: "pointer" }}>Excel</button>
+      </div>
+
+      <div style={{ ...card, padding: 16, marginBottom: 12, background: `linear-gradient(160deg, ${T.card2}, ${T.card})` }}>
+        <div style={{ fontSize: 13, color: T.mut }}>Nómina pagada · {carpetaMes(mes + "-01").slice(8)} {mes.slice(0, 4)}</div>
+        <div style={{ display: "flex", gap: 18, marginTop: 6, fontFamily: MONO, fontVariantNumeric: "tabular-nums" }}>
+          <div><div style={{ fontSize: 11, color: T.mut2, fontFamily: FONT }}>Dólares</div><div style={{ fontSize: 20, fontWeight: 600, color: T.text }}>{money(totUsd, "usd")}</div></div>
+          <div><div style={{ fontSize: 11, color: T.mut2, fontFamily: FONT }}>Bolívares</div><div style={{ fontSize: 20, fontWeight: 600, color: T.text }}>{money(totBs, "ves")}</div></div>
+        </div>
+        <div style={{ fontSize: 12, color: T.mut2, marginTop: 4 }}>{pagosMes.length} pago(s) · {Object.keys(porEmpleado).length} empleado(s)</div>
+      </div>
+
+      {sinEmpleado.length > 0 && (
+        <div style={{ background: T.goldSoft, border: `1px solid ${T.gold}`, borderRadius: 12, padding: "11px 14px", marginBottom: 12, fontSize: 12.5, color: T.text, lineHeight: 1.5 }}>
+          <b>{sinEmpleado.length} pago(s) de nómina sin empleado</b> este mes. No entran en los totales de arriba.
+          {onVerMovs && (
+            <button onClick={() => onVerMovs(sinEmpleado)} style={{ ...btnGhost, color: T.gold, fontWeight: 700, fontSize: 12.5, padding: "6px 0 0", display: "block" }}>
+              Asignarles empleado →
+            </button>
+          )}
+        </div>
+      )}
+
+      <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
+        <input style={{ ...inputStyle, flex: 1, fontSize: 14, padding: "10px 12px" }} value={q} onChange={(e) => setQ(e.target.value)} placeholder="Buscar por cédula o nombre" />
+        {canEdit && (
+          <button onClick={() => { setErr(""); setForm({ datos: { nombre: "", apellido: "", cedula: normCedula(q) ? q : "", pago: "mixto" }, editando: null }); }}
+            style={{ background: T.goldSoft, color: T.gold, border: `1px solid ${T.gold}`, borderRadius: 11, padding: "0 14px", fontSize: 13, fontWeight: 700, fontFamily: FONT, cursor: "pointer" }}>
+            + Empleado
+          </button>
+        )}
+      </div>
+
+      {form && (
+        <div style={{ ...card, padding: "14px 15px", marginBottom: 12, borderColor: T.gold }}>
+          <div style={{ fontSize: 13.5, fontWeight: 600, color: T.text, marginBottom: 10 }}>{form.editando ? "Editar empleado" : "Nuevo empleado"}</div>
+          <EmpleadoCampos datos={form.datos} setDatos={(d) => setForm({ ...form, datos: d })} err={err} cedulaFija={!!form.editando}
+            onCancel={() => { setForm(null); setErr(""); }} onSave={guardar} />
+          {form.editando && (
+            <button onClick={() => setForm({ ...form, datos: { ...form.datos, activo: form.datos.activo === false } })}
+              style={{ ...btnGhost, color: form.datos.activo === false ? T.green : T.red, fontSize: 12.5, fontWeight: 600, padding: "10px 0 0" }}>
+              {form.datos.activo === false ? "Reactivar (se guarda al tocar Guardar)" : "Marcar como inactivo (se guarda al tocar Guardar)"}
+            </button>
+          )}
+        </div>
+      )}
+
+      {lista.length === 0 ? (
+        <div style={emptyRow}>{(empleados || []).length ? "Nadie coincide con esa búsqueda." : "Registrá a tus empleados con su cédula para asignarles los pagos de nómina."}</div>
+      ) : (
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          {lista.map((e) => {
+            const k = normCedula(e.cedula);
+            const r = porEmpleado[k];
+            const open = abierto === k;
+            const mixtoReal = r && r.usd > 0 && r.bs > 0;
+            return (
+              <div key={k} style={{ ...card, overflow: "hidden", opacity: e.activo === false ? 0.6 : 1 }}>
+                <button onClick={() => setAbierto(open ? null : k)} style={{ width: "100%", background: "transparent", border: "none", padding: "12px 15px", cursor: "pointer", fontFamily: FONT, textAlign: "left" }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "baseline" }}>
+                    <span style={{ fontSize: 14.5, fontWeight: 600, color: T.text, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{nombreEmpleado(e)}</span>
+                    <span style={{ fontSize: 10.5, fontWeight: 700, color: T.gold, background: T.goldSoft, borderRadius: 6, padding: "2px 6px", flexShrink: 0 }}>
+                      {(PAGO_EMPLEADO[e.pago] || PAGO_EMPLEADO.mixto).corto.toUpperCase()}
+                    </span>
+                  </div>
+                  <div style={{ fontSize: 12, color: T.mut2, fontFamily: MONO, marginTop: 2 }}>{fmtCedula(e.cedula)}{e.activo === false ? " · inactivo" : ""}</div>
+                  <div style={{ display: "flex", gap: 12, marginTop: 6, fontSize: 12.5, fontFamily: MONO }}>
+                    {r ? (
+                      <>
+                        {r.usd > 0 && <span style={{ color: T.text }}>{money(r.usd, "usd")}</span>}
+                        {r.bs > 0 && <span style={{ color: T.text }}>{money(r.bs, "ves")}</span>}
+                        {Object.entries(r.otras).map(([c, v]) => <span key={c} style={{ color: T.text }}>{money(v, c)}</span>)}
+                        <span style={{ color: T.mut2, fontFamily: FONT }}>{r.pagos.length} pago(s){mixtoReal ? " · mixto" : ""}</span>
+                      </>
+                    ) : <span style={{ color: T.mut2, fontFamily: FONT }}>Sin pagos este mes</span>}
+                  </div>
+                </button>
+                {open && (
+                  <div style={{ borderTop: `1px solid ${T.lineSoft}`, padding: "10px 15px 12px", background: T.bg2 }}>
+                    {(r ? r.pagos : []).slice().sort((a, b) => (a.date < b.date ? -1 : 1)).map((t) => (
+                      <div key={t.id} style={{ display: "flex", justifyContent: "space-between", gap: 10, fontSize: 12.5, padding: "3px 0" }}>
+                        <span style={{ color: T.mut, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{fmtDate(t.date)} · {acc(t.accountId).name || "—"}</span>
+                        <span style={{ fontFamily: MONO, color: T.red, flexShrink: 0 }}>−{money(t.amount, curDe(t))}</span>
+                      </div>
+                    ))}
+                    {canEdit && (
+                      <button onClick={() => { setErr(""); setForm({ datos: { nombre: e.nombre || "", apellido: e.apellido || "", cedula: fmtCedula(e.cedula), pago: e.pago || "mixto", activo: e.activo }, editando: e }); }}
+                        style={{ ...btnGhost, color: T.blue, fontSize: 12.5, fontWeight: 600, padding: "8px 0 0" }}>
+                        Editar datos
+                      </button>
+                    )}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+      {(empleados || []).some((e) => e.activo === false) && (
+        <button onClick={() => setVerInactivos((v) => !v)} style={{ ...btnGhost, color: T.mut, fontSize: 12.5, padding: "12px 0" }}>
+          {verInactivos ? "Ocultar inactivos" : "Ver también los inactivos"}
+        </button>
+      )}
+    </div>
+  );
+}
+
 /* ─────────────────────────────  Justificar movimientos importados  ───────────────────────────── */
-function JustifySheet({ state, projects, txns, cur, accounts, divisas, onClose, onSave, onEdit, onReceipt, onReceiptDel }) {
+function JustifySheet({ state, projects, txns, cur, accounts, divisas, onClose, onSave, onEdit, onReceipt, onReceiptDel, empleados = [], onAddEmpleado }) {
   const open = !!state;
   const target = (state && state.list) || [];
   const single = target.length === 1 ? target[0] : null;
@@ -5754,6 +6174,8 @@ function JustifySheet({ state, projects, txns, cur, accounts, divisas, onClose, 
   // Clase del movimiento: gasto / interno / venta / divisa
   const [clase, setClase] = useState("");
   const [categoria, setCategoria] = useState("");
+  const [empleado, setEmpleado] = useState("");     // cédula, solo para Nómina
+  const [empSugerido, setEmpSugerido] = useState("");
   // Operación de divisas asociada a este movimiento
   const [divKindSel, setDivKindSel] = useState("");   // "" | "compra" | "venta"
   const [persona, setPersona] = useState("");
@@ -5780,7 +6202,16 @@ function JustifySheet({ state, projects, txns, cur, accounts, divisas, onClose, 
     setTasa(yaDiv && yaDiv.tasa ? String(yaDiv.tasa) : "");
     setClase(single ? claseDe(single) : "");
     setCategoria(single ? (claseDe(single) === "divisa" ? "" : categoriaDe(single)) : "");
+    setEmpleado(single && single.empleado ? single.empleado : "");
+    /* Si la descripción del banco trae la cédula de un empleado registrado, se
+       propone como pago de nómina (solo si todavía no tenía clase). */
+    const sug = single && single.kind === "expense" ? empleadoDeDescripcion(empleados, single.bankDesc) : null;
+    setEmpSugerido(sug ? normCedula(sug.cedula) : "");
+    if (sug && !claseDe(single) && !single.empleado) {
+      setClase("gasto"); setCategoria(NOMINA_CAT); setEmpleado(normCedula(sug.cedula));
+    }
   }, [state]);
+  const esPagoNomina = clase === "gasto" && categoria.trim().toLowerCase() === NOMINA_CAT.toLowerCase();
 
   const catsUsadas = useMemo(
     () => (txns || []).filter((t) => t.clase && t.categoria).map((t) => ({ clase: t.clase, categoria: t.categoria })),
@@ -5829,7 +6260,9 @@ function JustifySheet({ state, projects, txns, cur, accounts, divisas, onClose, 
   const proj = project === "__new" ? newProject.trim() : project;
   /* El motivo puede quedar vacío si se eligió una categoría (o es divisa):
      en ese caso la categoría pasa a ser el motivo. */
+  const empSel = esPagoNomina ? empleadoPorCedula(empleados, empleado) : null;
   const motivoFinal = motivo.trim()
+    || (empSel ? `${NOMINA_CAT} · ${nombreEmpleado(empSel)}` : "")
     || categoria.trim()
     || (divKind === "compra" ? "Compra de divisas" : divKind === "venta" ? "Venta de divisas" : "");
   const valid = motivoFinal && !(project === "__new" && !newProject.trim()) && !(clase === "divisa" && !divKind && !esAbono);
@@ -5907,6 +6340,9 @@ function JustifySheet({ state, projects, txns, cur, accounts, divisas, onClose, 
           allowDivisa={!!single}
           usadas={catsUsadas}
         />
+      )}
+      {!esAbono && esPagoNomina && (
+        <EmpleadoPicker empleados={empleados} value={empleado} onChange={setEmpleado} onAdd={onAddEmpleado} sugerencia={empSugerido} />
       )}
 
       <Field label={clase && clase !== "divisa" ? "Detalle / motivo (opcional si elegiste categoría)" : "Motivo / justificación"}>
@@ -6067,6 +6503,7 @@ function JustifySheet({ state, projects, txns, cur, accounts, divisas, onClose, 
           if (!esAbono && (single || clase)) {
             patch.clase = clase === "divisa" ? "" : clase;
             patch.categoria = clase === "divisa" ? "" : categoria.trim();
+            patch.empleado = esPagoNomina ? (normCedula(empleado) || "") : "";
           }
           onSave(ids, patch, divisa);
         }}
@@ -6183,7 +6620,7 @@ function AccountSheet({ state, cur, onClose, onSave, onDelete }) {
 }
 
 /* ─────────────────────────────  Sheet: Movimiento  ───────────────────────────── */
-function TxnSheet({ state, accounts, cur, vesRate, projects, onClose, onSave, onDelete }) {
+function TxnSheet({ state, accounts, cur, vesRate, projects, onClose, onSave, onDelete, empleados = [], onAddEmpleado }) {
   const open = !!state;
   const editing = state && state.id;
   const usable = accounts.filter((a) => a.type === "bank" || a.type === "cash");
@@ -6199,12 +6636,14 @@ function TxnSheet({ state, accounts, cur, vesRate, projects, onClose, onSave, on
   const [newProject, setNewProject] = useState("");
   const [clase, setClase] = useState("");
   const [categoria, setCategoria] = useState("");
+  const [empleado, setEmpleado] = useState("");
   // Las divisas y los traslados se clasifican solos: no se pisan desde acá
   const claseFija = !!(state && state.id && (state.divisaId || state.abonoId || esTraslado(state)));
   useEffect(() => {
     if (state && state.id) {
       setClase(state.clase || "");
       setCategoria(state.categoria || "");
+      setEmpleado(state.empleado || "");
       setKind(state.kind || "expense");
       setAmount(String(state.amount ?? ""));
       setMotivo(state.motivo || "");
@@ -6218,9 +6657,11 @@ function TxnSheet({ state, accounts, cur, vesRate, projects, onClose, onSave, on
     } else if (state) {
       setKind("expense"); setAmount(""); setMotivo(""); setAccountId(usable[0]?.id || ""); setDate(todayISO());
       setComMode("none"); setComManual(""); setComUsd(""); setProject(""); setNewProject("");
-      setClase(""); setCategoria("");
+      setClase(""); setCategoria(""); setEmpleado("");
     }
   }, [state]);
+  const esPagoNomina = clase === "gasto" && categoria.trim().toLowerCase() === NOMINA_CAT.toLowerCase();
+  const empSel = esPagoNomina ? empleadoPorCedula(empleados, empleado) : null;
 
   const acct = usable.find((a) => a.id === accountId);
   const acctCur = (acct && acct.currency) || cur;
@@ -6235,7 +6676,7 @@ function TxnSheet({ state, accounts, cur, vesRate, projects, onClose, onSave, on
   const egresoTotal = (isNaN(nAmount) ? 0 : nAmount) + comAcct;
   const saldo = acct ? acct.balance || 0 : 0;
   const insuf = kind === "expense" && !isNaN(nAmount) && nAmount > 0 && egresoTotal > saldo + 1e-6;
-  const motivoFinal = motivo.trim() || categoria.trim();
+  const motivoFinal = motivo.trim() || (empSel ? `${NOMINA_CAT} · ${nombreEmpleado(empSel)}` : "") || categoria.trim();
   const valid = amount && !isNaN(nAmount) && nAmount > 0 && accountId && motivoFinal && !(project === "__new" && !newProject.trim());
   const seg = (a, color) => ({ flex: 1, border: "none", borderRadius: 9, padding: "11px", fontSize: 14.5, fontWeight: 600, fontFamily: FONT, cursor: "pointer", background: a ? color : "transparent", color: a ? "#0A0F1E" : T.mut });
 
@@ -6259,6 +6700,9 @@ function TxnSheet({ state, accounts, cur, vesRate, projects, onClose, onSave, on
             <div style={{ fontSize: 12.5, color: T.mut, marginBottom: 14 }}>Clasificación: <b style={{ color: T.text }}>{claseLabel(state)}</b></div>
           ) : (
             <ClasePicker clase={clase} setClase={setClase} categoria={categoria} setCategoria={setCategoria} />
+          )}
+          {!claseFija && esPagoNomina && (
+            <EmpleadoPicker empleados={empleados} value={empleado} onChange={setEmpleado} onAdd={onAddEmpleado} />
           )}
           <Field label="Motivo">
             <input style={inputStyle} value={motivo} onChange={(e) => setMotivo(e.target.value)} placeholder={categoria || "Ej. Sueldo, Supermercado, Alquiler…"} />
@@ -6317,7 +6761,7 @@ function TxnSheet({ state, accounts, cur, vesRate, projects, onClose, onSave, on
               No disponés de fondos suficientes. Saldo de la cuenta: <span style={{ fontFamily: MONO, fontWeight: 600 }}>{money(saldo, acctCur)}</span>{comAcct > 0 ? ` · egreso + comisión: ${money(egresoTotal, acctCur)}` : ""} · quedaría en <span style={{ fontFamily: MONO, fontWeight: 600 }}>{money(saldo - egresoTotal, acctCur)}</span>.
             </div>
           )}
-          <PrimaryBtn color={kind === "income" ? T.green : T.red} disabled={!valid} onClick={() => onSave({ id: editing ? state.id : undefined, kind, amount: nAmount, motivo: motivoFinal, ...(claseFija ? {} : { clase: clase || undefined, categoria: (clase && categoria.trim()) || undefined }), accountId, date, currency: acctCur, commission: comAcct, comMode, comUsd: comUsdVal || undefined, project: proj || undefined })}>
+          <PrimaryBtn color={kind === "income" ? T.green : T.red} disabled={!valid} onClick={() => onSave({ id: editing ? state.id : undefined, kind, amount: nAmount, motivo: motivoFinal, ...(claseFija ? {} : { clase: clase || undefined, categoria: (clase && categoria.trim()) || undefined, empleado: (esPagoNomina && normCedula(empleado)) || undefined }), accountId, date, currency: acctCur, commission: comAcct, comMode, comUsd: comUsdVal || undefined, project: proj || undefined })}>
             {kind === "income" ? (editing ? "Guardar cambios" : "Registrar ingreso") : editing ? "Guardar cambios" : insuf ? "Registrar de todos modos" : "Registrar egreso"}
           </PrimaryBtn>
           {editing && (
