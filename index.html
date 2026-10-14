@@ -36,7 +36,7 @@ const { useState, useEffect, useRef, useMemo } = React;
 
 /* Versión de compilación. Sirve para confirmar de un vistazo qué build está
    corriendo en pantalla (útil para detectar caché vieja de la PWA). */
-const BUILD = "v6.4 · Reporte diario por proyecto (opcional) en pantalla, PDF, Excel y Drive · 2026-10-14";
+const BUILD = "v6.5 · Divisas: meses anteriores plegados (ventas, sin asignar, por cobrar) · 2026-10-14";
 try { console.log("[Patrimonio] build:", BUILD); } catch (e) {}
 
 /* ─────────────────────────────  Tokens de diseño  ───────────────────────────── */
@@ -8262,8 +8262,14 @@ function CxCTab({ divisas, accounts = [], projects = [], canWrite = true, onAddA
                 {open && (
                   <div style={{ padding: "4px 15px 16px", borderTop: `1px solid ${T.lineSoft}` }}>
                     <div style={{ ...sectionTitle, margin: "14px 0 8px" }}>Operaciones ({c.compras.length + c.ventas.length})</div>
-                    <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-                      {[...c.compras, ...c.ventas].sort(byDateDesc).map((d) => (
+                    <MesesPlegables
+                      compacto
+                      gap={6}
+                      items={[...c.compras, ...c.ventas].sort(byDateDesc)}
+                      fecha={(d) => d.date}
+                      abrirTodo={!!qn}
+                      resumen={(arr) => fmtUsd(arr.reduce((x, d) => x + (d.kind === "compra" ? (d.usd || 0) - comUsdOf(d) : (d.usd || 0)), 0))}
+                      render={(d) => (
                         <div key={d.id} style={{ display: "flex", justifyContent: "space-between", background: T.bg2, border: `1px solid ${matchOpCxC(d) ? T.gold : T.lineSoft}`, borderRadius: 10, padding: "8px 11px" }}>
                           <span style={{ fontSize: 12, color: d.kind === "compra" ? T.text : T.mut }}>
                             {d.kind === "compra" ? "Compra" : "Venta"} · {fmtDate(d.date)}{d.referencia ? ` · ref ${d.referencia}` : ""}
@@ -8271,8 +8277,8 @@ function CxCTab({ divisas, accounts = [], projects = [], canWrite = true, onAddA
                           </span>
                           <span style={{ fontSize: 12.5, fontFamily: MONO, fontWeight: 600, color: T.text }}>{fmtUsd(d.kind === "compra" ? (d.usd || 0) - comUsdOf(d) : d.usd)}</span>
                         </div>
-                      ))}
-                    </div>
+                      )}
+                    />
                     {c.ventas.length > 0 && (
                       <div style={{ fontSize: 11.5, color: T.mut2, marginTop: 6 }}>
                         Las ventas se muestran como referencia; el pendiente se calcula sobre las compras.
@@ -8283,8 +8289,14 @@ function CxCTab({ divisas, accounts = [], projects = [], canWrite = true, onAddA
                     {c.abonos.length === 0 ? (
                       <div style={{ fontSize: 12.5, color: T.mut, marginBottom: 6 }}>Sin abonos registrados.</div>
                     ) : (
-                      <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-                        {c.abonos.slice().sort(byDateDesc).map((a) => (
+                      <MesesPlegables
+                        compacto
+                        gap={6}
+                        items={c.abonos.slice().sort(byDateDesc)}
+                        fecha={(a) => a.date}
+                        abrirTodo={!!qn}
+                        resumen={(arr) => "+" + fmtUsd(arr.reduce((x, a) => x + (a.usd || 0), 0))}
+                        render={(a) => (
                           <div key={a.id} style={{ background: T.bg2, border: `1px solid ${matchOpCxC(a) ? T.gold : T.lineSoft}`, borderRadius: 10, padding: "9px 11px" }}>
                             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}>
                               <div style={{ minWidth: 0 }}>
@@ -8323,8 +8335,8 @@ function CxCTab({ divisas, accounts = [], projects = [], canWrite = true, onAddA
                               ) : null}
                             </div>
                           </div>
-                        ))}
-                      </div>
+                        )}
+                      />
                     )}
                     {err && <div style={{ fontSize: 12.5, color: T.red, marginTop: 8 }}>{err}</div>}
 
@@ -8437,6 +8449,82 @@ function CxCTab({ divisas, accounts = [], projects = [], canWrite = true, onAddA
           )
         ))}
       </Sheet>
+    </div>
+  );
+}
+
+/* ─────────────────────────────  Meses plegables (genérico)  ─────────────────────────────
+   Lista agrupada por mes: el mes en curso (y fechas futuras) se ve abierto;
+   cada mes anterior queda en una tarjeta desplegable "Mes Año" y sus filas no
+   se dibujan hasta abrirla. Dentro de cada mes se dibuja por tandas.
+   `items` ya viene ordenado (más nuevo primero). */
+function MesesPlegables({ items, fecha, render, abrirTodo = false, gap = 8, tanda = 80, resumen, compacto = false }) {
+  const mesActual = todayISO().slice(0, 7);
+  const [abiertos, setAbiertos] = useState({});
+  const [lims, setLims] = useState({});
+  const grupos = useMemo(() => {
+    const m = new Map();
+    (items || []).forEach((it) => {
+      const k = String(fecha(it) || "").slice(0, 7) || "sin-fecha";
+      if (!m.has(k)) m.set(k, []);
+      m.get(k).push(it);
+    });
+    return Array.from(m.entries()).sort((a, b) => (a[0] < b[0] ? 1 : -1));
+  }, [items]);
+  const nombre = (k) => {
+    const [y, mm] = String(k).split("-");
+    return MESES_ES[Number(mm) - 1] ? `${MESES_ES[Number(mm) - 1]} ${y}` : "Sin fecha";
+  };
+  const lista = (k, arr) => {
+    const lim = lims[k] || tanda;
+    const vis = arr.slice(0, lim);
+    return (
+      <div className="pt-list" style={{ display: "flex", flexDirection: "column", gap }}>
+        {vis.map(render)}
+        {vis.length < arr.length && (
+          <button
+            onClick={() => setLims((l) => ({ ...l, [k]: lim + tanda * 2 }))}
+            style={{ width: "100%", background: "transparent", color: T.blue, border: `1px dashed ${T.line}`, borderRadius: 12, padding: compacto ? "8px" : "11px", fontSize: 12.5, fontWeight: 600, fontFamily: FONT, cursor: "pointer" }}
+          >
+            <ConIco name="descarga" size={14}>Mostrar más ({arr.length - vis.length} restantes)</ConIco>
+          </button>
+        )}
+      </div>
+    );
+  };
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap }}>
+      {grupos.map(([k, arr]) => {
+        if (k >= mesActual) return <React.Fragment key={k}>{lista(k, arr)}</React.Fragment>;
+        const abierto = abiertos[k] !== undefined ? abiertos[k] : abrirTodo;
+        return (
+          <div key={k} style={{ background: compacto ? T.bg2 : T.card, border: `1px solid ${abierto ? T.line : T.lineSoft}`, borderRadius: compacto ? 11 : 14, overflow: "hidden" }}>
+            <button
+              onClick={() => setAbiertos((m) => ({ ...m, [k]: !abierto }))}
+              style={{ width: "100%", background: "transparent", border: "none", padding: compacto ? "9px 11px" : "12px 14px", cursor: "pointer", fontFamily: FONT, textAlign: "left", display: "flex", alignItems: "center", gap: 10 }}
+            >
+              {!compacto && (
+                <span style={{ width: 30, height: 30, borderRadius: 9, background: T.goldSoft, color: T.gold, display: "inline-flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+                  <Ico name="calendario" size={15} />
+                </span>
+              )}
+              <span style={{ flex: 1, minWidth: 0 }}>
+                <span style={{ fontSize: compacto ? 13 : 14.5, fontWeight: 650, color: T.text }}>{nombre(k)}</span>
+                <span style={{ display: "flex", flexWrap: "wrap", gap: "2px 10px", marginTop: 2, fontSize: 11.5, color: T.mut2 }}>
+                  <span>{arr.length} registro(s)</span>
+                  {resumen && <span style={{ fontFamily: MONO, color: T.mut }}>{resumen(arr)}</span>}
+                </span>
+              </span>
+              <Ico name="flecha" size={15} color={T.mut} style={{ transform: abierto ? "rotate(90deg)" : "none", transition: "transform .25s cubic-bezier(.22,1,.36,1)" }} />
+            </button>
+            {abierto && (
+              <div className="pt-pop" style={{ borderTop: `1px solid ${T.lineSoft}`, padding: compacto ? "8px" : "12px 10px", background: compacto ? T.card : T.bg2 }}>
+                {lista(k, arr)}
+              </div>
+            )}
+          </div>
+        );
+      })}
     </div>
   );
 }
@@ -8726,8 +8814,12 @@ function DivisasTab({ divisas, onAdd, onEdit, onDelete, onPatch, canWrite = true
       {ventasOrden.length === 0 ? (
         <div style={emptyRow}>{qn ? "Ninguna venta coincide con la búsqueda" : "Registrá tu primera venta de divisas"}</div>
       ) : (
-        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-          {ventasOrden.map((v) => {
+        <MesesPlegables
+          items={ventasOrden}
+          fecha={(v) => v.date}
+          abrirTodo={!!qn}
+          resumen={(arr) => `${fmtUsd(arr.reduce((x, v) => x + (v.usd || 0), 0))} vendidos`}
+          render={(v) => {
             const st = statsDeVenta(v);
             const open = openId === v.id;
             const pagos = v.abonos || [];
@@ -8868,16 +8960,20 @@ function DivisasTab({ divisas, onAdd, onEdit, onDelete, onPatch, canWrite = true
                 )}
               </div>
             );
-          })}
-        </div>
+          }}
+        />
       )}
 
       {alloc.unalloc.length > 0 && (
         <>
           <div style={{ ...sectionTitle, margin: "22px 0 10px" }}>Sin asignar (sin venta con VES disponibles)</div>
-          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-            {alloc.unalloc.map((a, i) => allocRow(a, i))}
-          </div>
+          <MesesPlegables
+            items={alloc.unalloc.slice().sort((a, b) => (String(a.compra.date) < String(b.compra.date) ? 1 : -1))}
+            fecha={(a) => a.compra.date}
+            abrirTodo={!!qn}
+            resumen={(arr) => `${fmtUsd(arr.reduce((x, a) => x + (a.usd || 0), 0))} sin asignar`}
+            render={(a, i) => allocRow(a, i)}
+          />
         </>
       )}
 
