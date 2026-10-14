@@ -36,7 +36,7 @@ const { useState, useEffect, useRef, useMemo } = React;
 
 /* Versión de compilación. Sirve para confirmar de un vistazo qué build está
    corriendo en pantalla (útil para detectar caché vieja de la PWA). */
-const BUILD = "v6.2 · Google Drive conectado (Client ID incluido, cuenta jwmedicalca) · 2026-10-14";
+const BUILD = "v6.3 · Reporte: total del día con todos los ingresos y egresos + sin clasificar visible · 2026-10-14";
 try { console.log("[Patrimonio] build:", BUILD); } catch (e) {}
 
 /* ─────────────────────────────  Tokens de diseño  ───────────────────────────── */
@@ -4576,6 +4576,16 @@ function armarReporteDia(fecha, { txns, accounts, divisas, cur, empleados = [] }
   });
   const comisiones = {};
   filas.forEach((f) => { if (f.comision) comisiones[f.moneda] = (comisiones[f.moneda] || 0) + f.comision; });
+  /* Total del día por moneda, con TODOS los movimientos (cualquier clase,
+     clasificados o no): ingresos, egresos, comisiones y neto. Es el mismo
+     criterio que el saldo de las cuentas. */
+  const general = {};
+  filas.forEach((f) => {
+    const g = (general[f.moneda] = general[f.moneda] || { ingresos: 0, egresos: 0, comisiones: 0, nIng: 0, nEgr: 0 });
+    if (f.monto >= 0) { g.ingresos += f.monto; g.nIng++; } else { g.egresos += -f.monto; g.nEgr++; }
+    g.comisiones += f.comision || 0;
+  });
+  Object.values(general).forEach((g) => { g.neto = g.ingresos - g.egresos - g.comisiones; });
 
   // Operaciones cambiarias del día (incluye las que no pasan por banco, ej. Binance P2P)
   const ops = (divisas || []).filter((d) => d.date === fecha && (d.kind === "compra" || d.kind === "venta" || d.kind === "abono"));
@@ -4607,7 +4617,7 @@ function armarReporteDia(fecha, { txns, accounts, divisas, cur, empleados = [] }
     })
     .filter((s) => s.mov > 0 || Math.abs(s.saldo) > 0.005);
 
-  return { fecha, filas, porClase, totales, comisiones, ops: opsFilas, pagosVenta, saldos,
+  return { fecha, filas, porClase, totales, comisiones, general, ops: opsFilas, pagosVenta, saldos,
     vacio: filas.length === 0 && opsFilas.length === 0 && pagosVenta.length === 0 };
 }
 
@@ -4660,8 +4670,11 @@ async function reportePDF(rep) {
   doc.text("Generado por Patrimonio el " + new Date().toLocaleString("es-VE"), W - M, M + 24, { align: "right" });
   let y = M + 44;
 
-  // Resumen por clase y moneda
+  // Resumen: primero el total del día, después por clase y moneda
   const resumen = [];
+  Object.entries(rep.general).forEach(([mon, g]) => {
+    resumen.push(["TOTAL DEL DÍA (todos los movimientos)", curLbl(mon), nVE(g.ingresos), nVE(g.egresos + g.comisiones), nVE(g.neto), String(g.nIng + g.nEgr)]);
+  });
   CLASES_ORDEN.concat([""]).forEach((k) => {
     const porMon = rep.totales[k] || {};
     Object.keys(porMon).forEach((mon) => {
@@ -4680,6 +4693,7 @@ async function reportePDF(rep) {
       styles: { fontSize: 9, cellPadding: 4, textColor: tinta },
       headStyles: { fillColor: [22, 32, 58], textColor: 255 },
       columnStyles: { 2: { halign: "right" }, 3: { halign: "right" }, 4: { halign: "right", fontStyle: "bold" }, 5: { halign: "center" } },
+      didParseCell: (d) => { if (d.section === "body" && String(d.row.raw[0]).startsWith("TOTAL")) { d.cell.styles.fontStyle = "bold"; d.cell.styles.fillColor = [232, 238, 250]; } },
     });
     y = doc.lastAutoTable.finalY + 18;
   }
@@ -4765,6 +4779,9 @@ async function reporteXLSX(rep) {
   const wb = XLSX.utils.book_new();
 
   const res = [["Concepto", "Moneda", "Entra", "Sale", "Neto", "Movimientos"]];
+  Object.entries(rep.general).forEach(([mon, g]) => {
+    res.push(["TOTAL DEL DÍA", curLbl(mon), r2(g.ingresos), r2(g.egresos + g.comisiones), r2(g.neto), g.nIng + g.nEgr]);
+  });
   CLASES_ORDEN.concat([""]).forEach((k) => {
     const porMon = rep.totales[k] || {};
     Object.keys(porMon).forEach((mon) => {
@@ -5079,8 +5096,42 @@ function ReporteDiarioTab({ txns, accounts, divisas, cur, settings, setSettings,
         <div style={emptyRow}>No hay movimientos ni operaciones el {fmtDate(fecha)}.</div>
       ) : (
         <>
+          <div style={{ background: `linear-gradient(160deg, ${T.card2}, ${T.card})`, border: `1px solid ${T.line}`, borderRadius: 16, padding: "14px 16px", marginBottom: 10 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 10, marginBottom: 6 }}>
+              <span style={{ fontSize: 13, color: T.mut, fontWeight: 600 }}><Ico name="reporte" size={15} color={T.gold} style={{ marginRight: 6 }} />Total del día</span>
+              <span style={{ fontSize: 11.5, color: T.mut2 }}>{rep.filas.length} movimiento(s)</span>
+            </div>
+            {Object.entries(rep.general).map(([mon, g]) => (
+              <div key={mon} style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "4px 12px", fontFamily: MONO, fontVariantNumeric: "tabular-nums", fontSize: 13, padding: "6px 0", borderTop: `1px solid ${T.lineSoft}` }}>
+                <div><div style={{ fontSize: 10.5, color: T.mut2, fontFamily: FONT }}>Ingresos ({g.nIng})</div><div style={{ color: T.green, fontWeight: 600 }}>+{money(g.ingresos, mon)}</div></div>
+                <div><div style={{ fontSize: 10.5, color: T.mut2, fontFamily: FONT }}>Egresos ({g.nEgr})</div><div style={{ color: T.red, fontWeight: 600 }}>−{money(g.egresos, mon)}</div></div>
+                {g.comisiones > 0.004 && <div><div style={{ fontSize: 10.5, color: T.mut2, fontFamily: FONT }}>Comisiones</div><div style={{ color: T.gold }}>−{money(g.comisiones, mon)}</div></div>}
+                <div><div style={{ fontSize: 10.5, color: T.mut2, fontFamily: FONT }}>Neto</div><div style={{ color: g.neto >= 0 ? T.text : T.red, fontWeight: 700 }}>{g.neto >= 0 ? "+" : "−"}{money(Math.abs(g.neto), mon)}</div></div>
+              </div>
+            ))}
+            {rep.filas.length === 0 && <div style={{ fontSize: 12.5, color: T.mut2 }}>Sin movimientos de banco este día (solo operaciones cambiarias).</div>}
+          </div>
+
           <div className="pt-list" style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 12 }}>
-            {CLASES_ORDEN.map((k) => {
+            {CLASES_ORDEN.concat(sinClase.length ? [""] : []).map((k) => {
+              if (k === "") {
+                const porMon = rep.totales[""] || {};
+                return (
+                  <div key="sin" style={{ background: T.card, border: `1px dashed ${T.gold}`, borderRadius: 14, padding: "11px 13px", gridColumn: "1 / -1" }}>
+                    <div style={{ fontSize: 11.5, fontWeight: 700, color: T.gold, letterSpacing: 0.3, display: "flex", alignItems: "center", gap: 6 }}>
+                      <span style={{ width: 26, height: 26, borderRadius: 8, background: T.goldSoft, display: "inline-flex", alignItems: "center", justifyContent: "center" }}><Ico name="alerta" size={15} /></span>
+                      SIN CLASIFICAR
+                    </div>
+                    <div style={{ fontSize: 11.5, color: T.mut2, margin: "2px 0 4px" }}>{sinClase.length} registro(s) · también suman en el total del día</div>
+                    {Object.entries(porMon).map(([mon, v]) => (
+                      <div key={mon} style={{ fontFamily: MONO, fontSize: 12.5, lineHeight: 1.5, display: "flex", gap: 12 }}>
+                        {v.entra > 0 && <span style={{ color: T.green }}>+{money(v.entra, mon)}</span>}
+                        {v.sale > 0 && <span style={{ color: T.red }}>−{money(v.sale, mon)}</span>}
+                      </div>
+                    ))}
+                  </div>
+                );
+              }
               const porMon = rep.totales[k] || {};
               const n = rep.porClase[k].length + (k === "divisa" ? rep.ops.filter((o) => !rep.porClase.divisa.some((f) => f.t.divisaId === o.id || f.t.abonoId === o.id)).length : 0);
               return (
