@@ -36,7 +36,7 @@ const { useState, useEffect, useRef, useMemo } = React;
 
 /* Versión de compilación. Sirve para confirmar de un vistazo qué build está
    corriendo en pantalla (útil para detectar caché vieja de la PWA). */
-const BUILD = "v6.1 · Meses anteriores plegados en Movimientos (carga por demanda) · 2026-10-14";
+const BUILD = "v6.2 · Google Drive conectado (Client ID incluido, cuenta jwmedicalca) · 2026-10-14";
 try { console.log("[Patrimonio] build:", BUILD); } catch (e) {}
 
 /* ─────────────────────────────  Tokens de diseño  ───────────────────────────── */
@@ -4504,6 +4504,11 @@ const r2 = (x) => Math.round(((Number(x) || 0) + Number.EPSILON) * 100) / 100;
 const MESES_ES = ["Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio", "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"];
 const DRIVE_RAIZ_NOMBRE = "Patrimonio – Contabilidad";
 const DRIVE_SCOPE = "https://www.googleapis.com/auth/drive.file";
+/* Cliente OAuth del proyecto "Patrimonio Drive" en Google Cloud (tipo
+   Aplicación web, origen https://arfe5555.github.io). El Client ID es público
+   por diseño: no es una clave secreta. Se puede cambiar en Reporte → Drive. */
+const DRIVE_CLIENT_ID_DEFAULT = "945682243834-cqi3e8bpghe6pilqju9rn2a2chfaqppc.apps.googleusercontent.com";
+const DRIVE_HINT_DEFAULT = "jwmedicalca@gmail.com";
 const FOLDER_MIME = "application/vnd.google-apps.folder";
 
 function carpetaMes(fecha) {
@@ -4963,10 +4968,10 @@ function ReporteDiarioTab({ txns, accounts, divisas, cur, settings, setSettings,
   const [err, setErr] = useState("");
   const [cfgOpen, setCfgOpen] = useState(false);
   const loc = driveLocal();
-  const [clientIdTxt, setClientIdTxt] = useState((settings && settings.driveClientId) || loc.clientId || "");
-  const [hintTxt, setHintTxt] = useState((settings && settings.driveHint) || loc.hint || "");
-  const clientId = ((settings && settings.driveClientId) || loc.clientId || "").trim();
-  const hint = ((settings && settings.driveHint) || loc.hint || "").trim();
+  const [clientIdTxt, setClientIdTxt] = useState((settings && settings.driveClientId) || loc.clientId || DRIVE_CLIENT_ID_DEFAULT);
+  const [hintTxt, setHintTxt] = useState((settings && settings.driveHint) || loc.hint || DRIVE_HINT_DEFAULT);
+  const clientId = ((settings && settings.driveClientId) || loc.clientId || DRIVE_CLIENT_ID_DEFAULT).trim();
+  const hint = ((settings && settings.driveHint) || loc.hint || DRIVE_HINT_DEFAULT).trim();
   const raizGuardada = (settings && settings.driveRootId) || loc.rootId || "";
   const log = { ...(loc.log || {}), ...((settings && settings.driveLog) || {}) };
   const [, setTick] = useState(0);
