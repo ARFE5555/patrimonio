@@ -12,6 +12,9 @@
 <link rel="manifest" href="manifest.webmanifest" />
 <link rel="apple-touch-icon" href="icon-180.png" />
 <link rel="icon" type="image/png" href="icon-192.png" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" />
 <style>
   :root { color-scheme: dark; --bg:#0A0F1E; --text:#EAF0FF; }
   :root[data-theme="light"] { color-scheme: light; --bg:#EEF3FC; --text:#16203A; }
@@ -33,7 +36,7 @@ const { useState, useEffect, useRef, useMemo } = React;
 
 /* Versión de compilación. Sirve para confirmar de un vistazo qué build está
    corriendo en pantalla (útil para detectar caché vieja de la PWA). */
-const BUILD = "v5.7 · Duplicados: banco + referencia + tipo + fecha, respetando traslados y reversos · 2026-09-21";
+const BUILD = "v6.0 · Transiciones suaves, íconos monocromáticos y tipografía de Apple · 2026-10-14";
 try { console.log("[Patrimonio] build:", BUILD); } catch (e) {}
 
 /* ─────────────────────────────  Tokens de diseño  ───────────────────────────── */
@@ -56,10 +59,12 @@ const T = {
   blue: "var(--blue)",
   violet: "var(--violet)",
 };
+/* Tipografía de Apple: San Francisco en Mac/iPhone (-apple-system). En
+   Windows/Android, donde SF no existe, cae en Inter, la más parecida. */
 const FONT =
-  '-apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, Segoe UI, Roboto, sans-serif';
+  '-apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", "Helvetica Neue", Inter, system-ui, "Segoe UI", Roboto, sans-serif';
 const MONO =
-  'ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace';
+  '"SF Mono", ui-monospace, SFMono-Regular, Menlo, "JetBrains Mono", Consolas, monospace';
 
 /* ─────────────────────────────  Config  ───────────────────────────── */
 const TICKER = [
@@ -1179,10 +1184,23 @@ function fmtDate(iso) {
 
 /* ─────────────────────────────  Primitivos de UI  ───────────────────────────── */
 function Sheet({ open, onClose, title, children }) {
-  if (!open) return null;
+  /* Se queda montada un instante al cerrar para animar la salida. Mientras
+     sale, se sigue mostrando el último contenido que tuvo abierto. */
+  const [vivo, setVivo] = useState(!!open);
+  const ultimo = useRef({ title, children });
+  if (open) ultimo.current = { title, children };
+  useEffect(() => {
+    if (open) { setVivo(true); return; }
+    if (!vivo) return;
+    const id = setTimeout(() => setVivo(false), 220);
+    return () => clearTimeout(id);
+  }, [open]);
+  if (!open && !vivo) return null;
+  const saliendo = !open;
+  if (saliendo) { title = ultimo.current.title; children = ultimo.current.children; }
   return (
     <div
-      onClick={onClose}
+      onClick={saliendo ? undefined : onClose}
       style={{
         position: "fixed",
         inset: 0,
@@ -1191,7 +1209,10 @@ function Sheet({ open, onClose, title, children }) {
         alignItems: "flex-end",
         justifyContent: "center",
         zIndex: 50,
-        animation: "fade .18s ease",
+        animation: saliendo ? "fadeOut .22s ease forwards" : "fade .2s ease",
+        pointerEvents: saliendo ? "none" : "auto",
+        backdropFilter: "blur(3px)",
+        WebkitBackdropFilter: "blur(3px)",
       }}
     >
       <div
@@ -1206,7 +1227,7 @@ function Sheet({ open, onClose, title, children }) {
           padding: "10px 18px calc(22px + env(safe-area-inset-bottom))",
           maxHeight: "88vh",
           overflowY: "auto",
-          animation: "slideUp .24s cubic-bezier(.22,1,.36,1)",
+          animation: saliendo ? "slideDown .22s cubic-bezier(.4,0,1,1) forwards" : "slideUp .3s cubic-bezier(.22,1,.36,1)",
         }}
       >
         <div
@@ -1705,9 +1726,34 @@ function AppMain({ session, role, signOut }) {
     }
     setTxnSheet(false);
   }
+  /* Empleados de nómina: viven en los ajustes compartidos, con la cédula como clave. */
+  const empleados = (settings && Array.isArray(settings.empleados)) ? settings.empleados : [];
+  function saveEmpleado(e) {
+    const k = normCedula(e && e.cedula);
+    if (!k) return;
+    setSettings((s) => {
+      const lista = Array.isArray(s.empleados) ? s.empleados.slice() : [];
+      const i = lista.findIndex((x) => normCedula(x.cedula) === k);
+      const limpio = { cedula: k, nombre: e.nombre, apellido: e.apellido, pago: e.pago || "mixto", activo: e.activo !== false };
+      if (i >= 0) lista[i] = { ...lista[i], ...limpio }; else lista.push(limpio);
+      return { ...s, empleados: lista };
+    });
+  }
+  /* Factura / soporte de un movimiento (gasto, venta…). Se guarda con el id
+     del movimiento, igual que los comprobantes de divisas. */
+  async function adjuntarSoporteTxn(txnId, file) {
+    const stored = await fileToStored(file);
+    await receiptPut(txnId, stored);
+    setTxns((prev) => prev.map((x) => (x.id === txnId ? { ...x, hasReceipt: true } : x)));
+  }
+  function quitarSoporteTxn(txnId) {
+    receiptDel(txnId);
+    setTxns((prev) => prev.map((x) => (x.id === txnId ? { ...x, hasReceipt: undefined } : x)));
+  }
   function deleteTxn(t) {
     // Al borrar el movimiento, el saldo de la cuenta se recalcula solo.
     setTxns((prev) => prev.filter((x) => x.id !== t.id));
+    if (t && t.hasReceipt) receiptDel(t.id);
     // Si el movimiento había generado una operación de divisas, se va con él:
     // dejarla suelta descuadraría Divisas y Cuentas por Cobrar.
     if (t && t.divisaId) {
@@ -2060,6 +2106,11 @@ function AppMain({ session, role, signOut }) {
       prev.map((x) => {
         if (!set.has(x.id)) return x;
         const base = { ...x, motivo: patch.motivo, project: patch.project || x.project, pending: false };
+        if (patch.clase !== undefined) {
+          base.clase = patch.clase || undefined;
+          base.categoria = patch.clase ? (patch.categoria || undefined) : undefined;
+          base.empleado = patch.empleado || undefined;
+        }
         /* Si alguien justifica a mano un traslado con otro motivo —o le asigna
            un proyecto— manda su criterio: deja de ser traslado y el barrido no
            vuelve a tocarlo (si no, le borraría el proyecto en la vuelta
@@ -2415,7 +2466,7 @@ function AppMain({ session, role, signOut }) {
       </header>
 
       <main style={desktop ? mainDesktop : mainMobile}>
-        <div style={desktop ? { maxWidth: 860, margin: "0 auto" } : undefined}>
+        <div key={tab + ":" + txnView + ":" + divView} className="pt-view" style={desktop ? { maxWidth: 860, margin: "0 auto" } : undefined}>
         {syncErr && (
           <div style={{ background: T.redSoft, border: `1px solid ${T.red}`, borderRadius: 12, padding: "10px 14px", marginBottom: 14, fontSize: 12.5, color: T.red, display: "flex", justifyContent: "space-between", gap: 10, alignItems: "flex-start", lineHeight: 1.5 }}>
             <span>{syncErr}</span>
@@ -2450,12 +2501,13 @@ function AppMain({ session, role, signOut }) {
         {tab === "txns" && (
           <div style={{ paddingTop: 8 }}>
             <div style={{ display: "flex", background: T.card, borderRadius: 12, padding: 4, marginBottom: 4, border: `1px solid ${T.lineSoft}` }}>
-              {[["mov", "Movimientos"], ["cierre", "Cierre diario"], ["proj", "Proyectos"]].map(([v, label]) => (
+              {[["mov", "Movim.", "lista"], ["cierre", "Cierre", "balanza"], ["reporte", "Reporte", "reporte"], ["nomina", "Nómina", "nomina"], ["proj", "Proyectos", "proyecto"]].map(([v, label, ic]) => (
                 <button
                   key={v}
                   onClick={() => setTxnView(v)}
-                  style={{ flex: 1, border: "none", borderRadius: 9, padding: "10px", fontSize: 14.5, fontWeight: 600, fontFamily: FONT, cursor: "pointer", background: txnView === v ? T.gold : "transparent", color: txnView === v ? "#0A0F1E" : T.mut }}
+                  style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", gap: 3, border: "none", borderRadius: 9, padding: "8px 2px", fontSize: 12, fontWeight: 600, fontFamily: FONT, cursor: "pointer", background: txnView === v ? T.gold : "transparent", color: txnView === v ? "#0A0F1E" : T.mut }}
                 >
+                  <Ico name={ic} size={17} />
                   {label}
                 </button>
               ))}
@@ -2479,6 +2531,29 @@ function AppMain({ session, role, signOut }) {
                 onNoSugerencia={descartarSugerencia}
                 diaFijado={diaFijado}
                 onLimpiarDia={() => setDiaFijado("")}
+                empleados={empleados}
+              />
+            ) : txnView === "nomina" ? (
+              <NominaTab
+                txns={txns}
+                accounts={accountsView}
+                cur={cur}
+                empleados={empleados}
+                onSaveEmpleado={saveEmpleado}
+                canEdit={canWriteData}
+                onVerMovs={canWriteData ? ((list) => setJustifySheet({ list })) : undefined}
+              />
+            ) : txnView === "reporte" ? (
+              <ReporteDiarioTab
+                empleados={empleados}
+                txns={txns}
+                accounts={accountsView}
+                divisas={divisas}
+                cur={cur}
+                settings={settings}
+                setSettings={setSettings}
+                canEditAll={canEditAll}
+                onClasificar={canWriteData ? ((list) => setJustifySheet({ list })) : undefined}
               />
             ) : txnView === "cierre" ? (
               <CierreDiarioTab
@@ -2516,13 +2591,13 @@ function AppMain({ session, role, signOut }) {
         {tab === "divisas" && (
           <div style={{ paddingTop: 8 }}>
             <div style={{ display: "flex", background: T.card, borderRadius: 12, padding: 4, marginBottom: 4, border: `1px solid ${T.lineSoft}` }}>
-              {[["ops", "Operaciones"], ["cxc", "Por cobrar"]].map(([v, label]) => (
+              {[["ops", "Operaciones", "divisa"], ["cxc", "Por cobrar", "persona"]].map(([v, label, ic]) => (
                 <button
                   key={v}
                   onClick={() => setDivView(v)}
                   style={{ flex: 1, border: "none", borderRadius: 9, padding: "10px", fontSize: 14.5, fontWeight: 600, fontFamily: FONT, cursor: "pointer", background: divView === v ? T.gold : "transparent", color: divView === v ? "#0A0F1E" : T.mut }}
                 >
-                  {label}
+                  <ConIco name={ic}>{label}</ConIco>
                 </button>
               ))}
             </div>
@@ -2650,6 +2725,8 @@ function AppMain({ session, role, signOut }) {
         onClose={() => setTxnSheet(false)}
         onSave={saveTxn}
         onDelete={deleteTxn}
+        empleados={empleados}
+        onAddEmpleado={saveEmpleado}
       />
       <StatementImportSheet
         open={stmtSheet}
@@ -2670,6 +2747,10 @@ function AppMain({ session, role, signOut }) {
         divisas={divisas}
         onClose={() => setJustifySheet(null)}
         onEdit={(t) => setTxnSheet(t)}
+        onReceipt={canWriteData ? adjuntarSoporteTxn : undefined}
+        onReceiptDel={canWriteData ? quitarSoporteTxn : undefined}
+        empleados={empleados}
+        onAddEmpleado={saveEmpleado}
         onSave={(ids, patch, divisa) => { justifyTxns(ids, patch, divisa); setJustifySheet(null); }}
       />
       <ProjectSheet
@@ -3207,13 +3288,14 @@ function AccountsTab({ accounts, prices, cur, settings, vesRate, onSetRate, onAd
 }
 
 /* ─────────────────────────────  Tab: Movimientos  ───────────────────────────── */
-function TxnsTab({ txns, accounts, cur, onAdd, onEdit, onDelete, onDeleteMany, onBulkImport, onImportStatement, onJustify, onTraslados, onNoTraslado, onTrasladoManual, onNoSugerencia, canWrite = true, diaFijado = "", onLimpiarDia }) {
+function TxnsTab({ txns, accounts, cur, onAdd, onEdit, onDelete, onDeleteMany, onBulkImport, onImportStatement, onJustify, onTraslados, onNoTraslado, onTrasladoManual, onNoSugerencia, canWrite = true, diaFijado = "", onLimpiarDia, empleados = [] }) {
   const acct = (id) => accounts.find((a) => a.id === id);
   const acctName = (id) => (acct(id) || {}).name || "—";
   const acctCur = (t) => t.currency || (acct(t.accountId) || {}).currency || cur;
 
   const [fAcct, setFAcct] = useState("all");
   const [fKind, setFKind] = useState("all");
+  const [fClase, setFClase] = useState("all");
   const [fProject, setFProject] = useState("all");
   const [fFrom, setFFrom] = useState("");
   const [fTo, setFTo] = useState("");
@@ -3226,7 +3308,7 @@ function TxnsTab({ txns, accounts, cur, onAdd, onEdit, onDelete, onDeleteMany, o
 
   const usable = accounts.filter((a) => a.type === "bank" || a.type === "cash");
   const projects = useMemo(() => Array.from(new Set(txns.map((t) => t.project).filter(Boolean))).sort(), [txns]);
-  const activos = (fAcct !== "all" ? 1 : 0) + (fKind !== "all" ? 1 : 0) + (fProject !== "all" ? 1 : 0) + (fFrom ? 1 : 0) + (fTo ? 1 : 0);
+  const activos = (fAcct !== "all" ? 1 : 0) + (fKind !== "all" ? 1 : 0) + (fClase !== "all" ? 1 : 0) + (fProject !== "all" ? 1 : 0) + (fFrom ? 1 : 0) + (fTo ? 1 : 0);
   const pendientes = useMemo(() => txns.filter((t) => t.pending), [txns]);
 
   /* Traslados entre cuentas: misma referencia en dos cuentas distintas. Los que
@@ -3320,7 +3402,7 @@ function TxnsTab({ txns, accounts, cur, onAdd, onEdit, onDelete, onDeleteMany, o
       return texto.includes(qn);
     }
     if (qRef && normRef(t.ref).includes(qRef)) return true;
-    const hay = [t.motivo, t.bankDesc, t.ref, t.project, acctName(t.accountId)]
+    const hay = [t.motivo, t.bankDesc, t.ref, t.project, acctName(t.accountId), t.empleado ? etiquetaEmpleado(empleados, t.empleado) + " " + normCedula(t.empleado) : ""]
       .filter(Boolean).join(" ").toLowerCase();
     if (hay.includes(qn)) return true;
     const nq = numVE(q);
@@ -3334,6 +3416,7 @@ function TxnsTab({ txns, accounts, cur, onAdd, onEdit, onDelete, onDeleteMany, o
         (t) =>
           (fAcct === "all" || t.accountId === fAcct) &&
           (fKind === "all" || t.kind === fKind) &&
+          (fClase === "all" || claseDe(t) === (fClase === "__none" ? "" : fClase)) &&
           (fProject === "all" || (fProject === "__none" ? !t.project : t.project === fProject)) &&
           (!fFrom || t.date >= fFrom) &&
           (!fTo || t.date <= fTo) &&
@@ -3341,7 +3424,7 @@ function TxnsTab({ txns, accounts, cur, onAdd, onEdit, onDelete, onDeleteMany, o
           (!soloPend || !!t.pending) &&
           matchQ(t)
       ),
-    [txns, fAcct, fKind, fProject, fFrom, fTo, soloPend, q, refAmplio, accounts, diaFijado]
+    [txns, fAcct, fKind, fClase, fProject, fFrom, fTo, soloPend, q, refAmplio, accounts, diaFijado]
   );
 
   const selIds = Object.keys(sel).filter((k) => sel[k]);
@@ -3940,6 +4023,13 @@ function TxnsTab({ txns, accounts, cur, onAdd, onEdit, onDelete, onDeleteMany, o
               <option value="expense">Solo egresos</option>
             </select>
           </Field>
+          <Field label="Clase">
+            <select style={selStyle} value={fClase} onChange={(e) => setFClase(e.target.value)}>
+              <option value="all">Todas las clases</option>
+              {CLASES_ORDEN.map((k) => (<option key={k} value={k}>{CLASES[k].plural}</option>))}
+              <option value="__none">Sin clasificar</option>
+            </select>
+          </Field>
           <Field label="Proyecto">
             <select style={selStyle} value={fProject} onChange={(e) => setFProject(e.target.value)}>
               <option value="all">Todos los proyectos</option>
@@ -3959,7 +4049,7 @@ function TxnsTab({ txns, accounts, cur, onAdd, onEdit, onDelete, onDeleteMany, o
           </div>
           {activos > 0 && (
             <button
-              onClick={() => { setFAcct("all"); setFKind("all"); setFProject("all"); setFFrom(""); setFTo(""); }}
+              onClick={() => { setFAcct("all"); setFKind("all"); setFClase("all"); setFProject("all"); setFFrom(""); setFTo(""); }}
               style={{ ...btnGhost, color: T.red, marginTop: 12, padding: 4 }}
             >
               Limpiar filtros
@@ -3991,8 +4081,8 @@ function TxnsTab({ txns, accounts, cur, onAdd, onEdit, onDelete, onDeleteMany, o
       ) : (
         grouped.map(([date, items]) => (
           <div key={date} style={{ marginBottom: 18 }}>
-            <div style={{ ...sectionTitle, marginBottom: 8 }}>{fmtDate(date)}</div>
-            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            <div style={{ ...sectionTitle, marginBottom: 8 }}><ConIco name="calendario" size={13} gap={6}>{fmtDate(date)}</ConIco></div>
+            <div className="pt-list" style={{ display: "flex", flexDirection: "column", gap: 8 }}>
               {items.map((t) => {
                 const inc = t.kind === "income";
                 const c = acctCur(t);
@@ -4057,12 +4147,22 @@ function TxnsTab({ txns, accounts, cur, onAdd, onEdit, onDelete, onDeleteMany, o
                               · ⇄ TRASLADO
                             </span>
                           )}
+                          {t.hasReceipt && <span style={{ marginLeft: 6, color: T.mut }} title="Tiene soporte adjunto"><Ico name="clip" size={13} /></span>}
                         </div>
                         <div style={{ fontSize: 12, color: T.mut, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
                           {acctName(t.accountId)} · {c.toUpperCase()}
                           {t.project ? ` · ${t.project}` : ""}
                           {t.commission ? ` · com. ${t.comMode === "usd" ? fmtUsd(t.comUsd || 0) : money(t.commission, c)}` : ""}
                         </div>
+                        {!pend && !t.divisaKind && !t.traslado && (() => {
+                          const cl = claseDe(t);
+                          return (
+                            <div style={{ fontSize: 10.5, fontWeight: 700, letterSpacing: 0.3, marginTop: 3, color: cl ? CLASES[cl].color : T.mut2, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                              <Ico name={t.empleado ? "nomina" : cl || "alerta"} size={12} stroke={2.2} style={{ marginRight: 4 }} />
+                              {cl ? (CLASES[cl].label + (categoriaDe(t) ? " · " + categoriaDe(t) : "") + (t.empleado ? " · " + etiquetaEmpleado(empleados, t.empleado) : "")).toUpperCase() : "SIN CLASIFICAR"}
+                            </div>
+                          );
+                        })()}
                         {t.ref && (
                           <div style={{ fontSize: 11, color: T.mut2, fontFamily: MONO, marginTop: 2 }}>ref {t.ref}</div>
                         )}
@@ -4197,7 +4297,7 @@ function CierreDiarioTab({ txns, accounts, cur, onVerDia }) {
       {dias.length === 0 ? (
         <div style={emptyRow}>Esta cuenta todavía no tiene movimientos.</div>
       ) : (
-        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+        <div className="pt-list" style={{ display: "flex", flexDirection: "column", gap: 8 }}>
           {dias.map((d) => {
             const dif = d.dif;
             const cuadra = dif != null && Math.abs(dif) <= 0.01;
@@ -4242,7 +4342,7 @@ function CierreDiarioTab({ txns, accounts, cur, onVerDia }) {
                 </button>
 
                 {open && (
-                  <div style={{ borderTop: `1px solid ${T.lineSoft}`, padding: "12px 15px", background: T.bg2 }}>
+                  <div className="pt-pop" style={{ borderTop: `1px solid ${T.lineSoft}`, padding: "12px 15px", background: T.bg2 }}>
                     <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5, color: T.mut, marginBottom: 4 }}>
                       <span>Saldo según la app</span>
                       <span style={{ fontFamily: MONO, color: T.text }}>{money(d.saldoApp, acctCur)}</span>
@@ -4290,6 +4390,694 @@ function CierreDiarioTab({ txns, accounts, cur, onVerDia }) {
           })}
         </div>
       )}
+    </div>
+  );
+}
+
+/* ─────────────────────────────  Reporte diario: PDF / Excel / Google Drive  ─────────────────────────────
+   Un reporte por día con todo lo que pasó: gastos, movimientos internos,
+   ventas/ingresos y operaciones cambiarias, más los saldos de cierre.
+   Se descarga en PDF y Excel, y se sube a Google Drive así:
+
+     Patrimonio – Contabilidad /
+       2026-10 Octubre /
+         2026-10-14 /
+           Reporte 2026-10-14.pdf
+           Reporte 2026-10-14.xlsx
+           Soporte - Gasto - Nómina - 1.250,00 Bs - a1b2c3.jpg
+           Comprobante - Compra divisas - Juan Pérez - b2c3d4.jpg
+
+   Volver a subir un día REEMPLAZA los archivos del mismo nombre: no duplica. */
+const r2 = (x) => Math.round(((Number(x) || 0) + Number.EPSILON) * 100) / 100;
+const MESES_ES = ["Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio", "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"];
+const DRIVE_RAIZ_NOMBRE = "Patrimonio – Contabilidad";
+const DRIVE_SCOPE = "https://www.googleapis.com/auth/drive.file";
+const FOLDER_MIME = "application/vnd.google-apps.folder";
+
+function carpetaMes(fecha) {
+  const [y, m] = String(fecha).split("-");
+  return `${y}-${m} ${MESES_ES[Number(m) - 1] || ""}`.trim();
+}
+// Número en formato venezolano, sin símbolos raros (el PDF usa Latin-1)
+function nVE(n) {
+  return (Number.isFinite(n) ? n : 0).toLocaleString("es-VE", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+function curLbl(c) {
+  const u = String(c || "").toUpperCase();
+  return u === "VES" ? "Bs" : u;
+}
+function fechaLarga(iso) {
+  const [y, m, d] = String(iso).split("-").map(Number);
+  const dt = new Date(y, m - 1, d);
+  const dias = ["domingo", "lunes", "martes", "miércoles", "jueves", "viernes", "sábado"];
+  return `${dias[dt.getDay()]} ${d} de ${(MESES_ES[m - 1] || "").toLowerCase()} de ${y}`;
+}
+function nombreSeguro(s, max = 60) {
+  return String(s || "").replace(/[\\/:*?"<>|\n\r\t]+/g, " ").replace(/\s+/g, " ").trim().slice(0, max);
+}
+
+/* Arma todo lo del día a partir de los datos de la app. */
+function armarReporteDia(fecha, { txns, accounts, divisas, cur, empleados = [] }) {
+  const acc = (id) => (accounts || []).find((a) => a.id === id) || {};
+  const curDe = (t) => t.currency || acc(t.accountId).currency || cur || "usd";
+  const filas = (txns || [])
+    .filter((t) => t.date === fecha)
+    .map((t) => {
+      const c = claseDe(t);
+      const entra = t.kind === "income";
+      return {
+        t,
+        id: t.id,
+        cuenta: acc(t.accountId).name || "—",
+        moneda: curDe(t),
+        clase: c,
+        claseNombre: c ? CLASES[c].label : "Sin clasificar",
+        categoria: categoriaDe(t),
+        motivo: t.motivo || t.bankDesc || "",
+        empleado: t.empleado ? etiquetaEmpleado(empleados, t.empleado) : "",
+        referencia: t.ref || "",
+        proyecto: t.project || "",
+        tipo: entra ? "Entra" : "Sale",
+        monto: entra ? (t.amount || 0) : -(t.amount || 0),
+        comision: t.commission || 0,
+        pendiente: !!t.pending,
+        soporte: !!t.hasReceipt,
+      };
+    })
+    .sort((a, b) => (a.cuenta < b.cuenta ? -1 : a.cuenta > b.cuenta ? 1 : (a.t.stmtRow || 0) - (b.t.stmtRow || 0)));
+
+  const porClase = {};
+  ["gasto", "interno", "venta", "divisa", ""].forEach((k) => { porClase[k] = filas.filter((f) => f.clase === k); });
+
+  // Totales por clase y moneda: entradas, salidas y neto
+  const totales = {};
+  filas.forEach((f) => {
+    const k = f.clase || "";
+    totales[k] = totales[k] || {};
+    const m = (totales[k][f.moneda] = totales[k][f.moneda] || { entra: 0, sale: 0 });
+    if (f.monto >= 0) m.entra += f.monto; else m.sale += -f.monto;
+  });
+  const comisiones = {};
+  filas.forEach((f) => { if (f.comision) comisiones[f.moneda] = (comisiones[f.moneda] || 0) + f.comision; });
+
+  // Operaciones cambiarias del día (incluye las que no pasan por banco, ej. Binance P2P)
+  const ops = (divisas || []).filter((d) => d.date === fecha && (d.kind === "compra" || d.kind === "venta" || d.kind === "abono"));
+  const opsFilas = ops.map((d) => ({
+    d,
+    id: d.id,
+    tipo: d.kind === "compra" ? "Compra" : d.kind === "venta" ? "Venta" : "Abono / cobro",
+    persona: d.persona || "",
+    usd: d.kind === "abono" ? (d.usd || d.monto || 0) : (d.usd || 0),
+    tasa: d.tasa || 0,
+    bs: d.kind === "abono" ? 0 : (d.usd || 0) * (d.tasa || 0),
+    referencia: d.referencia || d.ref || "",
+    soporte: !!d.hasReceipt,
+  }));
+  // Pagos parciales registrados dentro de una venta, con fecha de este día
+  const pagosVenta = [];
+  (divisas || []).forEach((v) => (v.abonos || []).forEach((a) => {
+    if (a && (a.date || a.fecha) === fecha) pagosVenta.push({ venta: v, a });
+  }));
+
+  // Saldo de cierre (según la app) de cada cuenta de banco o efectivo
+  const saldos = (accounts || [])
+    .filter((a) => a.type === "bank" || a.type === "cash")
+    .map((a) => {
+      const s = (txns || []).filter((t) => t.accountId === a.id && t.date && t.date <= fecha)
+        .reduce((x, t) => x + (t.kind === "income" ? (t.amount || 0) : -(t.amount || 0)) - (t.commission || 0), a.opening || 0);
+      const mov = filas.filter((f) => f.t.accountId === a.id).length;
+      return { cuenta: a.name, moneda: a.currency || cur || "usd", saldo: s, mov };
+    })
+    .filter((s) => s.mov > 0 || Math.abs(s.saldo) > 0.005);
+
+  return { fecha, filas, porClase, totales, comisiones, ops: opsFilas, pagosVenta, saldos,
+    vacio: filas.length === 0 && opsFilas.length === 0 && pagosVenta.length === 0 };
+}
+
+/* ── Librerías bajo demanda ── */
+function cargarScript(urls) {
+  return new Promise((res, rej) => {
+    let i = 0;
+    (function next() {
+      if (i >= urls.length) { rej(new Error("No se pudo cargar " + urls[0].split("/").pop())); return; }
+      const s = document.createElement("script");
+      s.src = urls[i++];
+      s.onload = () => res();
+      s.onerror = next;
+      document.head.appendChild(s);
+    })();
+  });
+}
+async function ensureJsPDF() {
+  if (!(window.jspdf && window.jspdf.jsPDF)) {
+    await cargarScript([
+      "https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js",
+      "https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js",
+    ]);
+  }
+  const J = window.jspdf && window.jspdf.jsPDF;
+  if (!J) throw new Error("No se pudo cargar el generador de PDF.");
+  if (!J.API.autoTable) {
+    await cargarScript([
+      "https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.8.2/jspdf.plugin.autotable.min.js",
+      "https://cdn.jsdelivr.net/npm/jspdf-autotable@3.8.2/dist/jspdf.plugin.autotable.min.js",
+    ]);
+  }
+  return J;
+}
+
+/* ── PDF ── */
+async function reportePDF(rep) {
+  const JsPDF = await ensureJsPDF();
+  const doc = new JsPDF({ unit: "pt", format: "letter" });
+  const W = doc.internal.pageSize.getWidth();
+  const M = 36;
+  const gris = [110, 118, 140], tinta = [22, 32, 58];
+  const colorClase = { gasto: [214, 69, 80], interno: [47, 107, 224], venta: [22, 150, 98], divisa: [124, 91, 214], "": [150, 150, 150] };
+
+  doc.setFont("helvetica", "bold"); doc.setFontSize(16); doc.setTextColor(...tinta);
+  doc.text("Reporte diario de gastos y movimientos", M, M + 6);
+  doc.setFont("helvetica", "normal"); doc.setFontSize(10.5); doc.setTextColor(...gris);
+  doc.text(fechaLarga(rep.fecha).replace(/^./, (c) => c.toUpperCase()) + "  ·  " + rep.fecha, M, M + 24);
+  doc.setFontSize(8.5);
+  doc.text("Generado por Patrimonio el " + new Date().toLocaleString("es-VE"), W - M, M + 24, { align: "right" });
+  let y = M + 44;
+
+  // Resumen por clase y moneda
+  const resumen = [];
+  CLASES_ORDEN.concat([""]).forEach((k) => {
+    const porMon = rep.totales[k] || {};
+    Object.keys(porMon).forEach((mon) => {
+      const v = porMon[mon];
+      resumen.push([k ? CLASES[k].plural : "Sin clasificar", curLbl(mon), nVE(v.entra), nVE(v.sale), nVE(v.entra - v.sale), String((rep.porClase[k] || []).filter((f) => f.moneda === mon).length)]);
+    });
+  });
+  Object.keys(rep.comisiones).forEach((mon) => {
+    resumen.push(["Comisiones bancarias (todas)", curLbl(mon), "", nVE(rep.comisiones[mon]), nVE(-rep.comisiones[mon]), ""]);
+  });
+  if (resumen.length) {
+    doc.autoTable({
+      startY: y, margin: { left: M, right: M },
+      head: [["Resumen", "Moneda", "Entra", "Sale", "Neto", "Mov."]],
+      body: resumen,
+      styles: { fontSize: 9, cellPadding: 4, textColor: tinta },
+      headStyles: { fillColor: [22, 32, 58], textColor: 255 },
+      columnStyles: { 2: { halign: "right" }, 3: { halign: "right" }, 4: { halign: "right", fontStyle: "bold" }, 5: { halign: "center" } },
+    });
+    y = doc.lastAutoTable.finalY + 18;
+  }
+
+  const seccion = (titulo, k, filas) => {
+    if (!filas.length) return;
+    if (y > doc.internal.pageSize.getHeight() - 90) { doc.addPage(); y = M; }
+    doc.setFont("helvetica", "bold"); doc.setFontSize(11.5); doc.setTextColor(...colorClase[k]);
+    doc.text(`${titulo} (${filas.length})`, M, y);
+    doc.autoTable({
+      startY: y + 6, margin: { left: M, right: M },
+      head: [["Cuenta", "Categoría", "Motivo", "Ref.", "Proyecto", "Monto", "Com."]],
+      body: filas.map((f) => [
+        f.cuenta, f.categoria || "-", (f.pendiente ? "[Por justificar] " : "") + f.motivo + (f.empleado && !f.motivo.includes(f.empleado.split(" · ")[0]) ? " - " + f.empleado : (f.empleado ? " (" + f.empleado.split(" · ").pop() + ")" : "")) + (f.soporte ? "  (soporte adj.)" : ""),
+        f.referencia || "-", f.proyecto || "-",
+        (f.monto < 0 ? "-" : "+") + nVE(Math.abs(f.monto)) + " " + curLbl(f.moneda),
+        f.comision ? nVE(f.comision) : "",
+      ]),
+      styles: { fontSize: 8, cellPadding: 3, textColor: tinta, overflow: "linebreak" },
+      headStyles: { fillColor: colorClase[k], textColor: 255 },
+      columnStyles: { 0: { cellWidth: 78 }, 1: { cellWidth: 82 }, 3: { cellWidth: 58 }, 4: { cellWidth: 60 }, 5: { halign: "right", cellWidth: 80 }, 6: { halign: "right", cellWidth: 44 } },
+    });
+    y = doc.lastAutoTable.finalY + 18;
+  };
+  seccion("Gastos", "gasto", rep.porClase.gasto);
+  seccion("Movimientos internos", "interno", rep.porClase.interno);
+  seccion("Ventas e ingresos", "venta", rep.porClase.venta);
+  seccion("Movimientos de operaciones cambiarias", "divisa", rep.porClase.divisa);
+  seccion("Sin clasificar", "", rep.porClase[""]);
+
+  if (rep.ops.length || rep.pagosVenta.length) {
+    if (y > doc.internal.pageSize.getHeight() - 90) { doc.addPage(); y = M; }
+    doc.setFont("helvetica", "bold"); doc.setFontSize(11.5); doc.setTextColor(...colorClase.divisa);
+    doc.text(`Operaciones cambiarias registradas (${rep.ops.length + rep.pagosVenta.length})`, M, y);
+    doc.autoTable({
+      startY: y + 6, margin: { left: M, right: M },
+      head: [["Tipo", "Cliente", "USD", "Tasa", "Bs", "Ref."]],
+      body: rep.ops.map((o) => [o.tipo, o.persona || "-", nVE(o.usd), o.tasa ? nVE(o.tasa) : "-", o.bs ? nVE(o.bs) : "-", o.referencia || "-"])
+        .concat(rep.pagosVenta.map(({ venta, a }) => ["Pago de venta", venta.persona || "-", nVE(a.usd || 0), "-", "-", "-"])),
+      styles: { fontSize: 8.5, cellPadding: 3, textColor: tinta },
+      headStyles: { fillColor: colorClase.divisa, textColor: 255 },
+      columnStyles: { 2: { halign: "right" }, 3: { halign: "right" }, 4: { halign: "right" } },
+    });
+    y = doc.lastAutoTable.finalY + 18;
+  }
+
+  if (rep.saldos.length) {
+    if (y > doc.internal.pageSize.getHeight() - 90) { doc.addPage(); y = M; }
+    doc.setFont("helvetica", "bold"); doc.setFontSize(11.5); doc.setTextColor(...tinta);
+    doc.text("Saldos al cierre del día (según la app)", M, y);
+    doc.autoTable({
+      startY: y + 6, margin: { left: M, right: M },
+      head: [["Cuenta", "Moneda", "Movimientos del día", "Saldo"]],
+      body: rep.saldos.map((s) => [s.cuenta, curLbl(s.moneda), String(s.mov), nVE(s.saldo)]),
+      styles: { fontSize: 8.5, cellPadding: 3, textColor: tinta },
+      headStyles: { fillColor: [80, 90, 115], textColor: 255 },
+      columnStyles: { 2: { halign: "center" }, 3: { halign: "right", fontStyle: "bold" } },
+    });
+  }
+
+  const n = doc.internal.getNumberOfPages();
+  for (let i = 1; i <= n; i++) {
+    doc.setPage(i); doc.setFont("helvetica", "normal"); doc.setFontSize(8); doc.setTextColor(...gris);
+    doc.text(`Página ${i} de ${n}`, W - M, doc.internal.pageSize.getHeight() - 18, { align: "right" });
+  }
+  return doc.output("blob");
+}
+
+/* ── Excel ── */
+async function reporteXLSX(rep) {
+  const XLSX = await ensureXLSXStyle();
+  const head = { font: { bold: true, color: { rgb: "FFFFFF" } }, fill: { fgColor: { rgb: "16203A" } } };
+  const hoja = (aoa, cols) => {
+    const ws = XLSX.utils.aoa_to_sheet(aoa);
+    ws["!cols"] = cols.map((w) => ({ wch: w }));
+    const range = XLSX.utils.decode_range(ws["!ref"] || "A1");
+    for (let c = range.s.c; c <= range.e.c; c++) {
+      const cell = ws[XLSX.utils.encode_cell({ r: 0, c })];
+      if (cell) cell.s = head;
+    }
+    return ws;
+  };
+  const wb = XLSX.utils.book_new();
+
+  const res = [["Concepto", "Moneda", "Entra", "Sale", "Neto", "Movimientos"]];
+  CLASES_ORDEN.concat([""]).forEach((k) => {
+    const porMon = rep.totales[k] || {};
+    Object.keys(porMon).forEach((mon) => {
+      const v = porMon[mon];
+      res.push([k ? CLASES[k].plural : "Sin clasificar", curLbl(mon), r2(v.entra), r2(v.sale), r2(v.entra - v.sale), (rep.porClase[k] || []).filter((f) => f.moneda === mon).length]);
+    });
+  });
+  Object.keys(rep.comisiones).forEach((mon) => res.push(["Comisiones bancarias", curLbl(mon), 0, r2(rep.comisiones[mon]), r2(-rep.comisiones[mon]), ""]));
+  res.push([]);
+  res.push(["Saldos al cierre (según la app)"]);
+  res.push(["Cuenta", "Moneda", "Saldo", "", "", "Movimientos"]);
+  rep.saldos.forEach((s) => res.push([s.cuenta, curLbl(s.moneda), r2(s.saldo), "", "", s.mov]));
+  XLSX.utils.book_append_sheet(wb, hoja(res, [30, 9, 14, 14, 14, 12]), "Resumen");
+
+  const cab = ["Fecha", "Cuenta", "Clase", "Categoría", "Empleado", "Motivo", "Referencia", "Proyecto", "Entra/Sale", "Monto", "Comisión", "Moneda", "Por justificar", "Soporte", "Descripción banco"];
+  const fila = (f) => [rep.fecha, f.cuenta, f.claseNombre, f.categoria, f.empleado, f.motivo, f.referencia, f.proyecto, f.tipo, r2(f.monto), r2(f.comision), curLbl(f.moneda), f.pendiente ? "Sí" : "", f.soporte ? "Sí" : "", f.t.bankDesc || ""];
+  const anchos = [11, 20, 16, 22, 26, 30, 16, 14, 9, 13, 10, 7, 9, 8, 34];
+  XLSX.utils.book_append_sheet(wb, hoja([cab, ...rep.filas.map(fila)], anchos), "Todos");
+  [["gasto", "Gastos"], ["interno", "Internos"], ["venta", "Ventas"], ["divisa", "Divisas (banco)"], ["", "Sin clasificar"]].forEach(([k, nombre]) => {
+    if ((rep.porClase[k] || []).length) XLSX.utils.book_append_sheet(wb, hoja([cab, ...rep.porClase[k].map(fila)], anchos), nombre);
+  });
+  if (rep.ops.length || rep.pagosVenta.length) {
+    const aoa = [["Tipo", "Cliente", "USD", "Tasa", "Bs", "Referencia", "Soporte"]]
+      .concat(rep.ops.map((o) => [o.tipo, o.persona, r2(o.usd), o.tasa || "", r2(o.bs) || "", o.referencia, o.soporte ? "Sí" : ""]))
+      .concat(rep.pagosVenta.map(({ venta, a }) => ["Pago de venta", venta.persona || "", r2(a.usd || 0), "", "", "", a.hasReceipt ? "Sí" : ""]));
+    XLSX.utils.book_append_sheet(wb, hoja(aoa, [14, 24, 12, 10, 16, 18, 8]), "Op. cambiarias");
+  }
+  const out = XLSX.write(wb, { bookType: "xlsx", type: "array" });
+  return new Blob([out], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
+}
+
+/* Comprobantes y soportes del día, listos para subir. */
+async function soportesDelDia(rep) {
+  const lista = [];
+  const add = async (id, base) => {
+    const st = await receiptGet(id).catch(() => null);
+    if (!st || !st.dataUrl) return;
+    const blob = await (await fetch(st.dataUrl)).blob();
+    let ext = st.type === "image" ? "jpg" : ((st.name || "").split(".").pop() || "").toLowerCase();
+    if (!ext || ext.length > 5) ext = blob.type === "application/pdf" ? "pdf" : blob.type.indexOf("image/") === 0 ? "jpg" : "bin";
+    lista.push({ name: `${nombreSeguro(base, 90)} - ${String(id).slice(-6)}.${ext}`, blob, mime: blob.type || "application/octet-stream" });
+  };
+  for (const f of rep.filas) {
+    if (!f.soporte) continue;
+    await add(f.id, `Soporte - ${f.claseNombre} - ${f.categoria || f.motivo} - ${nVE(Math.abs(f.monto))} ${curLbl(f.moneda)}`);
+  }
+  for (const o of rep.ops) {
+    if (!o.soporte) continue;
+    await add(o.id, `Comprobante - ${o.tipo} divisas - ${o.persona || "sin cliente"} - ${nVE(o.usd)} USD`);
+  }
+  for (const { venta, a } of rep.pagosVenta) {
+    if (!a.hasReceipt) continue;
+    await add(a.id, `Comprobante - Pago de venta - ${venta.persona || "sin cliente"} - ${nVE(a.usd || 0)} USD`);
+  }
+  return lista;
+}
+
+/* ── Google Drive (Google Identity Services + Drive API v3) ──
+   Alcance drive.file: la app solo ve las carpetas y archivos que ella misma
+   creó. No puede leer ni tocar nada más del Drive. La carpeta raíz se puede
+   mover a cualquier lado (por ejemplo, dentro de "Contabilidad") y la app la
+   sigue encontrando. */
+let _gisPromise = null;
+function ensureGIS() {
+  if (window.google && window.google.accounts && window.google.accounts.oauth2) return Promise.resolve();
+  if (!_gisPromise) _gisPromise = cargarScript(["https://accounts.google.com/gsi/client"]).catch((e) => { _gisPromise = null; throw e; });
+  return _gisPromise;
+}
+const _drive = { token: null, exp: 0, client: null, clientId: "", pending: null };
+function driveConectado() { return !!_drive.token && Date.now() < _drive.exp - 60000; }
+/* Debe llamarse directo desde un toque del usuario (abre la ventana de Google). */
+function driveAutorizar(clientId, hint) {
+  if (driveConectado()) return Promise.resolve(_drive.token);
+  if (!(window.google && window.google.accounts && window.google.accounts.oauth2)) {
+    return Promise.reject(new Error("Google todavía está cargando. Probá de nuevo en un segundo."));
+  }
+  if (!_drive.client || _drive.clientId !== clientId) {
+    _drive.clientId = clientId;
+    _drive.client = window.google.accounts.oauth2.initTokenClient({
+      client_id: clientId,
+      scope: DRIVE_SCOPE,
+      hint: hint || undefined,
+      callback: (r) => {
+        const p = _drive.pending; _drive.pending = null;
+        if (!p) return;
+        if (r.error) { p.rej(new Error("Google: " + (r.error_description || r.error))); return; }
+        _drive.token = r.access_token;
+        _drive.exp = Date.now() + (Number(r.expires_in) || 3600) * 1000;
+        p.res(_drive.token);
+      },
+      error_callback: (e) => {
+        const p = _drive.pending; _drive.pending = null;
+        if (p) p.rej(new Error(e && e.type === "popup_closed" ? "Se cerró la ventana de Google sin autorizar." : "No se pudo conectar con Google" + (e && e.type ? " (" + e.type + ")" : "") + "."));
+      },
+    });
+  }
+  return new Promise((res, rej) => {
+    _drive.pending = { res, rej };
+    _drive.client.requestAccessToken({ prompt: "" });
+  });
+}
+async function gdrive(url, opts = {}) {
+  const r = await fetch(url, { ...opts, headers: { Authorization: "Bearer " + _drive.token, ...(opts.headers || {}) } });
+  if (!r.ok) {
+    let m = "";
+    try { const j = await r.json(); m = (j.error && j.error.message) || ""; } catch (e) { /* sin cuerpo */ }
+    if (r.status === 401) { _drive.token = null; _drive.exp = 0; }
+    const err = new Error("Drive " + r.status + (m ? ": " + m : ""));
+    err.status = r.status;
+    throw err;
+  }
+  return r.status === 204 ? null : r.json();
+}
+const qEsc = (s) => String(s).replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+async function driveBuscar(name, parent, soloCarpetas) {
+  let q = `name='${qEsc(name)}' and trashed=false`;
+  if (parent) q += ` and '${parent}' in parents`;
+  if (soloCarpetas) q += ` and mimeType='${FOLDER_MIME}'`;
+  const j = await gdrive("https://www.googleapis.com/drive/v3/files?pageSize=10&fields=files(id,name)&q=" + encodeURIComponent(q));
+  return (j.files || [])[0] || null;
+}
+async function driveCarpeta(name, parent) {
+  const ya = await driveBuscar(name, parent, true);
+  if (ya) return ya.id;
+  const j = await gdrive("https://www.googleapis.com/drive/v3/files?fields=id", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name, mimeType: FOLDER_MIME, parents: parent ? [parent] : undefined }),
+  });
+  return j.id;
+}
+async function driveSubir(name, parent, blob, mime) {
+  const ya = await driveBuscar(name, parent, false);
+  if (ya) {
+    await gdrive(`https://www.googleapis.com/upload/drive/v3/files/${ya.id}?uploadType=media&fields=id`, {
+      method: "PATCH", headers: { "Content-Type": mime }, body: blob,
+    });
+    return { id: ya.id, reemplazado: true };
+  }
+  const b = "patrimonio" + Math.random().toString(36).slice(2);
+  const body = new Blob([
+    `--${b}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n`,
+    JSON.stringify({ name, parents: [parent] }),
+    `\r\n--${b}\r\nContent-Type: ${mime}\r\n\r\n`,
+    blob,
+    `\r\n--${b}--`,
+  ]);
+  const j = await gdrive("https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id", {
+    method: "POST", headers: { "Content-Type": `multipart/related; boundary=${b}` }, body,
+  });
+  return { id: j.id, reemplazado: false };
+}
+/* La carpeta raíz: la guardada si sigue viva; si no, se busca por nombre
+   (la app solo ve las suyas) y, si no está, se crea en "Mi unidad". */
+async function driveRaiz(guardada) {
+  if (guardada) {
+    try {
+      const j = await gdrive(`https://www.googleapis.com/drive/v3/files/${guardada}?fields=id,trashed`);
+      if (j && !j.trashed) return j.id;
+    } catch (e) { if (e.status !== 404 && e.status !== 403) throw e; }
+  }
+  const ya = await driveBuscar(DRIVE_RAIZ_NOMBRE, null, true);
+  if (ya) return ya.id;
+  return driveCarpeta(DRIVE_RAIZ_NOMBRE, "root");
+}
+/* Sube un día completo. Devuelve el id de la carpeta del día y lo que subió. */
+async function subirDiaADrive(rep, raizId, onPaso) {
+  const paso = (m) => { try { onPaso && onPaso(m); } catch (e) { /* no-op */ } };
+  const mesId = await driveCarpeta(carpetaMes(rep.fecha), raizId);
+  const diaId = await driveCarpeta(rep.fecha, mesId);
+  paso("Generando PDF…");
+  const pdf = await reportePDF(rep);
+  paso("Generando Excel…");
+  const xls = await reporteXLSX(rep);
+  paso("Subiendo reporte…");
+  await driveSubir(`Reporte ${rep.fecha}.pdf`, diaId, pdf, "application/pdf");
+  await driveSubir(`Reporte ${rep.fecha}.xlsx`, diaId, xls, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+  const sop = await soportesDelDia(rep);
+  for (let i = 0; i < sop.length; i++) {
+    paso(`Subiendo soportes ${i + 1}/${sop.length}…`);
+    await driveSubir(sop[i].name, diaId, sop[i].blob, sop[i].mime);
+  }
+  return { diaId, archivos: 2 + sop.length, soportes: sop.length };
+}
+function descargarBlob(blob, name) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = name;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 30000);
+}
+
+const LS_DRIVE = "fin:drive";
+function driveLocal() { try { return JSON.parse(localStorage.getItem(LS_DRIVE) || "{}") || {}; } catch (e) { return {}; } }
+function driveLocalSet(patch) { try { localStorage.setItem(LS_DRIVE, JSON.stringify({ ...driveLocal(), ...patch })); } catch (e) { /* no-op */ } }
+
+function ReporteDiarioTab({ txns, accounts, divisas, cur, settings, setSettings, canEditAll, onClasificar, empleados = [] }) {
+  const [fecha, setFecha] = useState(todayISO());
+  const [busy, setBusy] = useState("");
+  const [msg, setMsg] = useState("");
+  const [err, setErr] = useState("");
+  const [cfgOpen, setCfgOpen] = useState(false);
+  const loc = driveLocal();
+  const [clientIdTxt, setClientIdTxt] = useState((settings && settings.driveClientId) || loc.clientId || "");
+  const [hintTxt, setHintTxt] = useState((settings && settings.driveHint) || loc.hint || "");
+  const clientId = ((settings && settings.driveClientId) || loc.clientId || "").trim();
+  const hint = ((settings && settings.driveHint) || loc.hint || "").trim();
+  const raizGuardada = (settings && settings.driveRootId) || loc.rootId || "";
+  const log = { ...(loc.log || {}), ...((settings && settings.driveLog) || {}) };
+  const [, setTick] = useState(0);
+
+  useEffect(() => { if (clientId) ensureGIS().catch(() => {}); }, [clientId]);
+
+  const rep = useMemo(() => armarReporteDia(fecha, { txns, accounts, divisas, cur, empleados }), [fecha, txns, accounts, divisas, cur, empleados]);
+  const sinClase = rep.porClase[""];
+
+  function guardarCfg() {
+    const id = clientIdTxt.trim(), h = hintTxt.trim();
+    driveLocalSet({ clientId: id, hint: h });
+    if (canEditAll) setSettings((s) => ({ ...s, driveClientId: id || undefined, driveHint: h || undefined }));
+    _drive.client = null; _drive.token = null;
+    setCfgOpen(false);
+    setMsg("Configuración guardada.");
+    if (id) ensureGIS().catch(() => {});
+  }
+  function anotarSubida(dias, raizId) {
+    const ts = Date.now();
+    const nuevo = { ...(driveLocal().log || {}) };
+    dias.forEach((d) => { nuevo[d] = ts; });
+    driveLocalSet({ log: nuevo, rootId: raizId });
+    if (canEditAll) setSettings((s) => {
+      const l = { ...(s.driveLog || {}) };
+      dias.forEach((d) => { l[d] = ts; });
+      return { ...s, driveLog: l, driveRootId: raizId };
+    });
+    setTick((t) => t + 1);
+  }
+
+  async function bajarPDF() {
+    setErr(""); setMsg(""); setBusy("pdf");
+    try { descargarBlob(await reportePDF(rep), `Reporte ${fecha}.pdf`); }
+    catch (e) { setErr(e.message || "No se pudo generar el PDF."); }
+    finally { setBusy(""); }
+  }
+  async function bajarXLSX() {
+    setErr(""); setMsg(""); setBusy("xlsx");
+    try { descargarBlob(await reporteXLSX(rep), `Reporte ${fecha}.xlsx`); }
+    catch (e) { setErr(e.message || "No se pudo generar el Excel."); }
+    finally { setBusy(""); }
+  }
+
+  /* El toque abre la ventana de Google: driveAutorizar va primero, sin
+     esperas antes, para que Safari no la bloquee. */
+  function subir(dias) {
+    setErr(""); setMsg("");
+    if (!clientId) { setCfgOpen(true); setErr("Falta configurar el Client ID de Google (una sola vez)."); return; }
+    const auth = driveAutorizar(clientId, hint);
+    setBusy("drive");
+    (async () => {
+      try {
+        await auth;
+        setMsg("Buscando la carpeta en Drive…");
+        const raiz = await driveRaiz(raizGuardada);
+        const hechos = [];
+        let archivos = 0;
+        for (let i = 0; i < dias.length; i++) {
+          const r = armarReporteDia(dias[i], { txns, accounts, divisas, cur, empleados });
+          if (r.vacio) continue;
+          const pre = dias.length > 1 ? `${dias[i]} (${i + 1}/${dias.length}) · ` : "";
+          const out = await subirDiaADrive(r, raiz, (m) => setMsg(pre + m));
+          archivos += out.archivos;
+          hechos.push(dias[i]);
+        }
+        anotarSubida(hechos, raiz);
+        setMsg(hechos.length
+          ? `✓ Listo: ${hechos.length} día(s), ${archivos} archivo(s) en Drive → ${DRIVE_RAIZ_NOMBRE} / ${carpetaMes(hechos[0])}.`
+          : "No había nada que subir en esas fechas.");
+      } catch (e) {
+        setErr(e.message || "No se pudo subir a Drive.");
+        setMsg("");
+      } finally { setBusy(""); }
+    })();
+  }
+  const diasDelMes = useMemo(() => {
+    const pref = fecha.slice(0, 7);
+    const s = new Set();
+    (txns || []).forEach((t) => { if (t.date && t.date.slice(0, 7) === pref) s.add(t.date); });
+    (divisas || []).forEach((d) => { if (d.date && d.date.slice(0, 7) === pref) s.add(d.date); });
+    return Array.from(s).sort();
+  }, [fecha, txns, divisas]);
+  const pendientesMes = diasDelMes.filter((d) => !log[d]);
+
+  const card = { background: T.card, border: `1px solid ${T.lineSoft}`, borderRadius: 14, padding: "13px 15px" };
+  const btn = (color, on = true) => ({
+    flex: 1, background: on ? color : T.card2, color: on ? "#0A0F1E" : T.mut2, border: "none", borderRadius: 11,
+    padding: "11px 8px", fontSize: 13, fontWeight: 700, fontFamily: FONT, cursor: on ? "pointer" : "default",
+  });
+  const mover = (dias) => { const d = new Date(fecha + "T12:00:00"); d.setDate(d.getDate() + dias); setFecha(d.toISOString().slice(0, 10)); };
+
+  return (
+    <div style={{ paddingTop: 8 }}>
+      <div style={{ display: "flex", gap: 8, alignItems: "flex-end", marginBottom: 14 }}>
+        <button onClick={() => mover(-1)} style={{ ...btnGhost, color: T.mut, fontSize: 20, padding: "8px 10px" }} aria-label="Día anterior">‹</button>
+        <div style={{ flex: 1 }}>
+          <label style={labelStyle}>Día</label>
+          <input type="date" value={fecha} onChange={(e) => e.target.value && setFecha(e.target.value)} style={{ ...inputStyle, fontFamily: MONO, fontSize: 15, padding: "10px 12px" }} />
+        </div>
+        <button onClick={() => mover(1)} style={{ ...btnGhost, color: T.mut, fontSize: 20, padding: "8px 10px" }} aria-label="Día siguiente">›</button>
+      </div>
+
+      {rep.vacio ? (
+        <div style={emptyRow}>No hay movimientos ni operaciones el {fmtDate(fecha)}.</div>
+      ) : (
+        <>
+          <div className="pt-list" style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 12 }}>
+            {CLASES_ORDEN.map((k) => {
+              const porMon = rep.totales[k] || {};
+              const n = rep.porClase[k].length + (k === "divisa" ? rep.ops.filter((o) => !rep.porClase.divisa.some((f) => f.t.divisaId === o.id || f.t.abonoId === o.id)).length : 0);
+              return (
+                <div key={k} style={{ ...card, borderColor: n ? CLASES[k].color : T.lineSoft, padding: "11px 13px" }}>
+                  <div style={{ fontSize: 11.5, fontWeight: 700, color: CLASES[k].color, letterSpacing: 0.3, display: "flex", alignItems: "center", gap: 6 }}>
+                    <span style={{ width: 26, height: 26, borderRadius: 8, background: CLASES[k].soft, display: "inline-flex", alignItems: "center", justifyContent: "center" }}><Ico name={k} size={15} /></span>
+                    {CLASES[k].plural.toUpperCase()}
+                  </div>
+                  <div style={{ fontSize: 11.5, color: T.mut2, margin: "2px 0 4px" }}>{n} registro(s)</div>
+                  {Object.keys(porMon).length === 0 ? (
+                    <div style={{ fontFamily: MONO, fontSize: 13, color: T.mut2 }}>—</div>
+                  ) : Object.entries(porMon).map(([mon, v]) => (
+                    <div key={mon} style={{ fontFamily: MONO, fontSize: 12.5, color: T.text, lineHeight: 1.5 }}>
+                      {v.entra > 0 && <div style={{ color: T.green }}>+{money(v.entra, mon)}</div>}
+                      {v.sale > 0 && <div style={{ color: T.red }}>−{money(v.sale, mon)}</div>}
+                    </div>
+                  ))}
+                </div>
+              );
+            })}
+          </div>
+
+          {sinClase.length > 0 && (
+            <div style={{ background: T.goldSoft, border: `1px solid ${T.gold}`, borderRadius: 12, padding: "11px 14px", marginBottom: 12, fontSize: 12.5, color: T.text, lineHeight: 1.5 }}>
+              <Ico name="alerta" size={15} color={T.gold} style={{ marginRight: 6 }} /><b>{sinClase.length} movimiento(s) sin clasificar</b> este día. Salen en el reporte en su propia sección; conviene clasificarlos antes de subir.
+              {onClasificar && (
+                <button onClick={() => onClasificar(sinClase.map((f) => f.t))} style={{ ...btnGhost, color: T.gold, fontWeight: 700, fontSize: 12.5, padding: "6px 0 0", display: "block" }}>
+                  Clasificarlos ahora →
+                </button>
+              )}
+            </div>
+          )}
+
+          {Object.keys(rep.comisiones).length > 0 && (
+            <div style={{ fontSize: 12, color: T.mut, marginBottom: 12 }}>
+              Comisiones bancarias del día: {Object.entries(rep.comisiones).map(([m, v]) => money(v, m)).join(" · ")}
+            </div>
+          )}
+
+          <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
+            <button onClick={bajarPDF} disabled={!!busy} style={btn(T.gold, !busy)}><ConIco name="pdf">{busy === "pdf" ? "Generando…" : "Descargar PDF"}</ConIco></button>
+            <button onClick={bajarXLSX} disabled={!!busy} style={btn(T.green, !busy)}><ConIco name="excel">{busy === "xlsx" ? "Generando…" : "Descargar Excel"}</ConIco></button>
+          </div>
+          <button onClick={() => subir([fecha])} disabled={!!busy} style={{ ...btn(T.blue, !busy), width: "100%", marginBottom: 6 }}>
+            <ConIco name="nube" size={17}>{busy === "drive" ? "Subiendo a Drive…" : log[fecha] ? "Volver a subir este día a Drive" : "Subir este día a Drive"}</ConIco>
+          </button>
+          {log[fecha] && <div style={{ fontSize: 11.5, color: T.mut2, textAlign: "center", marginBottom: 8 }}>Subido {relTime(log[fecha])}. Volver a subir reemplaza los archivos.</div>}
+        </>
+      )}
+
+      {pendientesMes.length > 0 && (
+        <button onClick={() => subir(pendientesMes)} disabled={!!busy} style={{ ...btnGhost, width: "100%", color: busy ? T.mut2 : T.blue, fontSize: 12.5, fontWeight: 700, padding: "8px 0" }}>
+          Subir los {pendientesMes.length} día(s) de {carpetaMes(fecha).slice(8)} que faltan en Drive
+        </button>
+      )}
+
+      {msg && <div className="pt-pop" style={{ fontSize: 12.5, color: msg.startsWith("✓") ? T.green : T.mut, margin: "8px 0", lineHeight: 1.5 }}>{msg}</div>}
+      {err && <div className="pt-pop" style={{ fontSize: 12.5, color: T.red, margin: "8px 0", lineHeight: 1.5 }}><Ico name="alerta" size={14} style={{ marginRight: 5 }} />{err}</div>}
+
+      <div style={{ ...card, marginTop: 14 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 }}>
+          <div style={{ minWidth: 0 }}>
+            <div style={{ fontSize: 13, fontWeight: 600, color: T.text }}><ConIco name="carpeta" size={15} color={T.blue}>Google Drive</ConIco></div>
+            <div style={{ fontSize: 11.5, color: T.mut2, marginTop: 2, lineHeight: 1.5 }}>
+              {clientId ? `${DRIVE_RAIZ_NOMBRE} / mes / día${hint ? " · " + hint : ""}` : "Sin configurar"}
+            </div>
+          </div>
+          <button onClick={() => setCfgOpen((v) => !v)} style={{ ...btnGhost, color: T.blue, fontSize: 12.5, fontWeight: 600, flexShrink: 0 }}>
+            {cfgOpen ? "Cerrar" : "Configurar"}
+          </button>
+        </div>
+        {raizGuardada && (
+          <a href={`https://drive.google.com/drive/folders/${raizGuardada}`} target="_blank" rel="noopener" style={{ display: "inline-block", fontSize: 12.5, color: T.blue, marginTop: 8, fontWeight: 600 }}>
+            Abrir la carpeta en Drive ↗
+          </a>
+        )}
+        {cfgOpen && (
+          <div style={{ marginTop: 12 }}>
+            <Field label="Client ID de Google (OAuth, tipo Aplicación web)">
+              <input style={{ ...inputStyle, fontFamily: MONO, fontSize: 12.5 }} value={clientIdTxt} onChange={(e) => setClientIdTxt(e.target.value)} placeholder="1234…apps.googleusercontent.com" />
+            </Field>
+            <Field label="Cuenta de Google a usar (opcional)">
+              <input style={inputStyle} value={hintTxt} onChange={(e) => setHintTxt(e.target.value)} placeholder="correo@gmail.com" inputMode="email" />
+            </Field>
+            <div style={{ fontSize: 11.5, color: T.mut2, lineHeight: 1.6, marginBottom: 10 }}>
+              La app solo puede ver lo que ella misma crea en Drive. La primera subida crea
+              la carpeta «{DRIVE_RAIZ_NOMBRE}» en Mi unidad; podés moverla adonde quieras y la
+              app la sigue encontrando.
+              {!canEditAll && " (Esta configuración queda solo en este dispositivo: tu rol no puede cambiar los ajustes compartidos.)"}
+            </div>
+            <PrimaryBtn onClick={guardarCfg} disabled={!clientIdTxt.trim()}>Guardar</PrimaryBtn>
+          </div>
+        )}
+      </div>
     </div>
   );
 }
@@ -4898,8 +5686,564 @@ function sugerirPersona(desc) {
   return "";
 }
 
+/* ─────────────────────────────  Íconos monocromáticos  ─────────────────────────────
+   Trazo de línea en un solo color (currentColor), así toman el color de la
+   paleta del lugar donde están: rojo en gastos, azul en internos, etc. */
+const ICO = {
+  gasto: <><path d="M6 3h12v18l-3-2-3 2-3-2-3 2z" /><path d="M9 8h6M9 12h6M9 16h3" /></>,
+  interno: <><path d="M17 3l3 3-3 3" /><path d="M20 6H9a5 5 0 00-5 5" /><path d="M7 21l-3-3 3-3" /><path d="M4 18h11a5 5 0 005-5" /></>,
+  venta: <><path d="M3 12V4h8l10 10-8 8z" /><circle cx="7.5" cy="8.5" r="1.4" /></>,
+  divisa: <><circle cx="9" cy="9" r="6" /><path d="M15.5 9.2A6 6 0 1 1 9.2 15.5" /><path d="M9 6.5v5M7.5 7.8h2.4a1 1 0 010 2H8" /></>,
+  nomina: <><rect x="3" y="5" width="18" height="14" rx="2.5" /><circle cx="9" cy="11" r="2.3" /><path d="M5.5 16.5c.7-1.6 2-2.4 3.5-2.4s2.8.8 3.5 2.4" /><path d="M15 10h3M15 13.5h3" /></>,
+  persona: <><circle cx="12" cy="8" r="3.6" /><path d="M5 20c1.2-3.4 3.8-5.2 7-5.2s5.8 1.8 7 5.2" /></>,
+  pdf: <><path d="M14 3H7a2 2 0 00-2 2v14a2 2 0 002 2h10a2 2 0 002-2V8z" /><path d="M14 3v5h5" /><path d="M9 13h6M9 17h4" /></>,
+  excel: <><rect x="3.5" y="3.5" width="17" height="17" rx="2.5" /><path d="M3.5 9.5h17M3.5 15h17M10 9.5v11" /></>,
+  nube: <><path d="M7 18a4.5 4.5 0 01-.6-9A6 6 0 0118 9.5a4 4 0 01-1 8.5" /><path d="M12 12v8M9 15l3-3 3 3" /></>,
+  carpeta: <><path d="M3 7a2 2 0 012-2h4l2 2h8a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2z" /></>,
+  clip: <><path d="M20 11.5l-7.6 7.6a5 5 0 01-7.1-7.1l8-8a3.3 3.3 0 014.7 4.7l-8 8a1.7 1.7 0 01-2.4-2.4l7.3-7.3" /></>,
+  alerta: <><path d="M12 3.5L2.8 19.5h18.4z" /><path d="M12 10v4M12 17v.01" /></>,
+  ok: <><circle cx="12" cy="12" r="9" /><path d="M8 12.5l2.8 2.8L16 10" /></>,
+  calendario: <><rect x="3.5" y="5" width="17" height="15.5" rx="2.5" /><path d="M3.5 10h17M8 3v4M16 3v4" /></>,
+  buscar: <><circle cx="11" cy="11" r="6.5" /><path d="M20 20l-4.3-4.3" /></>,
+  lista: <><path d="M9 6h11M9 12h11M9 18h11" /><path d="M4.5 6h.01M4.5 12h.01M4.5 18h.01" /></>,
+  balanza: <><path d="M12 4v16M7 20h10" /><path d="M5 8h14" /><path d="M5 8l-2.5 6a2.8 2.8 0 005 0zM19 8l-2.5 6a2.8 2.8 0 005 0z" /></>,
+  reporte: <><rect x="4" y="3.5" width="16" height="17" rx="2.5" /><path d="M8 16v-3M12 16V9M16 16v-5" /></>,
+  proyecto: <><path d="M4 20V9l8-5 8 5v11" /><path d="M9.5 20v-6h5v6" /></>,
+  mas: <><path d="M12 5v14M5 12h14" /></>,
+  editar: <><path d="M4 20h4L19 9l-4-4L4 16z" /><path d="M13.5 6.5l4 4" /></>,
+  descarga: <><path d="M12 4v11M7.5 10.5L12 15l4.5-4.5" /><path d="M5 20h14" /></>,
+  flecha: <><path d="M9 6l6 6-6 6" /></>,
+};
+function Ico({ name, size = 16, color = "currentColor", stroke = 1.9, style }) {
+  return (
+    <svg
+      width={size} height={size} viewBox="0 0 24 24" fill="none" aria-hidden="true"
+      stroke={color} strokeWidth={stroke} strokeLinecap="round" strokeLinejoin="round"
+      style={{ flexShrink: 0, display: "inline-block", verticalAlign: "-0.18em", ...style }}
+    >
+      {ICO[name] || null}
+    </svg>
+  );
+}
+// Ícono + texto alineados, para botones y títulos
+function ConIco({ name, children, gap = 7, size = 16, color }) {
+  return (
+    <span style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", gap }}>
+      <Ico name={name} size={size} color={color} />
+      <span>{children}</span>
+    </span>
+  );
+}
+
+/* ─────────────────────────────  Clasificación: gasto / interno / venta / divisa  ─────────────────────────────
+   Cada movimiento cae en una de cuatro clases. La operación cambiaria y el
+   traslado entre cuentas propias se DEDUCEN de lo que ya existe (divisaId,
+   abonoId, traslado): no se guardan aparte para que nunca se desincronicen.
+   Gasto, movimiento interno y venta/ingreso se eligen a mano y quedan en
+   t.clase, con una categoría más fina en t.categoria. */
+const CLASES = {
+  gasto: {
+    label: "Gasto", plural: "Gastos", color: "var(--red)", soft: "var(--redSoft)",
+    cats: ["Nómina", "Alquiler", "Servicios (luz, agua, internet)", "Proveedores / mercancía", "Comisiones bancarias",
+      "Impuestos (SENIAT)", "Transporte y envíos", "Mantenimiento", "Publicidad", "Honorarios profesionales", "Otros gastos"],
+  },
+  interno: {
+    label: "Mov. interno", plural: "Movimientos internos", color: "var(--blue)", soft: "rgba(91,141,239,0.14)",
+    cats: ["Traslado entre cuentas", "Aporte del dueño", "Retiro del dueño", "Préstamo recibido", "Préstamo otorgado",
+      "Pago de préstamo", "Ajuste de saldo"],
+  },
+  venta: {
+    label: "Venta / ingreso", plural: "Ventas e ingresos", color: "var(--green)", soft: "var(--greenSoft)",
+    cats: ["Venta de mercancía", "Cobro a cliente", "Servicio prestado", "Otros ingresos"],
+  },
+  divisa: {
+    label: "Divisas", plural: "Operaciones cambiarias", color: "var(--violet)", soft: "rgba(167,139,250,0.16)",
+    cats: [],
+  },
+};
+const CLASES_ORDEN = ["gasto", "interno", "venta", "divisa"];
+
+function claseDe(t) {
+  if (!t) return "";
+  if (t.divisaId || t.divisaKind || t.abonoId) return "divisa";
+  if (esTraslado(t)) return "interno";
+  if (t.clase && CLASES[t.clase] && t.clase !== "divisa") return t.clase;
+  return "";
+}
+function categoriaDe(t) {
+  const c = claseDe(t);
+  if (c === "divisa") {
+    if (t.abonoId) return "Cobro de cuenta por cobrar";
+    return t.divisaKind === "venta" ? "Venta de divisas" : t.divisaKind === "compra" ? "Compra de divisas" : "Operación cambiaria";
+  }
+  if (c === "interno" && esTraslado(t)) return "Traslado entre cuentas";
+  return t.categoria || "";
+}
+// Etiqueta corta para listas y reportes: "Gasto · Nómina"
+function claseLabel(t) {
+  const c = claseDe(t);
+  if (!c) return "Sin clasificar";
+  const cat = categoriaDe(t);
+  return CLASES[c].label + (cat ? " · " + cat : "");
+}
+
+/* Selector de clase + categoría. `allowDivisa` solo cuando se clasifica un
+   movimiento único (la divisa necesita cliente y tasa propios). */
+function ClasePicker({ clase, setClase, categoria, setCategoria, allowDivisa = false, usadas = [] }) {
+  const opciones = CLASES_ORDEN.filter((k) => k !== "divisa" || allowDivisa);
+  const cats = clase && CLASES[clase]
+    ? Array.from(new Set([...CLASES[clase].cats, ...usadas.filter((u) => u.clase === clase).map((u) => u.categoria)])).filter(Boolean)
+    : [];
+  return (
+    <div style={{ marginBottom: 14 }}>
+      <label style={labelStyle}>¿Qué es este movimiento?</label>
+      <div style={{ display: "grid", gridTemplateColumns: `repeat(${opciones.length}, 1fr)`, background: T.card, borderRadius: 12, padding: 4, gap: 3 }}>
+        {opciones.map((k) => {
+          const on = clase === k;
+          return (
+            <button
+              key={k}
+              onClick={() => { setClase(on ? "" : k); if (!on) setCategoria(""); }}
+              style={{
+                border: "none", borderRadius: 9, padding: "10px 4px", fontSize: 12.5, fontWeight: 700, fontFamily: FONT,
+                cursor: "pointer", lineHeight: 1.2,
+                background: on ? CLASES[k].color : "transparent",
+                color: on ? "#0A0F1E" : T.mut,
+                display: "flex", flexDirection: "column", alignItems: "center", gap: 4,
+              }}
+            >
+              <Ico name={k} size={18} color={on ? "#0A0F1E" : CLASES[k].color} />
+              {CLASES[k].label}
+            </button>
+          );
+        })}
+      </div>
+      {clase && clase !== "divisa" && (
+        <>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 10 }}>
+            {cats.map((c) => {
+              const on = categoria === c;
+              return (
+                <button
+                  key={c}
+                  onClick={() => setCategoria(on ? "" : c)}
+                  style={{
+                    border: `1px solid ${on ? CLASES[clase].color : T.line}`, borderRadius: 999, padding: "6px 11px",
+                    fontSize: 12, fontWeight: 600, fontFamily: FONT, cursor: "pointer",
+                    background: on ? CLASES[clase].soft : "transparent", color: on ? T.text : T.mut,
+                  }}
+                >
+                  {c}
+                </button>
+              );
+            })}
+          </div>
+          <input
+            style={{ ...inputStyle, marginTop: 10, fontSize: 14, padding: "10px 12px" }}
+            value={categoria}
+            onChange={(e) => setCategoria(e.target.value)}
+            placeholder="…u otra categoría"
+          />
+        </>
+      )}
+    </div>
+  );
+}
+
+/* ─────────────────────────────  Nómina: empleados por cédula  ─────────────────────────────
+   Cada empleado se identifica por su CÉDULA, que es la clave única de búsqueda
+   (normalizada: "V-12.345.678" → "V12345678"). Un pago de nómina es un gasto
+   con categoría "Nómina" que lleva t.empleado = cédula. Como cada movimiento
+   vive en una sola cuenta, un pago mixto son varios movimientos (uno en Bs y
+   otro en USD) apuntando a la misma cédula: la vista Nómina los junta.
+   Los empleados se guardan en los ajustes compartidos (settings.empleados). */
+const NOMINA_CAT = "Nómina";
+const PAGO_EMPLEADO = {
+  usd: { label: "Dólares", corto: "USD" },
+  bs: { label: "Bolívares", corto: "Bs" },
+  mixto: { label: "Mixto (USD + Bs)", corto: "Mixto" },
+};
+function normCedula(s) {
+  const t = String(s || "").toUpperCase().replace(/[^VEJGP0-9]/g, "");
+  const m = t.match(/^([VEJGP])?0*(\d{5,10})$/);
+  if (!m) return "";
+  return (m[1] || "V") + m[2];
+}
+function fmtCedula(c) {
+  const n = normCedula(c);
+  if (!n) return String(c || "");
+  return n[0] + "-" + Number(n.slice(1)).toLocaleString("es-VE");
+}
+// Busca una cédula escrita dentro de un texto del banco ("TRF.MB 0105 V-12345678 JUAN…")
+function cedulasEnTexto(s) {
+  const out = [];
+  const re = /\b([VEJGP])\s*[-.]?\s*(\d{1,3}(?:\.\d{3}){1,2}|\d{5,10})\b/gi;
+  let m;
+  while ((m = re.exec(String(s || "")))) { const c = normCedula(m[1] + m[2]); if (c) out.push(c); }
+  return out;
+}
+function empleadoPorCedula(empleados, cedula) {
+  const k = normCedula(cedula);
+  return k ? (empleados || []).find((e) => normCedula(e.cedula) === k) || null : null;
+}
+function nombreEmpleado(e) {
+  return e ? `${e.nombre || ""} ${e.apellido || ""}`.trim() : "";
+}
+function etiquetaEmpleado(empleados, cedula) {
+  if (!cedula) return "";
+  const e = empleadoPorCedula(empleados, cedula);
+  return (e ? nombreEmpleado(e) + " · " : "") + fmtCedula(cedula);
+}
+function esNomina(t) {
+  return claseDe(t) === "gasto" && String(t.categoria || "").trim().toLowerCase() === NOMINA_CAT.toLowerCase();
+}
+/* Empleado que aparece en la descripción del banco, si está registrado. */
+function empleadoDeDescripcion(empleados, desc) {
+  for (const c of cedulasEnTexto(desc)) {
+    const e = empleadoPorCedula(empleados, c);
+    if (e) return e;
+  }
+  return null;
+}
+
+/* Selector de empleado: se busca por cédula, nombre o apellido; si no está,
+   se registra ahí mismo. */
+function EmpleadoPicker({ empleados = [], value, onChange, onAdd, sugerencia = "" }) {
+  const [q, setQ] = useState("");
+  const [nuevo, setNuevo] = useState(null);   // { nombre, apellido, cedula, pago }
+  const [errN, setErrN] = useState("");
+  const actual = empleadoPorCedula(empleados, value);
+  const qn = q.trim().toLowerCase();
+  const qc = normCedula(q) || q.replace(/\D/g, "");
+  const lista = (empleados || [])
+    .filter((e) => e.activo !== false || normCedula(e.cedula) === normCedula(value))
+    .filter((e) => !qn
+      || normCedula(e.cedula).includes(qc && qc.length >= 3 ? qc.replace(/^[VEJGP]/, "") : "\u0000")
+      || nombreEmpleado(e).toLowerCase().includes(qn))
+    .slice(0, 8);
+
+  function guardarNuevo() {
+    const ced = normCedula(nuevo.cedula);
+    if (!nuevo.nombre.trim() || !nuevo.apellido.trim()) { setErrN("Falta nombre y apellido."); return; }
+    if (!ced) { setErrN("Cédula inválida. Ej.: V-12345678"); return; }
+    if (empleadoPorCedula(empleados, ced)) { setErrN("Ya hay un empleado con esa cédula."); return; }
+    onAdd && onAdd({ cedula: ced, nombre: nuevo.nombre.trim(), apellido: nuevo.apellido.trim(), pago: nuevo.pago, activo: true });
+    onChange(ced);
+    setNuevo(null); setQ(""); setErrN("");
+  }
+
+  const box = { background: T.bg2, border: `1px solid ${actual ? T.red : T.lineSoft}`, borderRadius: 14, padding: "12px 14px", marginBottom: 14 };
+  if (actual && !nuevo) {
+    return (
+      <div style={box}>
+        <div style={{ fontSize: 11.5, color: T.mut, marginBottom: 4 }}><ConIco name="nomina" size={13} gap={5}>Empleado</ConIco></div>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 }}>
+          <div style={{ minWidth: 0 }}>
+            <div style={{ fontSize: 14.5, fontWeight: 600, color: T.text }}>{nombreEmpleado(actual)}</div>
+            <div style={{ fontSize: 12, color: T.mut2, fontFamily: MONO }}>
+              {fmtCedula(actual.cedula)} · {(PAGO_EMPLEADO[actual.pago] || PAGO_EMPLEADO.mixto).corto}
+            </div>
+          </div>
+          <button onClick={() => onChange("")} style={{ ...btnGhost, color: T.blue, fontSize: 12.5, fontWeight: 600, flexShrink: 0 }}>Cambiar</button>
+        </div>
+      </div>
+    );
+  }
+  return (
+    <div style={box}>
+      <div style={{ fontSize: 13, color: T.text, fontWeight: 600, marginBottom: 8 }}><ConIco name="persona" size={15} color={T.red}>¿A quién se le pagó?</ConIco></div>
+      {!nuevo ? (
+        <>
+          <input
+            style={{ ...inputStyle, fontSize: 14, padding: "10px 12px" }}
+            value={q}
+            onChange={(e) => setQ(e.target.value)}
+            placeholder="Cédula, nombre o apellido"
+          />
+          <div style={{ display: "flex", flexDirection: "column", gap: 4, marginTop: 8 }}>
+            {lista.map((e) => (
+              <button
+                key={e.cedula}
+                onClick={() => { onChange(normCedula(e.cedula)); setQ(""); }}
+                style={{ textAlign: "left", background: T.card, border: `1px solid ${normCedula(e.cedula) === normCedula(sugerencia) ? T.gold : T.lineSoft}`, borderRadius: 10, padding: "9px 12px", cursor: "pointer", fontFamily: FONT, display: "flex", justifyContent: "space-between", gap: 10 }}
+              >
+                <span style={{ fontSize: 13.5, color: T.text, fontWeight: 600 }}>{nombreEmpleado(e)}</span>
+                <span style={{ fontSize: 12, color: T.mut2, fontFamily: MONO, flexShrink: 0 }}>{fmtCedula(e.cedula)}</span>
+              </button>
+            ))}
+            {lista.length === 0 && (
+              <div style={{ fontSize: 12, color: T.mut2, padding: "4px 2px" }}>
+                {(empleados || []).length ? "Nadie coincide con esa búsqueda." : "Todavía no hay empleados registrados."}
+              </div>
+            )}
+          </div>
+          {onAdd && (
+            <button
+              onClick={() => setNuevo({ nombre: "", apellido: "", cedula: normCedula(q) ? q : "", pago: "mixto" })}
+              style={{ ...btnGhost, color: T.gold, fontSize: 12.5, fontWeight: 700, padding: "10px 0 0" }}
+            >
+              + Registrar empleado nuevo
+            </button>
+          )}
+        </>
+      ) : (
+        <EmpleadoCampos datos={nuevo} setDatos={setNuevo} err={errN} onCancel={() => { setNuevo(null); setErrN(""); }} onSave={guardarNuevo} />
+      )}
+    </div>
+  );
+}
+
+function EmpleadoCampos({ datos, setDatos, err, onCancel, onSave, cedulaFija = false, labelGuardar = "Guardar empleado" }) {
+  const set = (k) => (e) => setDatos({ ...datos, [k]: e.target.value });
+  return (
+    <div>
+      <div style={{ display: "flex", gap: 8 }}>
+        <div style={{ flex: 1 }}>
+          <label style={labelStyle}>Nombre</label>
+          <input style={{ ...inputStyle, fontSize: 14, padding: "10px 12px" }} value={datos.nombre} onChange={set("nombre")} />
+        </div>
+        <div style={{ flex: 1 }}>
+          <label style={labelStyle}>Apellido</label>
+          <input style={{ ...inputStyle, fontSize: 14, padding: "10px 12px" }} value={datos.apellido} onChange={set("apellido")} />
+        </div>
+      </div>
+      <div style={{ marginTop: 10 }}>
+        <label style={labelStyle}>Cédula (ID único)</label>
+        <input
+          style={{ ...inputStyle, fontSize: 14, padding: "10px 12px", fontFamily: MONO, opacity: cedulaFija ? 0.6 : 1 }}
+          value={datos.cedula}
+          onChange={set("cedula")}
+          disabled={cedulaFija}
+          placeholder="V-12345678"
+          autoCapitalize="characters"
+        />
+      </div>
+      <div style={{ marginTop: 10 }}>
+        <label style={labelStyle}>Se le paga en</label>
+        <div style={{ display: "flex", background: T.card, borderRadius: 12, padding: 4, gap: 3 }}>
+          {Object.entries(PAGO_EMPLEADO).map(([k, v]) => (
+            <button
+              key={k}
+              onClick={() => setDatos({ ...datos, pago: k })}
+              style={{ flex: 1, border: "none", borderRadius: 9, padding: "9px 4px", fontSize: 12.5, fontWeight: 700, fontFamily: FONT, cursor: "pointer", background: datos.pago === k ? T.gold : "transparent", color: datos.pago === k ? "#0A0F1E" : T.mut }}
+            >
+              {v.corto}
+            </button>
+          ))}
+        </div>
+      </div>
+      {err && <div style={{ fontSize: 12, color: T.red, marginTop: 8 }}>{err}</div>}
+      <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
+        <button onClick={onCancel} style={{ flex: 1, background: "transparent", color: T.mut, border: `1px solid ${T.line}`, borderRadius: 10, padding: "10px", fontSize: 13, fontWeight: 600, fontFamily: FONT, cursor: "pointer" }}>Cancelar</button>
+        <button onClick={onSave} style={{ flex: 2, background: T.gold, color: "#0A0F1E", border: "none", borderRadius: 10, padding: "10px", fontSize: 13, fontWeight: 700, fontFamily: FONT, cursor: "pointer" }}>{labelGuardar}</button>
+      </div>
+    </div>
+  );
+}
+
+/* Vista Nómina: empleados + lo pagado en el mes, separado en USD y Bs. */
+function NominaTab({ txns, accounts, cur, empleados = [], onSaveEmpleado, onVerMovs, canEdit = true }) {
+  const hoy = todayISO();
+  const [mes, setMes] = useState(hoy.slice(0, 7));
+  const [q, setQ] = useState("");
+  const [abierto, setAbierto] = useState(null);
+  const [form, setForm] = useState(null);     // { datos, editando }
+  const [err, setErr] = useState("");
+  const [verInactivos, setVerInactivos] = useState(false);
+  const acc = (id) => (accounts || []).find((a) => a.id === id) || {};
+  const curDe = (t) => String(t.currency || acc(t.accountId).currency || cur || "usd").toLowerCase();
+
+  const pagosMes = useMemo(
+    () => (txns || []).filter((t) => t.empleado && t.date && t.date.slice(0, 7) === mes && t.kind === "expense"),
+    [txns, mes]
+  );
+  const porEmpleado = useMemo(() => {
+    const m = {};
+    pagosMes.forEach((t) => {
+      const k = normCedula(t.empleado);
+      const r = (m[k] = m[k] || { usd: 0, bs: 0, otras: {}, pagos: [] });
+      const c = curDe(t);
+      if (c === "usd") r.usd += t.amount || 0;
+      else if (c === "ves") r.bs += t.amount || 0;
+      else r.otras[c] = (r.otras[c] || 0) + (t.amount || 0);
+      r.pagos.push(t);
+    });
+    return m;
+  }, [pagosMes, accounts]);
+  const totUsd = Object.values(porEmpleado).reduce((s, r) => s + r.usd, 0);
+  const totBs = Object.values(porEmpleado).reduce((s, r) => s + r.bs, 0);
+
+  // Pagos de nómina del mes que todavía no tienen empleado asignado
+  const sinEmpleado = useMemo(
+    () => (txns || []).filter((t) => t.date && t.date.slice(0, 7) === mes && esNomina(t) && !t.empleado),
+    [txns, mes]
+  );
+
+  const qn = q.trim().toLowerCase();
+  const qc = normCedula(q) || q.replace(/\D/g, "");
+  const lista = (empleados || [])
+    .filter((e) => verInactivos || e.activo !== false)
+    .filter((e) => !qn || nombreEmpleado(e).toLowerCase().includes(qn) || (qc.length >= 3 && normCedula(e.cedula).includes(qc.replace(/^[VEJGP]/, ""))))
+    .sort((a, b) => nombreEmpleado(a).localeCompare(nombreEmpleado(b), "es"));
+
+  function guardar() {
+    const d = form.datos;
+    const ced = normCedula(d.cedula);
+    if (!d.nombre.trim() || !d.apellido.trim()) { setErr("Falta nombre y apellido."); return; }
+    if (!ced) { setErr("Cédula inválida. Ej.: V-12345678"); return; }
+    if (!form.editando && empleadoPorCedula(empleados, ced)) { setErr("Ya hay un empleado con esa cédula."); return; }
+    onSaveEmpleado({ ...(form.editando || {}), cedula: ced, nombre: d.nombre.trim(), apellido: d.apellido.trim(), pago: d.pago, activo: d.activo !== false });
+    setForm(null); setErr("");
+  }
+
+  async function exportar() {
+    const XLSX = await ensureXLSXStyle();
+    const head = { font: { bold: true, color: { rgb: "FFFFFF" } }, fill: { fgColor: { rgb: "16203A" } } };
+    const res = [["Cédula", "Nombre", "Apellido", "Se le paga en", "Pagado USD", "Pagado Bs", "N.º pagos"]];
+    (empleados || []).forEach((e) => {
+      const r = porEmpleado[normCedula(e.cedula)];
+      if (!r && e.activo === false) return;
+      res.push([fmtCedula(e.cedula), e.nombre, e.apellido, (PAGO_EMPLEADO[e.pago] || PAGO_EMPLEADO.mixto).label, r2(r ? r.usd : 0), r2(r ? r.bs : 0), r ? r.pagos.length : 0]);
+    });
+    res.push(["", "", "", "TOTAL", r2(totUsd), r2(totBs), pagosMes.length]);
+    const det = [["Fecha", "Cédula", "Empleado", "Cuenta", "Moneda", "Monto", "Motivo", "Referencia"]];
+    pagosMes.slice().sort((a, b) => (a.date < b.date ? -1 : 1)).forEach((t) => {
+      const e = empleadoPorCedula(empleados, t.empleado);
+      det.push([t.date, fmtCedula(t.empleado), nombreEmpleado(e), acc(t.accountId).name || "", curLbl(curDe(t)), r2(t.amount), t.motivo || "", t.ref || ""]);
+    });
+    const hoja = (aoa, cols) => {
+      const ws = XLSX.utils.aoa_to_sheet(aoa);
+      ws["!cols"] = cols.map((w) => ({ wch: w }));
+      for (let c = 0; c < aoa[0].length; c++) { const cell = ws[XLSX.utils.encode_cell({ r: 0, c })]; if (cell) cell.s = head; }
+      return ws;
+    };
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, hoja(res, [14, 18, 18, 18, 13, 16, 10]), "Resumen");
+    XLSX.utils.book_append_sheet(wb, hoja(det, [11, 14, 26, 20, 7, 14, 28, 16]), "Pagos");
+    const out = XLSX.write(wb, { bookType: "xlsx", type: "array" });
+    descargarBlob(new Blob([out], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }), `Nomina ${mes}.xlsx`);
+  }
+
+  const card = { background: T.card, border: `1px solid ${T.lineSoft}`, borderRadius: 14 };
+  return (
+    <div style={{ paddingTop: 8 }}>
+      <div style={{ display: "flex", gap: 8, alignItems: "flex-end", marginBottom: 12 }}>
+        <div style={{ flex: 1 }}>
+          <label style={labelStyle}>Mes</label>
+          <input type="month" value={mes} onChange={(e) => e.target.value && setMes(e.target.value)} style={{ ...inputStyle, fontFamily: MONO, fontSize: 15, padding: "10px 12px" }} />
+        </div>
+        <button onClick={exportar} style={{ background: T.green, color: "#0A0F1E", border: "none", borderRadius: 11, padding: "12px 14px", fontSize: 13, fontWeight: 700, fontFamily: FONT, cursor: "pointer" }}><ConIco name="excel">Excel</ConIco></button>
+      </div>
+
+      <div style={{ ...card, padding: 16, marginBottom: 12, background: `linear-gradient(160deg, ${T.card2}, ${T.card})` }}>
+        <div style={{ fontSize: 13, color: T.mut }}><Ico name="nomina" size={15} color={T.gold} style={{ marginRight: 6 }} />Nómina pagada · {carpetaMes(mes + "-01").slice(8)} {mes.slice(0, 4)}</div>
+        <div style={{ display: "flex", gap: 18, marginTop: 6, fontFamily: MONO, fontVariantNumeric: "tabular-nums" }}>
+          <div><div style={{ fontSize: 11, color: T.mut2, fontFamily: FONT }}>Dólares</div><div style={{ fontSize: 20, fontWeight: 600, color: T.text }}>{money(totUsd, "usd")}</div></div>
+          <div><div style={{ fontSize: 11, color: T.mut2, fontFamily: FONT }}>Bolívares</div><div style={{ fontSize: 20, fontWeight: 600, color: T.text }}>{money(totBs, "ves")}</div></div>
+        </div>
+        <div style={{ fontSize: 12, color: T.mut2, marginTop: 4 }}>{pagosMes.length} pago(s) · {Object.keys(porEmpleado).length} empleado(s)</div>
+      </div>
+
+      {sinEmpleado.length > 0 && (
+        <div style={{ background: T.goldSoft, border: `1px solid ${T.gold}`, borderRadius: 12, padding: "11px 14px", marginBottom: 12, fontSize: 12.5, color: T.text, lineHeight: 1.5 }}>
+          <Ico name="alerta" size={15} color={T.gold} style={{ marginRight: 6 }} /><b>{sinEmpleado.length} pago(s) de nómina sin empleado</b> este mes. No entran en los totales de arriba.
+          {onVerMovs && (
+            <button onClick={() => onVerMovs(sinEmpleado)} style={{ ...btnGhost, color: T.gold, fontWeight: 700, fontSize: 12.5, padding: "6px 0 0", display: "block" }}>
+              Asignarles empleado →
+            </button>
+          )}
+        </div>
+      )}
+
+      <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
+        <input style={{ ...inputStyle, flex: 1, fontSize: 14, padding: "10px 12px" }} value={q} onChange={(e) => setQ(e.target.value)} placeholder="Buscar por cédula o nombre" />
+        {canEdit && (
+          <button onClick={() => { setErr(""); setForm({ datos: { nombre: "", apellido: "", cedula: normCedula(q) ? q : "", pago: "mixto" }, editando: null }); }}
+            style={{ background: T.goldSoft, color: T.gold, border: `1px solid ${T.gold}`, borderRadius: 11, padding: "0 14px", fontSize: 13, fontWeight: 700, fontFamily: FONT, cursor: "pointer" }}>
+            <ConIco name="mas" size={15}>Empleado</ConIco>
+          </button>
+        )}
+      </div>
+
+      {form && (
+        <div style={{ ...card, padding: "14px 15px", marginBottom: 12, borderColor: T.gold }}>
+          <div style={{ fontSize: 13.5, fontWeight: 600, color: T.text, marginBottom: 10 }}>{form.editando ? "Editar empleado" : "Nuevo empleado"}</div>
+          <EmpleadoCampos datos={form.datos} setDatos={(d) => setForm({ ...form, datos: d })} err={err} cedulaFija={!!form.editando}
+            onCancel={() => { setForm(null); setErr(""); }} onSave={guardar} />
+          {form.editando && (
+            <button onClick={() => setForm({ ...form, datos: { ...form.datos, activo: form.datos.activo === false } })}
+              style={{ ...btnGhost, color: form.datos.activo === false ? T.green : T.red, fontSize: 12.5, fontWeight: 600, padding: "10px 0 0" }}>
+              {form.datos.activo === false ? "Reactivar (se guarda al tocar Guardar)" : "Marcar como inactivo (se guarda al tocar Guardar)"}
+            </button>
+          )}
+        </div>
+      )}
+
+      {lista.length === 0 ? (
+        <div style={emptyRow}>{(empleados || []).length ? "Nadie coincide con esa búsqueda." : "Registrá a tus empleados con su cédula para asignarles los pagos de nómina."}</div>
+      ) : (
+        <div className="pt-list" style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          {lista.map((e) => {
+            const k = normCedula(e.cedula);
+            const r = porEmpleado[k];
+            const open = abierto === k;
+            const mixtoReal = r && r.usd > 0 && r.bs > 0;
+            return (
+              <div key={k} style={{ ...card, overflow: "hidden", opacity: e.activo === false ? 0.6 : 1 }}>
+                <button onClick={() => setAbierto(open ? null : k)} style={{ width: "100%", background: "transparent", border: "none", padding: "12px 15px", cursor: "pointer", fontFamily: FONT, textAlign: "left" }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "baseline" }}>
+                    <span style={{ fontSize: 14.5, fontWeight: 600, color: T.text, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", display: "flex", alignItems: "center", gap: 8 }}>
+                      <span style={{ width: 28, height: 28, borderRadius: 9, background: T.goldSoft, color: T.gold, display: "inline-flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}><Ico name="persona" size={15} /></span>
+                      {nombreEmpleado(e)}
+                    </span>
+                    <span style={{ fontSize: 10.5, fontWeight: 700, color: T.gold, background: T.goldSoft, borderRadius: 6, padding: "2px 6px", flexShrink: 0 }}>
+                      {(PAGO_EMPLEADO[e.pago] || PAGO_EMPLEADO.mixto).corto.toUpperCase()}
+                    </span>
+                  </div>
+                  <div style={{ fontSize: 12, color: T.mut2, fontFamily: MONO, marginTop: 2 }}>{fmtCedula(e.cedula)}{e.activo === false ? " · inactivo" : ""}</div>
+                  <div style={{ display: "flex", gap: 12, marginTop: 6, fontSize: 12.5, fontFamily: MONO }}>
+                    {r ? (
+                      <>
+                        {r.usd > 0 && <span style={{ color: T.text }}>{money(r.usd, "usd")}</span>}
+                        {r.bs > 0 && <span style={{ color: T.text }}>{money(r.bs, "ves")}</span>}
+                        {Object.entries(r.otras).map(([c, v]) => <span key={c} style={{ color: T.text }}>{money(v, c)}</span>)}
+                        <span style={{ color: T.mut2, fontFamily: FONT }}>{r.pagos.length} pago(s){mixtoReal ? " · mixto" : ""}</span>
+                      </>
+                    ) : <span style={{ color: T.mut2, fontFamily: FONT }}>Sin pagos este mes</span>}
+                  </div>
+                </button>
+                {open && (
+                  <div className="pt-pop" style={{ borderTop: `1px solid ${T.lineSoft}`, padding: "10px 15px 12px", background: T.bg2 }}>
+                    {(r ? r.pagos : []).slice().sort((a, b) => (a.date < b.date ? -1 : 1)).map((t) => (
+                      <div key={t.id} style={{ display: "flex", justifyContent: "space-between", gap: 10, fontSize: 12.5, padding: "3px 0" }}>
+                        <span style={{ color: T.mut, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{fmtDate(t.date)} · {acc(t.accountId).name || "—"}</span>
+                        <span style={{ fontFamily: MONO, color: T.red, flexShrink: 0 }}>−{money(t.amount, curDe(t))}</span>
+                      </div>
+                    ))}
+                    {canEdit && (
+                      <button onClick={() => { setErr(""); setForm({ datos: { nombre: e.nombre || "", apellido: e.apellido || "", cedula: fmtCedula(e.cedula), pago: e.pago || "mixto", activo: e.activo }, editando: e }); }}
+                        style={{ ...btnGhost, color: T.blue, fontSize: 12.5, fontWeight: 600, padding: "8px 0 0" }}>
+                        Editar datos
+                      </button>
+                    )}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+      {(empleados || []).some((e) => e.activo === false) && (
+        <button onClick={() => setVerInactivos((v) => !v)} style={{ ...btnGhost, color: T.mut, fontSize: 12.5, padding: "12px 0" }}>
+          {verInactivos ? "Ocultar inactivos" : "Ver también los inactivos"}
+        </button>
+      )}
+    </div>
+  );
+}
+
 /* ─────────────────────────────  Justificar movimientos importados  ───────────────────────────── */
-function JustifySheet({ state, projects, txns, cur, accounts, divisas, onClose, onSave, onEdit }) {
+function JustifySheet({ state, projects, txns, cur, accounts, divisas, onClose, onSave, onEdit, onReceipt, onReceiptDel, empleados = [], onAddEmpleado }) {
   const open = !!state;
   const target = (state && state.list) || [];
   const single = target.length === 1 ? target[0] : null;
@@ -4907,10 +6251,20 @@ function JustifySheet({ state, projects, txns, cur, accounts, divisas, onClose, 
   const [project, setProject] = useState("");
   const [newProject, setNewProject] = useState("");
   const [applySimilar, setApplySimilar] = useState(false);
+  // Clase del movimiento: gasto / interno / venta / divisa
+  const [clase, setClase] = useState("");
+  const [categoria, setCategoria] = useState("");
+  const [empleado, setEmpleado] = useState("");     // cédula, solo para Nómina
+  const [empSugerido, setEmpSugerido] = useState("");
   // Operación de divisas asociada a este movimiento
-  const [divKind, setDivKind] = useState("");   // "" | "compra" | "venta"
+  const [divKindSel, setDivKindSel] = useState("");   // "" | "compra" | "venta"
   const [persona, setPersona] = useState("");
   const [tasa, setTasa] = useState("");
+  const [recMsg, setRecMsg] = useState("");
+  const [recBusy, setRecBusy] = useState(false);
+  const esAbono = !!(single && single.abonoId);
+  // La divisa solo cuenta si la clase elegida es "divisa"
+  const divKind = clase === "divisa" ? divKindSel : "";
 
   useEffect(() => {
     if (!state) return;
@@ -4918,14 +6272,42 @@ function JustifySheet({ state, projects, txns, cur, accounts, divisas, onClose, 
     setProject(single && single.project ? single.project : "");
     setNewProject("");
     setApplySimilar(false);
+    setRecMsg("");
     // Si el movimiento ya estaba marcado como divisa, se recuperan sus datos
     const yaDiv = single && single.divisaId
       ? (divisas || []).find((d) => d.id === single.divisaId)
       : null;
-    setDivKind(yaDiv ? yaDiv.kind : "");
+    setDivKindSel(yaDiv ? yaDiv.kind : single ? (single.kind === "expense" ? "compra" : "venta") : "");
     setPersona(yaDiv ? (yaDiv.persona || "") : (single ? sugerirPersona(single.bankDesc) : ""));
     setTasa(yaDiv && yaDiv.tasa ? String(yaDiv.tasa) : "");
+    setClase(single ? claseDe(single) : "");
+    setCategoria(single ? (claseDe(single) === "divisa" ? "" : categoriaDe(single)) : "");
+    setEmpleado(single && single.empleado ? single.empleado : "");
+    /* Si la descripción del banco trae la cédula de un empleado registrado, se
+       propone como pago de nómina (solo si todavía no tenía clase). */
+    const sug = single && single.kind === "expense" ? empleadoDeDescripcion(empleados, single.bankDesc) : null;
+    setEmpSugerido(sug ? normCedula(sug.cedula) : "");
+    if (sug && !claseDe(single) && !single.empleado) {
+      setClase("gasto"); setCategoria(NOMINA_CAT); setEmpleado(normCedula(sug.cedula));
+    }
   }, [state]);
+  const esPagoNomina = clase === "gasto" && categoria.trim().toLowerCase() === NOMINA_CAT.toLowerCase();
+
+  const catsUsadas = useMemo(
+    () => (txns || []).filter((t) => t.clase && t.categoria).map((t) => ({ clase: t.clase, categoria: t.categoria })),
+    [txns]
+  );
+
+  async function adjuntar(e) {
+    const f = e.target.files && e.target.files[0];
+    e.target.value = "";
+    if (!f || !single || !onReceipt) return;
+    setRecBusy(true); setRecMsg("");
+    try { await onReceipt(single.id, f); setRecMsg("✓ Soporte adjuntado."); }
+    catch (err) { setRecMsg((err && err.message) || "No se pudo adjuntar."); }
+    finally { setRecBusy(false); }
+  }
+  const tieneSoporte = !!(single && (txns || []).find((t) => t.id === single.id && t.hasReceipt));
 
   /* Una compra de divisas sale de la cuenta (se paga en Bs) y una venta entra.
      Se propone según el tipo del movimiento, pero se puede cambiar. */
@@ -4956,7 +6338,14 @@ function JustifySheet({ state, projects, txns, cur, accounts, divisas, onClose, 
   const yaJustificados = target.filter((t) => t.motivo && String(t.motivo).trim()).length;
 
   const proj = project === "__new" ? newProject.trim() : project;
-  const valid = motivo.trim() && !(project === "__new" && !newProject.trim());
+  /* El motivo puede quedar vacío si se eligió una categoría (o es divisa):
+     en ese caso la categoría pasa a ser el motivo. */
+  const empSel = esPagoNomina ? empleadoPorCedula(empleados, empleado) : null;
+  const motivoFinal = motivo.trim()
+    || (empSel ? `${NOMINA_CAT} · ${nombreEmpleado(empSel)}` : "")
+    || categoria.trim()
+    || (divKind === "compra" ? "Compra de divisas" : divKind === "venta" ? "Venta de divisas" : "");
+  const valid = motivoFinal && !(project === "__new" && !newProject.trim()) && !(clase === "divisa" && !divKind && !esAbono);
   const acctName = (id) => ((accounts || []).find((a) => a.id === id) || {}).name || "—";
   const selStyle = { ...inputStyle, appearance: "none", fontSize: 14, padding: "11px 12px" };
 
@@ -5018,12 +6407,30 @@ function JustifySheet({ state, projects, txns, cur, accounts, divisas, onClose, 
         </div>
       )}
 
-      <Field label="Motivo / justificación">
+      {esAbono ? (
+        <div style={{ background: CLASES.divisa.soft, border: `1px solid ${T.violet}`, borderRadius: 12, padding: "12px 14px", marginBottom: 14, fontSize: 12.5, color: T.text, lineHeight: 1.5 }}>
+          Este ingreso es un <b>abono de Cuentas por cobrar</b>: cuenta como operación cambiaria y se maneja desde Divisas → Por cobrar.
+        </div>
+      ) : (
+        <ClasePicker
+          clase={clase}
+          setClase={setClase}
+          categoria={categoria}
+          setCategoria={setCategoria}
+          allowDivisa={!!single}
+          usadas={catsUsadas}
+        />
+      )}
+      {!esAbono && esPagoNomina && (
+        <EmpleadoPicker empleados={empleados} value={empleado} onChange={setEmpleado} onAdd={onAddEmpleado} sugerencia={empSugerido} />
+      )}
+
+      <Field label={clase && clase !== "divisa" ? "Detalle / motivo (opcional si elegiste categoría)" : "Motivo / justificación"}>
         <input
           style={inputStyle}
           value={motivo}
           onChange={(e) => setMotivo(e.target.value)}
-          placeholder="Ej. Pago a proveedor, Cobro cliente, Comisión bancaria…"
+          placeholder={categoria ? categoria : "Ej. Pago a proveedor, Cobro cliente, Comisión bancaria…"}
           list="motivos-usados"
         />
       </Field>
@@ -5047,18 +6454,18 @@ function JustifySheet({ state, projects, txns, cur, accounts, divisas, onClose, 
       )}
 
       {/* ── Operación de divisas ── */}
-      {single && (
+      {single && clase === "divisa" && !esAbono && (
         <div style={{ background: T.bg2, border: `1px solid ${divKind ? T.violet : T.lineSoft}`, borderRadius: 14, padding: "14px 15px", marginBottom: 14 }}>
-          <div style={{ fontSize: 13, color: T.text, fontWeight: 600, marginBottom: 4 }}>¿Es una operación de divisas?</div>
+          <div style={{ fontSize: 13, color: T.text, fontWeight: 600, marginBottom: 4 }}>Operación de divisas</div>
           <div style={{ fontSize: 12, color: T.mut, lineHeight: 1.5, marginBottom: 10 }}>
-            Si lo marcás, se crea sola la operación en Divisas y en Cuentas por Cobrar.
+            Se crea sola la operación en Divisas y en Cuentas por Cobrar.
             Solo hace falta el cliente y la tasa.
           </div>
           <div style={{ display: "flex", background: T.card, borderRadius: 12, padding: 4, marginBottom: divKind ? 14 : 0, gap: 2 }}>
-            {[["", "No"], ["compra", "Compra"], ["venta", "Venta"]].map(([k, label]) => (
+            {[["compra", "Compra"], ["venta", "Venta"]].map(([k, label]) => (
               <button
                 key={k || "no"}
-                onClick={() => setDivKind(k)}
+                onClick={() => setDivKindSel(k)}
                 style={{
                   flex: 1, border: "none", borderRadius: 9, padding: "10px 6px", fontSize: 13.5, fontWeight: 600,
                   fontFamily: FONT, cursor: "pointer",
@@ -5137,17 +6544,48 @@ function JustifySheet({ state, projects, txns, cur, accounts, divisas, onClose, 
         </button>
       )}
 
+      {single && onReceipt && clase !== "divisa" && (
+        <div style={{ background: T.bg2, border: `1px solid ${T.lineSoft}`, borderRadius: 14, padding: "12px 15px", marginBottom: 14 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 }}>
+            <div style={{ minWidth: 0 }}>
+              <div style={{ fontSize: 13, color: T.text, fontWeight: 600 }}><ConIco name="clip" size={15}>Factura / soporte</ConIco></div>
+              <div style={{ fontSize: 11.5, color: T.mut2, marginTop: 2 }}>
+                {tieneSoporte ? "Adjuntado · se sube al Drive con el reporte del día" : "Foto o PDF de la factura, recibo o nota"}
+              </div>
+            </div>
+            <label style={{ flexShrink: 0, background: tieneSoporte ? "transparent" : T.goldSoft, color: T.gold, border: `1px solid ${T.gold}`, borderRadius: 10, padding: "8px 12px", fontSize: 12.5, fontWeight: 700, fontFamily: FONT, cursor: recBusy ? "default" : "pointer" }}>
+              {recBusy ? "Subiendo…" : tieneSoporte ? "Reemplazar" : "Adjuntar"}
+              <input type="file" accept="image/*,application/pdf" onChange={adjuntar} disabled={recBusy} style={{ display: "none" }} />
+            </label>
+          </div>
+          {tieneSoporte && onReceiptDel && (
+            <button onClick={() => { onReceiptDel(single.id); setRecMsg("Soporte quitado."); }} style={{ ...btnGhost, color: T.red, fontSize: 12, padding: "8px 0 0" }}>
+              Quitar soporte
+            </button>
+          )}
+          {recMsg && <div style={{ fontSize: 12, color: T.mut, marginTop: 6 }}>{recMsg}</div>}
+        </div>
+      )}
+
       <PrimaryBtn
-        color={divKind ? T.violet : T.green}
+        color={divKind ? T.violet : clase && CLASES[clase] ? CLASES[clase].color : T.green}
         disabled={!valid || !divisaValida}
         onClick={() => {
           const ids = target.map((t) => t.id).concat(applySimilar ? similares.map((t) => t.id) : []);
           // Siempre se informa del movimiento único: si divKind quedó vacío y
-          // antes era una divisa, hay que deshacer esa operación.
-          const divisa = single
+          // antes era una divisa, hay que deshacer esa operación. Un abono no
+          // toca su operación: vive en Cuentas por cobrar.
+          const divisa = single && !esAbono
             ? { txnId: single.id, kind: divKind || null, persona: persona.trim(), tasa: nTasa }
             : null;
-          onSave(ids, { motivo: motivo.trim(), project: proj || undefined }, divisa);
+          const patch = { motivo: motivoFinal, project: proj || undefined };
+          // En lote, si no se eligió clase se respeta la que ya tenía cada uno
+          if (!esAbono && (single || clase)) {
+            patch.clase = clase === "divisa" ? "" : clase;
+            patch.categoria = clase === "divisa" ? "" : categoria.trim();
+            patch.empleado = esPagoNomina ? (normCedula(empleado) || "") : "";
+          }
+          onSave(ids, patch, divisa);
         }}
       >
         {!divisaValida
@@ -5262,7 +6700,7 @@ function AccountSheet({ state, cur, onClose, onSave, onDelete }) {
 }
 
 /* ─────────────────────────────  Sheet: Movimiento  ───────────────────────────── */
-function TxnSheet({ state, accounts, cur, vesRate, projects, onClose, onSave, onDelete }) {
+function TxnSheet({ state, accounts, cur, vesRate, projects, onClose, onSave, onDelete, empleados = [], onAddEmpleado }) {
   const open = !!state;
   const editing = state && state.id;
   const usable = accounts.filter((a) => a.type === "bank" || a.type === "cash");
@@ -5276,8 +6714,16 @@ function TxnSheet({ state, accounts, cur, vesRate, projects, onClose, onSave, on
   const [comUsd, setComUsd] = useState("");
   const [project, setProject] = useState("");
   const [newProject, setNewProject] = useState("");
+  const [clase, setClase] = useState("");
+  const [categoria, setCategoria] = useState("");
+  const [empleado, setEmpleado] = useState("");
+  // Las divisas y los traslados se clasifican solos: no se pisan desde acá
+  const claseFija = !!(state && state.id && (state.divisaId || state.abonoId || esTraslado(state)));
   useEffect(() => {
     if (state && state.id) {
+      setClase(state.clase || "");
+      setCategoria(state.categoria || "");
+      setEmpleado(state.empleado || "");
       setKind(state.kind || "expense");
       setAmount(String(state.amount ?? ""));
       setMotivo(state.motivo || "");
@@ -5291,8 +6737,11 @@ function TxnSheet({ state, accounts, cur, vesRate, projects, onClose, onSave, on
     } else if (state) {
       setKind("expense"); setAmount(""); setMotivo(""); setAccountId(usable[0]?.id || ""); setDate(todayISO());
       setComMode("none"); setComManual(""); setComUsd(""); setProject(""); setNewProject("");
+      setClase(""); setCategoria(""); setEmpleado("");
     }
   }, [state]);
+  const esPagoNomina = clase === "gasto" && categoria.trim().toLowerCase() === NOMINA_CAT.toLowerCase();
+  const empSel = esPagoNomina ? empleadoPorCedula(empleados, empleado) : null;
 
   const acct = usable.find((a) => a.id === accountId);
   const acctCur = (acct && acct.currency) || cur;
@@ -5307,7 +6756,8 @@ function TxnSheet({ state, accounts, cur, vesRate, projects, onClose, onSave, on
   const egresoTotal = (isNaN(nAmount) ? 0 : nAmount) + comAcct;
   const saldo = acct ? acct.balance || 0 : 0;
   const insuf = kind === "expense" && !isNaN(nAmount) && nAmount > 0 && egresoTotal > saldo + 1e-6;
-  const valid = amount && !isNaN(nAmount) && nAmount > 0 && accountId && motivo.trim() && !(project === "__new" && !newProject.trim());
+  const motivoFinal = motivo.trim() || (empSel ? `${NOMINA_CAT} · ${nombreEmpleado(empSel)}` : "") || categoria.trim();
+  const valid = amount && !isNaN(nAmount) && nAmount > 0 && accountId && motivoFinal && !(project === "__new" && !newProject.trim());
   const seg = (a, color) => ({ flex: 1, border: "none", borderRadius: 9, padding: "11px", fontSize: 14.5, fontWeight: 600, fontFamily: FONT, cursor: "pointer", background: a ? color : "transparent", color: a ? "#0A0F1E" : T.mut });
 
   return (
@@ -5326,8 +6776,16 @@ function TxnSheet({ state, accounts, cur, vesRate, projects, onClose, onSave, on
           <Field label={`Monto (${acctCur.toUpperCase()})`}>
             <input style={{ ...inputStyle, fontFamily: MONO, fontSize: 22 }} value={amount} onChange={(e) => setAmount(e.target.value)} inputMode="decimal" placeholder="0.00" />
           </Field>
+          {claseFija ? (
+            <div style={{ fontSize: 12.5, color: T.mut, marginBottom: 14 }}>Clasificación: <b style={{ color: T.text }}>{claseLabel(state)}</b></div>
+          ) : (
+            <ClasePicker clase={clase} setClase={setClase} categoria={categoria} setCategoria={setCategoria} />
+          )}
+          {!claseFija && esPagoNomina && (
+            <EmpleadoPicker empleados={empleados} value={empleado} onChange={setEmpleado} onAdd={onAddEmpleado} />
+          )}
           <Field label="Motivo">
-            <input style={inputStyle} value={motivo} onChange={(e) => setMotivo(e.target.value)} placeholder="Ej. Sueldo, Supermercado, Alquiler…" />
+            <input style={inputStyle} value={motivo} onChange={(e) => setMotivo(e.target.value)} placeholder={categoria || "Ej. Sueldo, Supermercado, Alquiler…"} />
           </Field>
           <Field label="Cuenta / método de pago">
             <select style={{ ...inputStyle, appearance: "none" }} value={accountId} onChange={(e) => setAccountId(e.target.value)}>
@@ -5383,7 +6841,7 @@ function TxnSheet({ state, accounts, cur, vesRate, projects, onClose, onSave, on
               No disponés de fondos suficientes. Saldo de la cuenta: <span style={{ fontFamily: MONO, fontWeight: 600 }}>{money(saldo, acctCur)}</span>{comAcct > 0 ? ` · egreso + comisión: ${money(egresoTotal, acctCur)}` : ""} · quedaría en <span style={{ fontFamily: MONO, fontWeight: 600 }}>{money(saldo - egresoTotal, acctCur)}</span>.
             </div>
           )}
-          <PrimaryBtn color={kind === "income" ? T.green : T.red} disabled={!valid} onClick={() => onSave({ id: editing ? state.id : undefined, kind, amount: nAmount, motivo: motivo.trim(), accountId, date, currency: acctCur, commission: comAcct, comMode, comUsd: comUsdVal || undefined, project: proj || undefined })}>
+          <PrimaryBtn color={kind === "income" ? T.green : T.red} disabled={!valid} onClick={() => onSave({ id: editing ? state.id : undefined, kind, amount: nAmount, motivo: motivoFinal, ...(claseFija ? {} : { clase: clase || undefined, categoria: (clase && categoria.trim()) || undefined, empleado: (esPagoNomina && normCedula(empleado)) || undefined }), accountId, date, currency: acctCur, commission: comAcct, comMode, comUsd: comUsdVal || undefined, project: proj || undefined })}>
             {kind === "income" ? (editing ? "Guardar cambios" : "Registrar ingreso") : editing ? "Guardar cambios" : insuf ? "Registrar de todos modos" : "Registrar egreso"}
           </PrimaryBtn>
           {editing && (
@@ -5839,7 +7297,7 @@ function AjustesTab({ settings, setSettings, accounts, txns, prices, cur, divisa
       // Movimientos del período
       const movs = txns.filter(inRange).slice().sort((a, b) => (a.date < b.date ? -1 : 1));
       const movAoa = [
-        ["Fecha", "Tipo", "Motivo", "Cuenta / método", "Moneda", "Monto", "Comisión", "Proyecto", "Tasa VES/USD (del día)"],
+        ["Fecha", "Tipo", "Clase", "Categoría", "Motivo", "Cuenta / método", "Moneda", "Monto", "Comisión", "Proyecto", "Tasa VES/USD (del día)"],
         ...movs.map((t) => {
           const mc = (t.currency || cur).toUpperCase();
           const comTxt = t.commission ? (t.comMode === "usd" ? `${round2(t.comUsd || 0)} USD` : round2(t.commission)) : "";
@@ -5847,6 +7305,8 @@ function AjustesTab({ settings, setSettings, accounts, txns, prices, cur, divisa
           return [
             t.date,
             t.kind === "income" ? "Ingreso" : "Egreso",
+            claseDe(t) ? CLASES[claseDe(t)].label : "Sin clasificar",
+            categoriaDe(t),
             t.motivo || "",
             nameOf(t.accountId),
             mc,
@@ -5858,7 +7318,7 @@ function AjustesTab({ settings, setSettings, accounts, txns, prices, cur, divisa
         }),
       ];
       const wsM = XLSX.utils.aoa_to_sheet(movAoa);
-      wsM["!cols"] = [{ wch: 12 }, { wch: 10 }, { wch: 26 }, { wch: 22 }, { wch: 8 }, { wch: 14 }, { wch: 12 }, { wch: 18 }, { wch: 20 }];
+      wsM["!cols"] = [{ wch: 12 }, { wch: 10 }, { wch: 18 }, { wch: 22 }, { wch: 26 }, { wch: 22 }, { wch: 8 }, { wch: 14 }, { wch: 12 }, { wch: 18 }, { wch: 20 }];
 
       // Cripto (instantánea al momento de exportar)
       const cripto = accounts.filter((a) => a.type === "crypto");
@@ -9983,6 +11443,44 @@ const css = `
   @keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(63,203,139,0.5);} 70% { box-shadow: 0 0 0 6px rgba(63,203,139,0);} 100% { box-shadow: 0 0 0 0 rgba(63,203,139,0);} }
   @keyframes slideUp { from { transform: translateY(100%);} to { transform: translateY(0);} }
   @keyframes fade { from { opacity: 0;} to { opacity: 1;} }
+  @keyframes fadeOut { from { opacity: 1;} to { opacity: 0;} }
+  @keyframes slideDown { from { transform: translateY(0);} to { transform: translateY(100%);} }
+  @keyframes viewIn { from { opacity: 0; transform: translateY(8px);} to { opacity: 1; transform: none;} }
+  @keyframes popIn { from { opacity: 0; transform: scale(.96);} to { opacity: 1; transform: none;} }
+
+  /* Tipografía tipo Mac y suavizado */
+  html, body { font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", Inter, system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; text-rendering: optimizeLegibility;
+    font-feature-settings: "cv11", "ss01"; scroll-behavior: smooth; }
+  body { transition: background-color .35s ease, color .35s ease; }
+  input, select, textarea, button { font-family: inherit; }
+
+  /* Transiciones suaves en todo lo que se toca */
+  button, a, input, select, textarea, label {
+    transition: background-color .22s ease, color .22s ease, border-color .22s ease,
+      box-shadow .22s ease, transform .16s cubic-bezier(.22,1,.36,1), opacity .22s ease, filter .22s ease;
+  }
+  button:not(:disabled), label[style*="cursor: pointer"] { will-change: transform; }
+  button:active:not(:disabled), label:active { transform: scale(.97); }
+  input:focus, select:focus, textarea:focus { box-shadow: 0 0 0 3px var(--goldSoft); }
+  @media (hover: hover) {
+    button:hover:not(:disabled) { filter: brightness(1.08); }
+    a:hover { opacity: .85; }
+  }
+  svg { transition: stroke .22s ease, color .22s ease; }
+
+  /* Entrada de cada pestaña y de las listas */
+  .pt-view { animation: viewIn .34s cubic-bezier(.22,1,.36,1) both; }
+  .pt-list > * { animation: viewIn .32s cubic-bezier(.22,1,.36,1) both; }
+  .pt-list > *:nth-child(2) { animation-delay: .03s; } .pt-list > *:nth-child(3) { animation-delay: .06s; }
+  .pt-list > *:nth-child(4) { animation-delay: .09s; } .pt-list > *:nth-child(5) { animation-delay: .12s; }
+  .pt-list > *:nth-child(6) { animation-delay: .15s; } .pt-list > *:nth-child(7) { animation-delay: .18s; }
+  .pt-list > *:nth-child(n+8) { animation-delay: .2s; }
+  .pt-pop { animation: popIn .26s cubic-bezier(.22,1,.36,1) both; }
+
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation-duration: .01ms !important; animation-delay: 0s !important; transition-duration: .01ms !important; scroll-behavior: auto !important; }
+  }
 `;
 
 ReactDOM.createRoot(document.getElementById('root')).render(<App />);
